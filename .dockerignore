@@ -1,0 +1,35 @@
+# Docker
+Dockerfile
+.dockerignore
+railway.json
+README.md
+LICENSE
+
+# VCS
+.git
+.gitignore
+.github
+
+# Локальные секреты — никогда в образ
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.venv
+venv/
+
+# Runtime-логи живут в Volume, не в образе.
+# seed-managers.json нужен в образе как стартовый набор.
+access_rules.json
+claim_log.json
+reject_log.json
+greeting_log.json
+
+# OS
+.DS_Store
+Thumbs.db

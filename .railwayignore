@@ -1,0 +1,13 @@
+.git
+.github
+__pycache__
+*.pyc
+.venv
+venv/
+.DS_Store
+
+# Локальные секреты — не пушим в Railway
+.env
+.env.bitrix
+.env.vibecode
+!.env.example

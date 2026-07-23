@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.venv/
+venv/
+env/
+
+# Секреты — никогда в репозиторий
+.env
+.env.bitrix
+.env.vibecode
+!.env.example
+
+# Файлы состояния (runtime-логи) — живут в Volume, не в репозитории.
+# managers.json хранится в репозитории как статический список компетенций.
+access_rules.json
+claim_log.json
+reject_log.json
+greeting_log.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
