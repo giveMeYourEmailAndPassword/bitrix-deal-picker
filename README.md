@@ -256,3 +256,24 @@ python3 app.py
 ```
 
 Открыть: http://localhost:3000/api/health
+
+---
+
+## 6. Статус проверки
+
+Проверено на хост-уровне (macOS, Python 3.9.6, без контейнерного runtime):
+
+- `python3 app.py` стартует, `/api/health` → 200, `version: 2026-07-23-batched-deal-search`,
+  `sourceStages` = `UC_ZJ55BR` + `UC_PUCAAQ`.
+- `/api/next-deal?managerId=41` → JSON, заявка со стадии `UC_ZJ55BR`.
+- `entrypoint.sh` с `env -u APP_DATA_DIR` корректно экспортит `APP_DATA_DIR`,
+  сеет `managers.json` в каталог-стенд и не пишет runtime-логи в папку приложения.
+
+**Не проверено** (на машине нет `docker`/`podman`/`colima`):
+
+- Реальная сборка образа (`docker build`).
+- Реальный прогон контейнера с примонтированным `/data` (`docker run -v ...`).
+- Деплой на Railway (сборка, healthcheck, Volume, переменные).
+
+Перед деплоем обязательно прогнать `docker build` + `docker run` локально
+или на CI — статус «готово к деплою» устанавливается только после этого.
