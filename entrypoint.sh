@@ -12,6 +12,10 @@ set -e
 DATA_DIR="${APP_DATA_DIR:-/data}"
 mkdir -p "$DATA_DIR"
 
+# Гарантируем APP_DATA_DIR в окружении процесса приложения —
+# даже если Railway-переменную забыли задать, app.py:18 читает /data.
+export APP_DATA_DIR="$DATA_DIR"
+
 # Сеем только managers.json, если его ещё нет в Volume.
 if [ ! -f "$DATA_DIR/managers.json" ] && [ -f /app/seed-managers.json ]; then
   cp /app/seed-managers.json "$DATA_DIR/managers.json"

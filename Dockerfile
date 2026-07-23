@@ -2,6 +2,7 @@ FROM python:3.12-slim
 
 # Railway прокидывает PORT автоматически; приложение слушает HOST:PORT.
 ENV HOST=0.0.0.0 \
+    APP_DATA_DIR=/data \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 

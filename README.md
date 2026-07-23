@@ -96,62 +96,78 @@
 4. `reject_log.json` — история отказов
 5. `greeting_log.json` — история отправленных приветствий
 
-### Как выгрузить с VibeCode
+### Подготовка: выгрузка с VibeCode
 
-Способ зависит от доступа к VibeCode-инстансу. Варианты:
+На стороне работающего VibeCode-инстанса упаковать 5 файлов состояния:
 
-**Вариант A — через SSH/консоль VibeCode:**
 ```bash
-# На стороне VibeCode упаковать файлы состояния
+# Выполнять на VibeCode (SSH/консоль платформы).
 cd <папка приложения VibeCode>
 tar czf /tmp/bitrix-state.tar.gz \
   managers.json access_rules.json claim_log.json \
   reject_log.json greeting_log.json
-# Скачать /tmp/bitrix-state.tar.gz на локальную машину
+# Скопировать /tmp/bitrix-state.tar.gz на локальную машину
+# (scp, скачать через панель VibeCode — что доступно).
 ```
 
-**Вариант B — через Railway CLI (один из вариантов ниже):**
+### Загрузка в Volume Railway
 
-1. После первого деплоя (Volume пуст) запустить shell в контейнере:
-   ```bash
-   railway shell
-   ```
-2. Перенести файлы вручную (через `curl` с VibeCode или вставкой
-   через heredoc, если файлы небольшие).
-3. Положить в `/data`:
-   ```bash
-   cd /data
-   # <перенести 5 файлов сюда>
-   ls -la /data  # должно быть 5 JSON-файлов
-   ```
-
-**Вариант C — локально через `railway run` + Volume:**
-
-1. Установить [Railway CLI](https://docs.railway.app/develop/cli):
-   ```bash
-   npm i -g @railway/cli
-   railway login
-   railway link  # привязать проект
-   ```
-2. Примонтировать Volume локально и скопировать файлы (см.
-   [Railway Volumes docs](https://docs.railway.app/develop/volumes)).
-
-### Проверка после переноса
+Установить [Railway CLI](https://docs.railway.app/develop/cli) и привязать проект:
 
 ```bash
-railway shell
+npm i -g @railway/cli
+railway login
+railway link   # выбрать проект/окружение/сервис с подключённым Volume
+```
+
+`railway ssh` открывает интерактивную сессию **в удалённом контейнере**
+с примонтированным Volume. Копируем архив внутрь и распаковываем в `/data`.
+
+#### Шаг 1. Копирование архива в контейнер
+
+Из локального терминала (архив уже скачан с VibeCode):
+
+```bash
+# railway ssh умеет прокидывать stdin в удалённый контейнер.
+# Копируем tar-архив в Volume, затем распаковываем.
+cat /tmp/bitrix-state.tar.gz | railway ssh "cat > /tmp/state.tar.gz"
+```
+
+#### Шаг 2. Распаковка в Volume
+
+```bash
+railway ssh
+# --- теперь мы в удалённом контейнере, Volume примонтирован в /data ---
+cd /data
+tar xzf /tmp/state.tar.gz
 ls -la /data
 # Должно быть 5 файлов:
-# access_rules.json  claim_log.json  greeting_log.json
-# managers.json      reject_log.json
-cat /data/access_rules.json | head  # не пустой
-cat /data/claim_log.json | head     # не пустой
+#   access_rules.json  claim_log.json  greeting_log.json
+#   managers.json      reject_log.json
+cat /data/access_rules.json | head   # не пустой
+cat /data/claim_log.json     | head   # не пустой
+exit
+```
+
+#### Альтернатива: ручная загрузка через heredoc (если файлы небольшие)
+
+```bash
+railway ssh
+# --- в контейнере ---
+cd /data
+# Вставить содержимое каждого файла через heredoc, например:
+cat > access_rules.json <<'EOF'
+{ ... содержимое ... }
+EOF
+exit
 ```
 
 > ⚠️ **Файлы нельзя перезаписывать пустыми.** Приложение при первом
-> запуске создаст недостающие файлы со значениями по умолчанию.
-> Если Volume уже инициализирован пустыми файлами — удалите их
-> и загрузите настоящие данные с VibeCode.
+> запуске создаёт недостающие файлы со значениями по умолчанию.
+> Если Volume уже инициализирован пустыми файлами — перед загрузкой
+> удалите их (`rm /data/*.json` в `railway ssh`), затем распакуйте
+> настоящие данные с VibeCode. `managers.json` из seed-образа
+> будет перезаписан настоящим из архива — это ожидаемо и правильно.
 
 ---
 
