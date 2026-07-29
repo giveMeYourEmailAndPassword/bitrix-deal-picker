@@ -218,7 +218,7 @@ def entry_date(entry):
     try:
         parsed = datetime.fromisoformat(raw)
     except ValueError:
-        return raw[:10]
+        return ""
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(LOCAL_TZ).date().isoformat()
@@ -611,6 +611,8 @@ def clean_text(value):
 
 
 def is_service_text(text):
+    if not text:
+        return False
     lowered = text.lower()
     return any(re.search(pattern, lowered) for pattern in SERVICE_PATTERNS)
 
