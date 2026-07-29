@@ -627,6 +627,9 @@ class TestHasBitrixAuth(unittest.TestCase):
 
 
 class TestActorIdFromPayload(unittest.TestCase):
+    def setUp(self):
+        app._USER_VERIFY_CACHE.clear()
+
     @patch("app.verify_bitrix_user")
     def test_returns_verified_user_id(self, mock_verify):
         mock_verify.return_value = {"id": "42", "name": "Test"}
@@ -634,11 +637,11 @@ class TestActorIdFromPayload(unittest.TestCase):
         self.assertEqual(r, "42")
 
     @patch("app.verify_bitrix_user")
-    def test_verify_fails_falls_to_current_user_id(self, mock_verify):
+    def test_verify_revoked_token_returns_none(self, mock_verify):
         mock_verify.return_value = None
         r = app.actor_id_from_payload(
-            {"auth": {"access_token": "tok", "domain": "d.bitrix24.kz"}, "currentUserId": "99"})
-        self.assertEqual(r, "99")
+            {"auth": {"access_token": "expired", "domain": "d.bitrix24.kz"}, "currentUserId": "99"})
+        self.assertIsNone(r)
 
     @patch("app.verify_bitrix_user")
     def test_no_auth_uses_manager_id_when_unverified_allowed(self, mock_verify):
@@ -653,6 +656,14 @@ class TestActorIdFromPayload(unittest.TestCase):
         r = app.actor_id_from_payload({"auth": {}})
         self.assertIsNone(r)
 
+    @patch("app.verify_bitrix_user")
+    def test_client_endpoint_extracts_domain(self, mock_verify):
+        """client_endpoint без domain — должен корректно извлекаться."""
+        mock_verify.return_value = {"id": "77", "name": "Client EP User"}
+        r = app.actor_id_from_payload({
+            "auth": {"access_token": "tok", "client_endpoint": "https://my.bitrix24.kz/rest/"}})
+        self.assertEqual(r, "77")
+
 
 class TestRequireAdmin(unittest.TestCase):
     @patch("app.verify_bitrix_user")
@@ -665,8 +676,9 @@ class TestRequireAdmin(unittest.TestCase):
         mock_verify.return_value = {"id": "99", "name": "User"}
         self.assertIsNone(app.require_admin({"auth": {"access_token": "tok", "domain": "d"}}))
 
-    def test_admin_by_current_user_id(self):
-        self.assertIsNotNone(app.require_admin({"currentUserId": "1"}))
+    def test_admin_by_current_user_id_no_auth(self):
+        """currentUserId без auth → не админ (impersonation защита)."""
+        self.assertIsNone(app.require_admin({"currentUserId": "1"}))
 
     def test_non_admin_by_current_user_id(self):
         self.assertIsNone(app.require_admin({"currentUserId": "99"}))
@@ -844,21 +856,15 @@ class TestHandlerRouting(unittest.TestCase):
         self.assertEqual(self._status(h), 400)
 
     # ── GET /api/next-deal (managerId query) ──
-
-    @patch("app.get_next_deal_for_manager")
-    def test_next_deal_get(self, mock_next):
-        mock_next.return_value = {"deal": None}
-        h = MockHandler.make("GET", "/api/next-deal", query={"managerId": "41"})
+    def test_next_deal_get_returns_404(self):
+        h = MockHandler.make("GET", "/api/next-deal")
         self._dispatch(h)
-        mock_next.assert_called_once_with("41", [])
+        self.assertEqual(self._status(h), 404)
 
-    @patch("app.get_next_deal_for_manager")
-    def test_next_deal_get_with_skip(self, mock_next):
-        mock_next.return_value = {"deal": None}
-        h = MockHandler.make("GET", "/api/next-deal",
-                             query={"managerId": "41", "skip[]": "1"})
+    def test_next_deal_get_with_skip_returns_404(self):
+        h = MockHandler.make("GET", "/api/next-deal", query={"skip[]": "1"})
         self._dispatch(h)
-        mock_next.assert_called_once_with("41", ["1"])
+        self.assertEqual(self._status(h), 404)
 
     # ── POST /install / root ──
 
