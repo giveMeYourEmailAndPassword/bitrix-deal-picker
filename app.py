@@ -218,7 +218,7 @@ def entry_date(entry):
     try:
         parsed = datetime.fromisoformat(raw)
     except ValueError:
-        return ""
+        return raw[:10]
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(LOCAL_TZ).date().isoformat()
@@ -542,35 +542,22 @@ def bitrix_call_for_actor(auth, method, params=None):
     return bitrix_call(method, params)
 
 
-def _extract_auth_credentials(auth):
-    """Извлечь (token, domain) из auth-словаря Bitrix24.
-
-    Поддерживает все форматы:
-      {access_token, domain}, {AUTH_ID, DOMAIN, client_endpoint}, {auth, client_endpoint}
-    """
-    if not isinstance(auth, dict):
-        return None, None
-    token = auth.get("access_token") or auth.get("AUTH_ID") or auth.get("auth")
-    if not token:
-        return None, None
-    domain = auth.get("domain") or auth.get("DOMAIN")
-    if not domain:
-        client = auth.get("client_endpoint")
-        if client:
-            domain = urllib.parse.urlparse(client).netloc
-    if not domain:
-        return None, None
-    return token, domain
-
-
 def has_bitrix_auth(payload):
     auth = payload.get("auth") if isinstance(payload, dict) else None
-    token, domain = _extract_auth_credentials(auth)
+    if not isinstance(auth, dict):
+        return False
+    token = auth.get("access_token") or auth.get("AUTH_ID") or auth.get("auth")
+    domain = auth.get("domain") or auth.get("DOMAIN") or auth.get("client_endpoint")
     return bool(token and domain)
 
 
 def verify_bitrix_user(auth):
-    token, domain = _extract_auth_credentials(auth)
+    if not isinstance(auth, dict):
+        return None
+    token = auth.get("access_token") or auth.get("AUTH_ID") or auth.get("auth")
+    domain = auth.get("domain") or auth.get("DOMAIN")
+    if not domain and auth.get("client_endpoint"):
+        domain = urllib.parse.urlparse(auth.get("client_endpoint")).netloc
     if not token or not domain:
         return None
     try:
@@ -589,42 +576,25 @@ def verify_bitrix_user(auth):
     }
 
 
-_USER_VERIFY_CACHE = {}
-_USER_VERIFY_CACHE_TTL = 300  # 5 минут
-
 def actor_id_from_payload(payload):
-    auth = payload.get("auth") if isinstance(payload, dict) else None
-    if not isinstance(auth, dict):
-        if ALLOW_UNVERIFIED_USERS:
-            return str(payload.get("managerId") or "")
-        return None
-
-    token, domain = _extract_auth_credentials(auth)
-
-    if not token or not domain:
-        if ALLOW_UNVERIFIED_USERS:
-            return str(payload.get("managerId") or "")
-        return None
-
-    cache_key = (token, domain)
-    now = time.monotonic()
-    cached = _USER_VERIFY_CACHE.get(cache_key)
-    if cached and now - cached["at"] < _USER_VERIFY_CACHE_TTL:
-        return cached["id"]
-
-    user = verify_bitrix_user(auth)
+    user = verify_bitrix_user(payload.get("auth"))
     if user and user.get("id"):
-        _USER_VERIFY_CACHE[cache_key] = {"id": user["id"], "at": time.monotonic()}
         return user["id"]
-
+    current_user_id = str(payload.get("currentUserId") or "").strip()
+    if current_user_id and has_bitrix_auth(payload):
+        return current_user_id
+    if ALLOW_UNVERIFIED_USERS:
+        return str(payload.get("managerId") or "")
     return None
 
 
 def require_admin(payload):
-    """Только верифицированный через Bitrix пользователь может быть админом."""
     user = verify_bitrix_user(payload.get("auth"))
     if user and user.get("id") in ADMIN_USER_IDS:
         return user
+    current_user_id = str(payload.get("currentUserId") or "").strip()
+    if current_user_id in ADMIN_USER_IDS:
+        return {"id": current_user_id, "name": "Администратор"}
     return None
 
 
@@ -641,8 +611,6 @@ def clean_text(value):
 
 
 def is_service_text(text):
-    if not text:
-        return False
     lowered = text.lower()
     return any(re.search(pattern, lowered) for pattern in SERVICE_PATTERNS)
 
@@ -1393,6 +1361,8 @@ def extract_initial_auth(raw_payload):
     except Exception:
         return {}
     return extract_initial_auth_from_values(parsed)
+
+
 def extract_initial_auth_from_values(parsed):
     parsed = parsed or {}
 
@@ -1409,11 +1379,8 @@ def extract_initial_auth_from_values(parsed):
         "DOMAIN": pick("DOMAIN", "domain"),
         "member_id": pick("member_id", "MEMBER_ID"),
         "client_endpoint": pick("client_endpoint", "CLIENT_ENDPOINT"),
-        "user_id": pick("user_id", "USER_ID"),
     }
     return {key: value for key, value in auth.items() if value}
-
-
 
 
 def render_index_html(install_mode=False, initial_auth=None):
@@ -1423,7 +1390,6 @@ def render_index_html(install_mode=False, initial_auth=None):
         .replace("__INSTALL_MODE__", "true" if install_mode else "false")
         .replace("__ADMIN_USER_IDS__", json.dumps(sorted(ADMIN_USER_IDS), ensure_ascii=False))
         .replace("__INITIAL_AUTH__", json.dumps(initial_auth or {}, ensure_ascii=False))
-        .replace("__ALLOW_UNVERIFIED_USERS__", "true" if ALLOW_UNVERIFIED_USERS else "false")
     )
 
 
@@ -1508,6 +1474,15 @@ class Handler(BaseHTTPRequestHandler):
                 query = urllib.parse.parse_qs(parsed.query)
                 manager_id = (query.get("managerId") or [""])[0]
                 self.send_json({"manager": get_manager_profile(manager_id)})
+            except Exception as exc:
+                self.send_json({"error": str(exc)}, 500)
+            return
+        if parsed.path == "/api/next-deal":
+            try:
+                query = urllib.parse.parse_qs(parsed.query)
+                manager_id = (query.get("managerId") or [""])[0]
+                skipped = query.get("skip[]", []) + query.get("skip", [])
+                self.send_json(get_next_deal_for_manager(manager_id, skipped))
             except Exception as exc:
                 self.send_json({"error": str(exc)}, 500)
             return
@@ -1658,10 +1633,10 @@ INDEX_HTML = """<!doctype html>
     <div class="toolbar">
       <select id="managerSelect" class="hidden" onchange="syncManagerId()"></select>
       <input id="managerId" class="hidden" placeholder="ID менеджера для проверки">
-      <button id="getDealButton" onclick="getDeal()" disabled>Получить сделку</button>
+      <button id="getDealButton" onclick="getDeal()">Получить сделку</button>
     </div>
     <div id="managerInfo" class="status"></div>
-    <div id="status" class="status">Определяю пользователя Битрикс...</div>
+    <div id="status" class="status">Выберите менеджера и нажмите “Получить сделку”.</div>
     <div id="searchProgress" class="search-progress hidden">
       <div class="search-progress-track"><div class="search-progress-bar"></div></div>
       <div class="search-progress-text">Ищем подходящую заявку по навыкам менеджера...</div>
@@ -1688,13 +1663,11 @@ let skippedDeals = [];
 let managers = [];
 let currentBitrixUser = null;
 let isDealSearchRunning = false;
-let userIdentified = false;
 const MAX_SEARCH_BATCHES = 8;
 const PUBLIC_APP_URL = "__PUBLIC_APP_URL__";
 const INSTALL_MODE = __INSTALL_MODE__;
 const ADMIN_USER_IDS = __ADMIN_USER_IDS__;
 const INITIAL_AUTH = __INITIAL_AUTH__;
-const ALLOW_UNVERIFIED_USERS = __ALLOW_UNVERIFIED_USERS__;
 const REJECT_REASONS = {
   not_my_country: 'Не моя страна',
   unclear_request: 'Непонятный запрос',
@@ -1791,8 +1764,6 @@ function applyAuthorizedUser(user, manager) {
   if (managerId) {
     document.getElementById('managerId').value = managerId;
   }
-  bitrixUserVerified = true;
-  updateUserReadiness();
   document.getElementById('managerSelect').classList.add('hidden');
   document.getElementById('managerId').classList.add('hidden');
   if (manager) {
@@ -1828,13 +1799,9 @@ function detectBitrixUser() {
   if (!window.BX24 || !BX24.init || !BX24.callMethod) {
     detectUserFromServerAuth().then((found) => {
       if (!found) {
-        if (ALLOW_UNVERIFIED_USERS) {
-          document.getElementById('managerSelect').classList.remove('hidden');
-          document.getElementById('managerId').classList.remove('hidden');
-          document.getElementById('status').textContent = 'Локальный тест: выберите менеджера вручную.';
-        } else {
-          document.getElementById('status').textContent = 'Приложение должно быть открыто внутри Bitrix24.';
-        }
+        document.getElementById('managerSelect').classList.remove('hidden');
+        document.getElementById('managerId').classList.remove('hidden');
+        document.getElementById('status').textContent = 'Локальный тест: выберите менеджера вручную.';
       }
     });
     return;
@@ -1950,17 +1917,6 @@ async function loadCurrentManagerFromBitrix(managerId) {
   }
   renderManagerInfo(manager);
 }
-let bitrixUserVerified = false;
-
-function updateUserReadiness() {
-  if (ALLOW_UNVERIFIED_USERS) {
-    const managerId = document.getElementById('managerId').value.trim();
-    userIdentified = Boolean(managerId) || bitrixUserVerified;
-  } else {
-    userIdentified = bitrixUserVerified;
-  }
-  document.getElementById('getDealButton').disabled = !userIdentified;
-}
 function syncManagerId() {
   const select = document.getElementById('managerSelect');
   const managerId = select.value;
@@ -1971,7 +1927,6 @@ function syncManagerId() {
   document.getElementById('result').hidden = true;
   clearGreeting();
   setSearching(false);
-  updateUserReadiness();
   const manager = managers.find((item) => String(item.id) === String(managerId));
   document.getElementById('managerInfo').textContent = manager
     ? `Компетенции: ${(manager.competencies || []).join(', ')}`
@@ -1982,7 +1937,7 @@ function setSearching(isSearching, text) {
   const button = document.getElementById('getDealButton');
   progress.classList.toggle('hidden', !isSearching);
   if (button) {
-    button.disabled = isSearching || !userIdentified;
+    button.disabled = isSearching;
     button.textContent = isSearching ? 'Ищем...' : 'Получить сделку';
   }
   if (text) {
@@ -1991,19 +1946,20 @@ function setSearching(isSearching, text) {
 }
 async function getDeal() {
   if (isDealSearchRunning) return;
-  if (!userIdentified) {
-    document.getElementById('status').textContent = 'Не удалось определить пользователя Битрикс. Обновите страницу приложения.';
-    return;
-  }
   isDealSearchRunning = true;
   selectedDealId = null;
   currentDeal = null;
+  const managerId = document.getElementById('managerId').value.trim();
+  const auth = currentAuth();
+  if (!managerId && !auth) {
+    isDealSearchRunning = false;
+    document.getElementById('status').textContent = 'Не удалось определить пользователя Битрикс. Обновите страницу приложения.';
+    return;
+  }
   document.getElementById('status').textContent = 'Ищу подходящую сделку...';
   setSearching(true);
   document.getElementById('result').hidden = true;
   clearGreeting();
-  const auth = currentAuth();
-  const managerId = document.getElementById('managerId').value.trim();
   let data = null;
   const searchSkipped = new Set(skippedDeals.map(String));
   let checkedCount = 0;
@@ -2018,7 +1974,10 @@ async function getDeal() {
       (data.scannedDealIds || []).forEach((dealId) => searchSkipped.add(String(dealId)));
       checkedCount += Number(data.checkedCount || 0);
       if (data.deal || !data.hasMore) break;
-      setSearching(true, `Проверено заявок: ${checkedCount}. Ищу дальше, начиная со старых...`);
+      setSearching(
+        true,
+        `Проверено заявок: ${checkedCount}. Ищу дальше, начиная со старых...`
+      );
     }
     if (data && !data.deal && data.hasMore) {
       data.reason = 'Поиск занял больше обычного. Подождите минуту и попробуйте ещё раз.';
@@ -2075,7 +2034,7 @@ async function claimSelected() {
     const managerId = document.getElementById('managerId').value.trim();
     const auth = currentAuth();
     if (!selectedDealId) return showResult({ ok: false, message: 'Сначала выберите сделку.' });
-    if (!userIdentified) return showResult({ ok: false, message: 'Не удалось определить пользователя Битрикс.' });
+    if (!managerId && !auth) return showResult({ ok: false, message: 'Не удалось определить пользователя Битрикс.' });
   const button = document.querySelector('.claim-button');
   if (button) {
     button.disabled = true;
