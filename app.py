@@ -1828,9 +1828,13 @@ function detectBitrixUser() {
   if (!window.BX24 || !BX24.init || !BX24.callMethod) {
     detectUserFromServerAuth().then((found) => {
       if (!found) {
-        document.getElementById('managerSelect').classList.remove('hidden');
-        document.getElementById('managerId').classList.remove('hidden');
-        document.getElementById('status').textContent = 'Локальный тест: выберите менеджера вручную.';
+        if (ALLOW_UNVERIFIED_USERS) {
+          document.getElementById('managerSelect').classList.remove('hidden');
+          document.getElementById('managerId').classList.remove('hidden');
+          document.getElementById('status').textContent = 'Локальный тест: выберите менеджера вручную.';
+        } else {
+          document.getElementById('status').textContent = 'Приложение должно быть открыто внутри Bitrix24.';
+        }
       }
     });
     return;
