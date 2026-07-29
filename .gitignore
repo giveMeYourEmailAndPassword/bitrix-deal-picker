@@ -13,6 +13,8 @@ env/
 .env.vibecode
 !.env.example
 
+doc_*.env.*
+*.zip
 # Файлы состояния (runtime-логи) — живут в Volume, не в репозитории.
 # managers.json хранится в репозитории как статический список компетенций.
 access_rules.json
