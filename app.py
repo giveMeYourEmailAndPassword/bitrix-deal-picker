@@ -36,6 +36,10 @@ TARGET_STAGE = "NEW"
 TARGET_STAGE_NAME = "В РАБОТЕ"
 OPENLINE_HISTORY_CACHE = {}
 DEAL_ANALYSIS_CACHE = {}
+PORTAL_USERS_CACHE = {}
+CRM_CLAIM_COUNTS_CACHE = {}
+CRM_CLAIM_COUNTS_CACHE_LOCK = threading.Lock()
+PORTAL_USERS_CACHE_TTL_SECONDS = float(os.environ.get("PORTAL_USERS_CACHE_TTL_SECONDS", "300"))
 DRY_RUN = os.environ.get("DRY_RUN", "1").lower() not in {"0", "false", "no"}
 PUBLIC_APP_URL = os.environ.get("PUBLIC_APP_URL", "https://app-7ecf09c67021.vibecode.bitrix24.tech").rstrip("/")
 ADMIN_USER_IDS = {
@@ -352,6 +356,46 @@ def count_claims_in_log(log, manager_id, date_from=None, date_to=None):
         if date_from <= claim_date <= date_to:
             total += 1
     return total
+
+
+def crm_claim_counts(date_from, date_to):
+    """Количество сделок в стадии «В работе», изменённых за период,
+    сгруппированных по ответственному менеджеру. Источник — Битрикс24 CRM,
+    поэтому учитываются заявки, взятые как через приложение, так и напрямую в CRM."""
+    cache_key = f"{date_from}|{date_to}"
+    now = time.monotonic()
+    with CRM_CLAIM_COUNTS_CACHE_LOCK:
+        cached = CRM_CLAIM_COUNTS_CACHE.get(cache_key)
+        if cached and now - cached["ts"] < 30:
+            return cached["data"]
+    counts = {}
+    start = 0
+    while start <= 450:
+        try:
+            page = bitrix_call(
+                "crm.deal.list",
+                {
+                    "filter[STAGE_ID]": TARGET_STAGE,
+                    "filter[>=DATE_MODIFY]": f"{date_from} 00:00:00",
+                    "filter[<=DATE_MODIFY]": f"{date_to} 23:59:59",
+                    "select[]": ["ID", "ASSIGNED_BY_ID"],
+                    "start": start,
+                },
+                BITRIX_TIMEOUT_SECONDS,
+            ) or []
+        except Exception as exc:
+            sys.stderr.write(f"crm_claim_counts error: {exc}\n")
+            break
+        for deal in page:
+            mid = str(deal.get("ASSIGNED_BY_ID") or "")
+            if mid and mid != "0":
+                counts[mid] = counts.get(mid, 0) + 1
+        if len(page) < 50:
+            break
+        start += 50
+    with CRM_CLAIM_COUNTS_CACHE_LOCK:
+        CRM_CLAIM_COUNTS_CACHE[cache_key] = {"ts": now, "data": counts}
+    return counts
 
 
 def count_rejections_in_log(log, manager_id, date_from=None, date_to=None):
@@ -1240,6 +1284,9 @@ def record_rejection(manager_id, payload):
 
 
 def list_portal_users():
+    now = time.monotonic()
+    if PORTAL_USERS_CACHE and now - PORTAL_USERS_CACHE.get("cachedAt", 0) < PORTAL_USERS_CACHE_TTL_SECONDS:
+        return list(PORTAL_USERS_CACHE["users"])
     users = []
     start = 0
     while True:
@@ -1254,7 +1301,9 @@ def list_portal_users():
         if "next" not in payload:
             break
         start = payload.get("next")
-    return users
+    PORTAL_USERS_CACHE["users"] = users
+    PORTAL_USERS_CACHE["cachedAt"] = now
+    return list(users)
 
 
 def admin_state(payload):
@@ -1271,8 +1320,30 @@ def admin_state(payload):
     log_manager_ids = {str(item.get("managerId")) for item in log if item.get("managerId")}
     reject_manager_ids = {str(item.get("managerId")) for item in reject_log if item.get("managerId")}
     manager_ids = set(rules.keys()) | log_manager_ids | reject_manager_ids
-    portal_users = list_portal_users()
-    profiles_by_id = get_manager_profiles_bulk(portal_users)
+    warnings = []
+    crm_period_counts = {}
+    crm_today_counts = {}
+    try:
+        crm_period_counts = crm_claim_counts(date_from, date_to)
+    except Exception as exc:
+        warnings.append(f"Не удалось загрузить статистику заявок из CRM: {exc}")
+    if date_from == today == date_to:
+        crm_today_counts = crm_period_counts
+    else:
+        try:
+            crm_today_counts = crm_claim_counts(today, today)
+        except Exception as exc:
+            warnings.append(f"Не удалось загрузить статистику заявок за сегодня из CRM: {exc}")
+    try:
+        portal_users = list_portal_users()
+    except Exception as exc:
+        portal_users = []
+        warnings.append(f"Не удалось загрузить список пользователей портала: {exc}")
+    try:
+        profiles_by_id = get_manager_profiles_bulk(portal_users)
+    except Exception as exc:
+        profiles_by_id = {}
+        warnings.append(f"Не удалось загрузить профили менеджеров: {exc}")
 
     rows = []
     for user in portal_users:
@@ -1291,8 +1362,8 @@ def admin_state(payload):
                 "name": profile.get("name") or " ".join(part for part in [user.get("NAME"), user.get("LAST_NAME")] if part).strip() or manager_id,
                 "competencies": competencies,
                 "rule": rule,
-                "takenInPeriod": count_claims_in_log(log, manager_id, date_from, date_to),
-                "takenToday": count_claims_in_log(log, manager_id, today, today),
+                "takenInPeriod": max(crm_period_counts.get(manager_id, 0), count_claims_in_log(log, manager_id, date_from, date_to)),
+                "takenToday": max(crm_today_counts.get(manager_id, 0), count_claims_in_log(log, manager_id, today, today)),
                 "rejectedInPeriod": count_rejections_in_log(reject_log, manager_id, date_from, date_to),
                 "rejectedToday": count_rejections_in_log(reject_log, manager_id, today, today),
                 "topRejectReason": rejection_reason_summary(reject_log, manager_id, date_from, date_to),
@@ -1309,8 +1380,8 @@ def admin_state(payload):
                 "name": profile.get("name") or manager_id,
                 "competencies": profile.get("competencies") or [],
                 "rule": get_manager_rule(manager_id),
-                "takenInPeriod": count_claims_in_log(log, manager_id, date_from, date_to),
-                "takenToday": count_claims_in_log(log, manager_id, today, today),
+                "takenInPeriod": max(crm_period_counts.get(manager_id, 0), count_claims_in_log(log, manager_id, date_from, date_to)),
+                "takenToday": max(crm_today_counts.get(manager_id, 0), count_claims_in_log(log, manager_id, today, today)),
                 "rejectedInPeriod": count_rejections_in_log(reject_log, manager_id, date_from, date_to),
                 "rejectedToday": count_rejections_in_log(reject_log, manager_id, today, today),
                 "topRejectReason": rejection_reason_summary(reject_log, manager_id, date_from, date_to),
@@ -1318,7 +1389,7 @@ def admin_state(payload):
         )
 
     rows.sort(key=lambda item: item["name"].lower())
-    return {
+    result = {
         "ok": True,
         "isAdmin": True,
         "admin": {"id": admin["id"], "name": admin.get("name")},
@@ -1327,6 +1398,9 @@ def admin_state(payload):
         "today": today,
         "managers": rows,
     }
+    if warnings:
+        result["warnings"] = warnings
+    return result
 
 
 def update_admin_rule(payload):
@@ -1646,7 +1720,7 @@ INDEX_HTML = """<!doctype html>
     <section id="greetingBox" class="card greeting-box hidden"></section>
     <section id="adminPanel" class="admin-panel hidden">
       <h2>Доступ менеджеров</h2>
-      <div class="meta">Этот блок видит только администратор. Здесь можно закрыть выдачу заявок или поставить дневной лимит. Лимит не применяется в воскресенье и каждый день с 18:00 до 21:30.</div>
+      <div class="meta">Этот блок видит только администратор. Здесь можно закрыть выдачу заявок или поставить дневной лимит. Лимит не применяется в воскресенье и каждый день с 18:00 до 21:30. Подсчёт взятых заявок берётся из CRM (сделки в стадии «В работе»), поэтому учитываются заявки, взятые как через приложение, так и напрямую в Битрикс24.</div>
       <div class="toolbar">
         <input id="statsFrom" type="date">
         <input id="statsTo" type="date">
