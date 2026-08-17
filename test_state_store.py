@@ -1906,5 +1906,72 @@ class TestGreetingOutbox(StateStoreTestCase):
             )
             self.assertFalse(finalized["greetingQueued"])
         self.assertEqual(store.list_greeting_outbox(), [])
+
+
+class TestLostDealAutocloseState(StateStoreTestCase):
+    def transition(self):
+        return {
+            "transitionId": "9001",
+            "dealId": "7001",
+            "fromSemantic": "P",
+            "toSemantic": "F",
+            "fromCategoryId": "0",
+            "toCategoryId": "0",
+            "fromStageId": "NEW",
+            "toStageId": "LOSE",
+            "transitionTime": "2099-01-01T10:00:01+00:00",
+        }
+
+    def test_first_install_has_no_armed_remote_boundary(self):
+        store = self.make_store()
+        self.assertIsNone(store.get_lost_deal_autoclose_boundary())
+        self.assertIsNotNone(store.get_lost_deal_autoclose_watermark())
+
+    def test_remote_arm_is_immutable_and_history_cursor_advances_separately(self):
+        store = self.make_store()
+        first = store.arm_lost_deal_autoclose(
+            "2099-01-01T10:00:00+00:00", 9000
+        )
+        second = store.arm_lost_deal_autoclose(
+            "2099-02-01T10:00:00+00:00", 9999
+        )
+
+        self.assertTrue(first["armedNow"])
+        self.assertFalse(second["armedNow"])
+        boundary = store.get_lost_deal_autoclose_boundary()
+        self.assertEqual(boundary["baselineHistoryId"], 9000)
+        self.assertEqual(boundary["scanAfterHistoryId"], 9000)
+        store.advance_lost_deal_autoclose_history_id(9010)
+        advanced = store.get_lost_deal_autoclose_boundary()
+        self.assertEqual(advanced["baselineHistoryId"], 9000)
+        self.assertEqual(advanced["scanAfterHistoryId"], 9010)
+
+    def test_dispatch_boundary_persists_reconciliation_identity_and_never_reclaims(self):
+        store = self.make_store()
+        claim = store.claim_lost_deal_close_transition(self.transition())
+        dispatching = store.mark_lost_deal_close_dispatching(
+            "9001",
+            claim["leaseToken"],
+            "8101",
+            "8201",
+            "8301",
+            12,
+            "a" * 64,
+            "8401",
+        )
+        self.assertEqual(dispatching["status"], "dispatching")
+        self.assertEqual(dispatching["sessionId"], "8201")
+        self.assertEqual(dispatching["lastMessageId"], "8301")
+        self.assertEqual(dispatching["historySignature"], "a" * 64)
+        self.assertEqual(dispatching["activityId"], "8401")
+
+        replay = store.claim_lost_deal_close_transition(self.transition())
+        self.assertFalse(replay["claimed"])
+        self.assertEqual(replay["status"], "dispatching")
+        store.mark_lost_deal_close_uncertain("9001")
+        store.mark_lost_deal_close_reconciled("9001")
+        self.assertEqual(
+            store.get_lost_deal_close_operation("9001")["status"], "closed"
+        )
 if __name__ == "__main__":
     unittest.main()

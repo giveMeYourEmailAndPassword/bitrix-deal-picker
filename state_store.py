@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import sqlite3
 import uuid
 from contextlib import contextmanager
@@ -23,6 +24,8 @@ from typing import Any, Dict, Iterable, Iterator, Mapping, Optional
 SCHEMA_VERSION = 2
 DEFAULT_DB_FILENAME = "state.sqlite3"
 MIGRATION_MARKER = "legacy_json_migration_v1"
+LOST_DEAL_AUTOCLOSE_WATERMARK = "lost_deal_autoclose_watermark_v1"
+LOST_DEAL_AUTOCLOSE_ARMED = "lost_deal_autoclose_armed_v1"
 
 LEGACY_FILES = {
     "access_rules.json": dict,
@@ -353,6 +356,37 @@ class StateStore:
                     finalized_at TEXT
                 );
 
+                CREATE TABLE IF NOT EXISTS lost_deal_close_operations (
+                    transition_id TEXT PRIMARY KEY,
+                    deal_id TEXT NOT NULL,
+                    from_semantic TEXT NOT NULL CHECK (from_semantic IN ('P', 'S')),
+                    to_semantic TEXT NOT NULL CHECK (to_semantic = 'F'),
+                    from_category_id TEXT NOT NULL,
+                    to_category_id TEXT NOT NULL,
+                    from_stage_id TEXT NOT NULL,
+                    to_stage_id TEXT NOT NULL,
+                    transition_time TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK (status IN (
+                        'checking', 'retryable', 'skipped', 'dry_run',
+                        'dispatching', 'closed', 'uncertain'
+                    )),
+                    outcome_code TEXT NOT NULL DEFAULT '',
+                    chat_id TEXT NOT NULL DEFAULT '',
+                    session_id TEXT NOT NULL DEFAULT '',
+                    last_message_id TEXT NOT NULL DEFAULT '',
+                    history_message_count INTEGER NOT NULL DEFAULT 0
+                        CHECK (history_message_count >= 0),
+                    history_signature TEXT NOT NULL DEFAULT '',
+                    activity_id TEXT NOT NULL DEFAULT '',
+                    attempt_count INTEGER NOT NULL DEFAULT 1 CHECK (attempt_count >= 1),
+                    lease_token TEXT NOT NULL DEFAULT '',
+                    lease_expires_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    dispatching_at TEXT,
+                    finalized_at TEXT
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_claim_events_manager_date
                     ON claim_events(manager_id, event_date);
                 CREATE INDEX IF NOT EXISTS idx_reject_events_manager_date
@@ -378,6 +412,10 @@ class StateStore:
                     ON greeting_outbox(status, next_attempt_at, lease_expires_at, created_at);
                 CREATE INDEX IF NOT EXISTS idx_greeting_outbox_manager_status
                     ON greeting_outbox(manager_id, status);
+                CREATE INDEX IF NOT EXISTS idx_lost_deal_close_deal
+                    ON lost_deal_close_operations(deal_id, transition_time DESC);
+                CREATE INDEX IF NOT EXISTS idx_lost_deal_close_status
+                    ON lost_deal_close_operations(status, updated_at);
                 """
             )
             for statement in schema_sql.split(";"):
@@ -431,6 +469,47 @@ class StateStore:
             if "dead_letter_at" not in outbox_columns:
                 connection.execute(
                     "ALTER TABLE integration_outbox ADD COLUMN dead_letter_at TEXT"
+                )
+            lost_close_columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(lost_deal_close_operations)"
+                )
+            }
+            if "from_category_id" not in lost_close_columns:
+                connection.execute(
+                    "ALTER TABLE lost_deal_close_operations "
+                    "ADD COLUMN from_category_id TEXT NOT NULL DEFAULT '0'"
+                )
+            if "to_category_id" not in lost_close_columns:
+                connection.execute(
+                    "ALTER TABLE lost_deal_close_operations "
+                    "ADD COLUMN to_category_id TEXT NOT NULL DEFAULT '0'"
+                )
+            if "session_id" not in lost_close_columns:
+                connection.execute(
+                    "ALTER TABLE lost_deal_close_operations "
+                    "ADD COLUMN session_id TEXT NOT NULL DEFAULT ''"
+                )
+            if "last_message_id" not in lost_close_columns:
+                connection.execute(
+                    "ALTER TABLE lost_deal_close_operations "
+                    "ADD COLUMN last_message_id TEXT NOT NULL DEFAULT ''"
+                )
+            if "history_message_count" not in lost_close_columns:
+                connection.execute(
+                    "ALTER TABLE lost_deal_close_operations "
+                    "ADD COLUMN history_message_count INTEGER NOT NULL DEFAULT 0"
+                )
+            if "activity_id" not in lost_close_columns:
+                connection.execute(
+                    "ALTER TABLE lost_deal_close_operations "
+                    "ADD COLUMN activity_id TEXT NOT NULL DEFAULT ''"
+                )
+            if "history_signature" not in lost_close_columns:
+                connection.execute(
+                    "ALTER TABLE lost_deal_close_operations "
+                    "ADD COLUMN history_signature TEXT NOT NULL DEFAULT ''"
                 )
             # Older development builds keyed the uncertain auto-send
             # reservation only by dealId, which incorrectly crossed claim
@@ -516,6 +595,16 @@ class StateStore:
                     "UPDATE meta SET value = ?, updated_at = ? WHERE key = 'schema_version'",
                     (str(SCHEMA_VERSION), now),
                 )
+            # Keep the local schema-install time only as an audit watermark.
+            # The worker's real no-backlog boundary is armed separately from
+            # the current remote stage-history ID on its first enabled poll.
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO meta(key, value, updated_at)
+                VALUES(?, ?, ?)
+                """,
+                (LOST_DEAL_AUTOCLOSE_WATERMARK, now, now),
+            )
             connection.commit()
         except BaseException:
             connection.rollback()
@@ -627,6 +716,7 @@ class StateStore:
                         "extra_claim_grants",
                         "integration_outbox",
                         "greeting_outbox",
+                        "lost_deal_close_operations",
                     )
                 )
             if quick_check != "ok":
@@ -3795,6 +3885,574 @@ class StateStore:
             if operation.get("dealId")
         }
 
+    # ------------------------------------------------------------------
+    # Lost-deal OpenLine auto-close
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _lost_deal_close_row(row: sqlite3.Row) -> Dict[str, Any]:
+        return {
+            "transitionId": str(row["transition_id"]),
+            "dealId": str(row["deal_id"]),
+            "fromSemantic": str(row["from_semantic"]),
+            "toSemantic": str(row["to_semantic"]),
+            "fromCategoryId": str(row["from_category_id"]),
+            "toCategoryId": str(row["to_category_id"]),
+            "fromStageId": str(row["from_stage_id"]),
+            "toStageId": str(row["to_stage_id"]),
+            "transitionTime": str(row["transition_time"]),
+            "status": str(row["status"]),
+            "outcomeCode": str(row["outcome_code"] or ""),
+            "chatId": str(row["chat_id"] or ""),
+            "sessionId": str(row["session_id"] or ""),
+            "lastMessageId": str(row["last_message_id"] or ""),
+            "historyMessageCount": int(row["history_message_count"] or 0),
+            "historySignature": str(row["history_signature"] or ""),
+            "activityId": str(row["activity_id"] or ""),
+            "attemptCount": int(row["attempt_count"]),
+            "leaseToken": str(row["lease_token"] or ""),
+            "leaseExpiresAt": row["lease_expires_at"],
+            "createdAt": str(row["created_at"]),
+            "updatedAt": str(row["updated_at"]),
+            "dispatchingAt": row["dispatching_at"],
+            "finalizedAt": row["finalized_at"],
+        }
+
+    def get_lost_deal_autoclose_watermark(self) -> datetime:
+        """Return the immutable first-install boundary for close candidates."""
+
+        self._ensure_ready()
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT value FROM meta WHERE key = ?",
+                (LOST_DEAL_AUTOCLOSE_WATERMARK,),
+            ).fetchone()
+        if not row:
+            raise StateStoreError("lost-deal auto-close watermark is missing")
+        try:
+            value = datetime.fromisoformat(str(row["value"]))
+        except (TypeError, ValueError) as exc:
+            raise StateStoreError("lost-deal auto-close watermark is invalid") from exc
+        if value.tzinfo is None:
+            raise StateStoreError("lost-deal auto-close watermark has no timezone")
+        return value
+
+    def arm_lost_deal_autoclose(
+        self,
+        remote_time: Any,
+        baseline_history_id: Any,
+    ) -> Dict[str, Any]:
+        """Create the remote-bound first-run boundary exactly once."""
+
+        self._ensure_ready()
+        remote_time, _ = self._normalize_timestamp(remote_time)
+        try:
+            baseline_history_id = int(str(baseline_history_id or "0"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("baseline_history_id must be a non-negative integer") from exc
+        if baseline_history_id < 0:
+            raise ValueError("baseline_history_id must be a non-negative integer")
+        install_time = self.get_lost_deal_autoclose_watermark()
+        parsed_remote = datetime.fromisoformat(remote_time)
+        boundary_time = max(parsed_remote, install_time).isoformat(timespec="microseconds")
+        now = self._now_iso()
+        with self._transaction(immediate=True) as connection:
+            row = connection.execute(
+                "SELECT value FROM meta WHERE key = ?",
+                (LOST_DEAL_AUTOCLOSE_ARMED,),
+            ).fetchone()
+            armed_now = row is None
+            if row is None:
+                value = {
+                    "armedAt": boundary_time,
+                    "baselineHistoryId": baseline_history_id,
+                    "scanAfterHistoryId": baseline_history_id,
+                }
+                connection.execute(
+                    "INSERT INTO meta(key, value, updated_at) VALUES(?, ?, ?)",
+                    (LOST_DEAL_AUTOCLOSE_ARMED, _json_dumps(value), now),
+                )
+            else:
+                try:
+                    value = json.loads(row["value"])
+                except (TypeError, json.JSONDecodeError) as exc:
+                    raise StateStoreError("lost-deal armed boundary is invalid") from exc
+        if not isinstance(value, dict):
+            raise StateStoreError("lost-deal armed boundary is invalid")
+        return {**value, "armedNow": armed_now}
+
+    def get_lost_deal_autoclose_boundary(self) -> Optional[Dict[str, Any]]:
+        self._ensure_ready()
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT value FROM meta WHERE key = ?",
+                (LOST_DEAL_AUTOCLOSE_ARMED,),
+            ).fetchone()
+        if not row:
+            return None
+        try:
+            value = json.loads(row["value"])
+            armed_at = datetime.fromisoformat(str(value["armedAt"]))
+            baseline_id = int(value["baselineHistoryId"])
+            scan_after_id = int(value.get("scanAfterHistoryId", baseline_id))
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise StateStoreError("lost-deal armed boundary is invalid") from exc
+        if (
+            armed_at.tzinfo is None
+            or baseline_id < 0
+            or scan_after_id < baseline_id
+        ):
+            raise StateStoreError("lost-deal armed boundary is invalid")
+        return {
+            "armedAt": armed_at,
+            "baselineHistoryId": baseline_id,
+            "scanAfterHistoryId": scan_after_id,
+        }
+
+    def advance_lost_deal_autoclose_history_id(self, value: Any) -> Dict[str, Any]:
+        self._ensure_ready()
+        try:
+            requested = int(str(value))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("history cursor must be a non-negative integer") from exc
+        if requested < 0:
+            raise ValueError("history cursor must be a non-negative integer")
+        now = self._now_iso()
+        with self._transaction(immediate=True) as connection:
+            row = connection.execute(
+                "SELECT value FROM meta WHERE key=?",
+                (LOST_DEAL_AUTOCLOSE_ARMED,),
+            ).fetchone()
+            if not row:
+                raise StateStoreError("lost-deal auto-close is not armed")
+            try:
+                boundary = json.loads(row["value"])
+                baseline = int(boundary["baselineHistoryId"])
+                current = int(boundary.get("scanAfterHistoryId", baseline))
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise StateStoreError("lost-deal armed boundary is invalid") from exc
+            boundary["scanAfterHistoryId"] = max(baseline, current, requested)
+            connection.execute(
+                "UPDATE meta SET value=?, updated_at=? WHERE key=?",
+                (_json_dumps(boundary), now, LOST_DEAL_AUTOCLOSE_ARMED),
+            )
+        return boundary
+
+    def _normalize_lost_deal_transition(
+        self,
+        transition: Mapping[str, Any],
+    ) -> Dict[str, str]:
+        if not isinstance(transition, Mapping):
+            raise ValueError("transition must be an object")
+        transition_id = str(transition.get("transitionId") or "").strip()
+        deal_id = str(transition.get("dealId") or "").strip()
+        from_semantic = str(transition.get("fromSemantic") or "").strip().upper()
+        to_semantic = str(transition.get("toSemantic") or "").strip().upper()
+        from_category_id = str(transition.get("fromCategoryId") or "").strip()
+        to_category_id = str(transition.get("toCategoryId") or "").strip()
+        from_stage_id = str(transition.get("fromStageId") or "").strip()
+        to_stage_id = str(transition.get("toStageId") or "").strip()
+        if not re.fullmatch(r"[1-9]\d{0,19}", transition_id):
+            raise ValueError("transitionId must be a positive integer")
+        if not re.fullmatch(r"[1-9]\d{0,19}", deal_id):
+            raise ValueError("dealId must be a positive integer")
+        if from_semantic not in {"P", "S"} or to_semantic != "F":
+            raise ValueError("transition must be exactly non-F to F")
+        if not re.fullmatch(r"\d{1,19}", from_category_id):
+            raise ValueError("fromCategoryId must be a non-negative integer")
+        if not re.fullmatch(r"\d{1,19}", to_category_id):
+            raise ValueError("toCategoryId must be a non-negative integer")
+        if not from_stage_id or len(from_stage_id) > 128:
+            raise ValueError("fromStageId is invalid")
+        if not to_stage_id or len(to_stage_id) > 128:
+            raise ValueError("toStageId is invalid")
+        transition_time, _ = self._normalize_timestamp(
+            transition.get("transitionTime"),
+        )
+        return {
+            "transitionId": transition_id,
+            "dealId": deal_id,
+            "fromSemantic": from_semantic,
+            "toSemantic": to_semantic,
+            "fromCategoryId": from_category_id,
+            "toCategoryId": to_category_id,
+            "fromStageId": from_stage_id,
+            "toStageId": to_stage_id,
+            "transitionTime": transition_time,
+        }
+
+    @staticmethod
+    def _normalize_lost_deal_outcome_code(value: Any) -> str:
+        value = str(value or "").strip().lower()
+        if value and not re.fullmatch(r"[a-z0-9_]{1,80}", value):
+            raise ValueError("outcome code is invalid")
+        return value
+
+    def claim_lost_deal_close_transition(
+        self,
+        transition: Mapping[str, Any],
+        *,
+        lease_seconds: int = 120,
+    ) -> Dict[str, Any]:
+        """Claim safe pre-dispatch checks for one proven stage transition.
+
+        ``dispatching`` is deliberately terminal for this method.  Once the
+        irreversible REST call may have started, no worker can acquire the
+        transition again, even after a process crash or lease timeout.
+        """
+
+        self._ensure_ready()
+        normalized = self._normalize_lost_deal_transition(transition)
+        lease_seconds = max(30, min(900, int(lease_seconds)))
+        now_dt = datetime.now(self.local_timezone)
+        now = now_dt.isoformat(timespec="microseconds")
+        lease_expires_at = (now_dt + timedelta(seconds=lease_seconds)).isoformat(
+            timespec="microseconds"
+        )
+        lease_token = secrets.token_urlsafe(24)
+        with self._transaction(immediate=True) as connection:
+            row = connection.execute(
+                "SELECT * FROM lost_deal_close_operations WHERE transition_id = ?",
+                (normalized["transitionId"],),
+            ).fetchone()
+            if row is None:
+                connection.execute(
+                    """
+                    INSERT INTO lost_deal_close_operations(
+                        transition_id, deal_id, from_semantic, to_semantic,
+                        from_category_id, to_category_id,
+                        from_stage_id, to_stage_id, transition_time,
+                        status, attempt_count, lease_token, lease_expires_at,
+                        created_at, updated_at
+                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 'checking', 1, ?, ?, ?, ?)
+                    """,
+                    (
+                        normalized["transitionId"],
+                        normalized["dealId"],
+                        normalized["fromSemantic"],
+                        normalized["toSemantic"],
+                        normalized["fromCategoryId"],
+                        normalized["toCategoryId"],
+                        normalized["fromStageId"],
+                        normalized["toStageId"],
+                        normalized["transitionTime"],
+                        lease_token,
+                        lease_expires_at,
+                        now,
+                        now,
+                    ),
+                )
+                claimed = True
+                reason = "new_transition"
+            else:
+                existing = self._lost_deal_close_row(row)
+                immutable = (
+                    existing["dealId"],
+                    existing["fromSemantic"],
+                    existing["toSemantic"],
+                    existing["fromCategoryId"],
+                    existing["toCategoryId"],
+                    existing["fromStageId"],
+                    existing["toStageId"],
+                    existing["transitionTime"],
+                )
+                requested = (
+                    normalized["dealId"],
+                    normalized["fromSemantic"],
+                    normalized["toSemantic"],
+                    normalized["fromCategoryId"],
+                    normalized["toCategoryId"],
+                    normalized["fromStageId"],
+                    normalized["toStageId"],
+                    normalized["transitionTime"],
+                )
+                if immutable != requested:
+                    raise IdempotencyConflictError(
+                        "stage-history transition identity was reused with different data"
+                    )
+                status = existing["status"]
+                expired = True
+                if existing.get("leaseExpiresAt"):
+                    try:
+                        expiry = datetime.fromisoformat(str(existing["leaseExpiresAt"]))
+                        expired = expiry <= now_dt
+                    except (TypeError, ValueError):
+                        expired = True
+                if status == "retryable" or (status == "checking" and expired):
+                    connection.execute(
+                        """
+                        UPDATE lost_deal_close_operations
+                        SET status='checking', outcome_code='',
+                            attempt_count=attempt_count + 1,
+                            lease_token=?, lease_expires_at=?, updated_at=?
+                        WHERE transition_id=?
+                        """,
+                        (
+                            lease_token,
+                            lease_expires_at,
+                            now,
+                            normalized["transitionId"],
+                        ),
+                    )
+                    claimed = True
+                    reason = "retry_pre_dispatch"
+                else:
+                    claimed = False
+                    reason = "checking_in_progress" if status == "checking" else "already_final"
+            result_row = connection.execute(
+                "SELECT * FROM lost_deal_close_operations WHERE transition_id = ?",
+                (normalized["transitionId"],),
+            ).fetchone()
+        result = self._lost_deal_close_row(result_row)
+        result["claimed"] = claimed
+        result["claimReason"] = reason
+        # Do not expose an old/stale lease token to callers that did not claim.
+        if not claimed:
+            result["leaseToken"] = ""
+        return result
+
+    def get_lost_deal_close_operation(self, transition_id: Any) -> Optional[Dict[str, Any]]:
+        self._ensure_ready()
+        transition_id = str(transition_id or "").strip()
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM lost_deal_close_operations WHERE transition_id = ?",
+                (transition_id,),
+            ).fetchone()
+        return self._lost_deal_close_row(row) if row else None
+
+    def _update_lost_deal_check_status(
+        self,
+        transition_id: Any,
+        lease_token: Any,
+        *,
+        status: str,
+        outcome_code: Any,
+        chat_id: Any = "",
+        finalized: bool,
+    ) -> Dict[str, Any]:
+        self._ensure_ready()
+        transition_id = str(transition_id or "").strip()
+        lease_token = str(lease_token or "").strip()
+        chat_id = str(chat_id or "").strip()
+        if not transition_id or not lease_token:
+            raise ValueError("transition_id and lease_token are required")
+        if chat_id and not re.fullmatch(r"[1-9]\d{0,19}", chat_id):
+            raise ValueError("chat_id must be a positive integer")
+        outcome_code = self._normalize_lost_deal_outcome_code(outcome_code)
+        now = self._now_iso()
+        with self._transaction(immediate=True) as connection:
+            cursor = connection.execute(
+                """
+                UPDATE lost_deal_close_operations
+                SET status=?, outcome_code=?, chat_id=?, lease_token='',
+                    lease_expires_at=NULL, updated_at=?, finalized_at=?
+                WHERE transition_id=? AND status='checking' AND lease_token=?
+                """,
+                (
+                    status,
+                    outcome_code,
+                    chat_id,
+                    now,
+                    now if finalized else None,
+                    transition_id,
+                    lease_token,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise StateStoreError("lost-deal close check lease is no longer owned")
+            row = connection.execute(
+                "SELECT * FROM lost_deal_close_operations WHERE transition_id = ?",
+                (transition_id,),
+            ).fetchone()
+        return self._lost_deal_close_row(row)
+
+    def mark_lost_deal_close_retryable(
+        self,
+        transition_id: Any,
+        lease_token: Any,
+        outcome_code: Any,
+    ) -> Dict[str, Any]:
+        return self._update_lost_deal_check_status(
+            transition_id,
+            lease_token,
+            status="retryable",
+            outcome_code=outcome_code,
+            finalized=False,
+        )
+
+    def finalize_lost_deal_close_check(
+        self,
+        transition_id: Any,
+        lease_token: Any,
+        *,
+        status: str,
+        outcome_code: Any,
+        chat_id: Any = "",
+    ) -> Dict[str, Any]:
+        if status not in {"skipped", "dry_run"}:
+            raise ValueError("pre-dispatch final status must be skipped or dry_run")
+        return self._update_lost_deal_check_status(
+            transition_id,
+            lease_token,
+            status=status,
+            outcome_code=outcome_code,
+            chat_id=chat_id,
+            finalized=True,
+        )
+
+    def mark_lost_deal_close_dispatching(
+        self,
+        transition_id: Any,
+        lease_token: Any,
+        chat_id: Any,
+        session_id: Any,
+        last_message_id: Any,
+        history_message_count: int,
+        history_signature: Any,
+        activity_id: Any,
+    ) -> Dict[str, Any]:
+        """Commit the no-retry boundary before the remote finish call."""
+
+        self._ensure_ready()
+        transition_id = str(transition_id or "").strip()
+        lease_token = str(lease_token or "").strip()
+        chat_id = str(chat_id or "").strip()
+        session_id = str(session_id or "").strip()
+        last_message_id = str(last_message_id or "").strip()
+        activity_id = str(activity_id or "").strip()
+        history_signature = str(history_signature or "").strip().lower()
+        if not re.fullmatch(r"[1-9]\d{0,19}", chat_id):
+            raise ValueError("chat_id must be a positive integer")
+        if not re.fullmatch(r"[1-9]\d{0,19}", session_id):
+            raise ValueError("session_id must be a positive integer")
+        if last_message_id and not re.fullmatch(r"[1-9]\d{0,19}", last_message_id):
+            raise ValueError("last_message_id must be a positive integer or empty")
+        history_message_count = int(history_message_count)
+        if history_message_count < 0 or history_message_count > 1_000_000:
+            raise ValueError("history_message_count is invalid")
+        if not re.fullmatch(r"[1-9]\d{0,19}", activity_id):
+            raise ValueError("activity_id must be a positive integer")
+        if not re.fullmatch(r"[0-9a-f]{64}", history_signature):
+            raise ValueError("history_signature must be a SHA-256 digest")
+        now = self._now_iso()
+        with self._transaction(immediate=True) as connection:
+            cursor = connection.execute(
+                """
+                UPDATE lost_deal_close_operations
+                SET status='dispatching', outcome_code='finish_started',
+                    chat_id=?, session_id=?, last_message_id=?,
+                    history_message_count=?, history_signature=?, activity_id=?,
+                    lease_token='', lease_expires_at=NULL,
+                    updated_at=?, dispatching_at=?
+                WHERE transition_id=? AND status='checking' AND lease_token=?
+                """,
+                (
+                    chat_id,
+                    session_id,
+                    last_message_id,
+                    history_message_count,
+                    history_signature,
+                    activity_id,
+                    now,
+                    now,
+                    transition_id,
+                    lease_token,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise StateStoreError("lost-deal close dispatch boundary was not acquired")
+            row = connection.execute(
+                "SELECT * FROM lost_deal_close_operations WHERE transition_id = ?",
+                (transition_id,),
+            ).fetchone()
+        return self._lost_deal_close_row(row)
+
+    def _finalize_lost_deal_dispatch(
+        self,
+        transition_id: Any,
+        *,
+        status: str,
+        outcome_code: Any,
+    ) -> Dict[str, Any]:
+        self._ensure_ready()
+        transition_id = str(transition_id or "").strip()
+        outcome_code = self._normalize_lost_deal_outcome_code(outcome_code)
+        if status not in {"closed", "uncertain"}:
+            raise ValueError("dispatch final status must be closed or uncertain")
+        now = self._now_iso()
+        with self._transaction(immediate=True) as connection:
+            cursor = connection.execute(
+                """
+                UPDATE lost_deal_close_operations
+                SET status=?, outcome_code=?, updated_at=?, finalized_at=?
+                WHERE transition_id=? AND status='dispatching'
+                """,
+                (status, outcome_code, now, now, transition_id),
+            )
+            if cursor.rowcount != 1:
+                raise StateStoreError("lost-deal close dispatch is not pending")
+            row = connection.execute(
+                "SELECT * FROM lost_deal_close_operations WHERE transition_id = ?",
+                (transition_id,),
+            ).fetchone()
+        return self._lost_deal_close_row(row)
+
+    def mark_lost_deal_close_closed(self, transition_id: Any) -> Dict[str, Any]:
+        return self._finalize_lost_deal_dispatch(
+            transition_id,
+            status="closed",
+            outcome_code="finished",
+        )
+
+    def mark_lost_deal_close_uncertain(
+        self,
+        transition_id: Any,
+        outcome_code: Any = "finish_result_uncertain",
+    ) -> Dict[str, Any]:
+        return self._finalize_lost_deal_dispatch(
+            transition_id,
+            status="uncertain",
+            outcome_code=outcome_code,
+        )
+
+    def list_lost_deal_close_reconciliation(self, limit: int = 100) -> list[Dict[str, Any]]:
+        self._ensure_ready()
+        limit = max(1, min(1000, int(limit)))
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM lost_deal_close_operations
+                WHERE status IN ('dispatching', 'uncertain')
+                ORDER BY updated_at, transition_id
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [self._lost_deal_close_row(row) for row in rows]
+
+    def mark_lost_deal_close_reconciled(self, transition_id: Any) -> Dict[str, Any]:
+        self._ensure_ready()
+        transition_id = str(transition_id or "").strip()
+        now = self._now_iso()
+        with self._transaction(immediate=True) as connection:
+            cursor = connection.execute(
+                """
+                UPDATE lost_deal_close_operations
+                SET status='closed', outcome_code='finished_reconciled',
+                    updated_at=?, finalized_at=?
+                WHERE transition_id=? AND status IN ('dispatching', 'uncertain')
+                """,
+                (now, now, transition_id),
+            )
+            if cursor.rowcount != 1:
+                raise StateStoreError("lost-deal close is not awaiting reconciliation")
+            row = connection.execute(
+                "SELECT * FROM lost_deal_close_operations WHERE transition_id=?",
+                (transition_id,),
+            ).fetchone()
+        return self._lost_deal_close_row(row)
+
 
 def create_state_store() -> StateStore:
     """Create a store from ``APP_DATA_DIR`` and ``STATE_DB_FILENAME``."""
@@ -3809,6 +4467,7 @@ __all__ = [
     "ExtraClaimRequestAssociationConflictError",
     "IdempotencyConflictError",
     "LegacyMigrationError",
+    "LOST_DEAL_AUTOCLOSE_WATERMARK",
     "MIGRATION_MARKER",
     "SCHEMA_VERSION",
     "StateStore",

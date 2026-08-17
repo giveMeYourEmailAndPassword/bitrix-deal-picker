@@ -23,6 +23,27 @@ durable outbox резервирует ровно эту операцию. Кор
 `im.message.add` с OAuth взявшего заявку менеджера. OAuth-токен не записывается
 в SQLite или логи; после начала отправки автоматического повтора нет.
 
+Фоновый worker `LOST_DEAL_AUTOCLOSE_ENABLED=1` опрашивает историю стадий через
+тот же серверный webhook. Он завершает диалог только для доказанного нового
+перехода сделки `P/S → F` и только когда к сделке привязан ровно один активный
+чат Открытой линии. На первом цикле worker сохраняет удалённые server time и
+максимальный history ID Bitrix и ничего не завершает: уже проигранные сделки не
+попадают в обратную обработку. В `DRY_RUN=1` все проверки выполняются, но метод
+завершения не вызывается.
+
+Перед `imopenlines.operator.another.finish` приложение дважды сверяет текущую
+стадию, точную пару записей stage history, активный чат, типизированную привязку
+`DEAL|<id>`, CHAT/SESSION identity, последнее сообщение и единственную CRM-активность
+`IMOPENLINES_SESSION`. Если Bitrix уже автоматически завершил эту CRM-активность
+вместе со сделкой (`STATUS=3`), её точная привязка всё равно принимается: это не
+считается доказательством закрытия самого диалога. Затем приложение транзакционно
+фиксирует в SQLite состояние
+`dispatching` вместе с chat/session/activity ID и безопасным SHA-256 отпечатком
+истории. После этой границы finish никогда не повторяется автоматически. При
+timeout результат остаётся `uncertain`; следующие циклы выполняют только
+read-only сверку и отмечают `closed` лишь после доказанного завершения той же
+сессии.
+
 ## Как устроено
 
 ```text
@@ -33,6 +54,7 @@ Python HTTP service
     ├── проверка portal domain + user.current
     ├── поиск и повторная серверная проверка сделки
     ├── request/rate/cache limits
+    ├── polling новых P/S → F переходов + guarded OpenLine finish
     └── события claim/reject/greeting + access rules
                          │
                          ├── /data/state.sqlite3 + durable outbox
@@ -235,8 +257,12 @@ Railway запускает Dockerfile. Поле **Custom Start Command** в на
    исправьте константы и увеличьте `ROUTING_POLICY_VERSION`.
 7. IT должен проверить права нового webhook на фактически используемые REST-
    методы: `user.get`, `crm.deal.list`, `crm.deal.get`,
-   `crm.timeline.comment.list`, `crm.activity.list`, `batch` и, для сделки с
-   OpenLine-сессией, `imopenlines.session.history.get`. Локальное приложение
+   `crm.stagehistory.list`, `crm.status.list`, `crm.timeline.comment.list`,
+   `crm.activity.list`, `crm.activity.get`, `batch`, `imopenlines.crm.chat.get`,
+   `imopenlines.dialog.get` и, для сделки с OpenLine-сессией,
+   `imopenlines.session.history.get`. Перед включением `DRY_RUN=0` отдельно на
+   согласованной тестовой сделке проверьте право
+   `imopenlines.operator.another.finish`. Локальное приложение
    должно разрешать `user.current` для проверки вошедшего пользователя. Ошибка
    доступа к обязательному источнику сообщений намеренно блокирует выдачу, а
    не превращается в «сообщений нет». Право `crm.deal.update` проверяйте только
@@ -293,6 +319,9 @@ Railway сам добавляет `RAILWAY_PROJECT_ID`, `RAILWAY_VOLUME_NAME` и
 | `REQUIRE_LEGACY_MIGRATION` | `1` для переноса этой действующей системы |
 | `REQUIRE_EXPLICIT_ACCESS_RULE` | `1`; неизвестный сотрудник запрещён по умолчанию |
 | `DRY_RUN` | `1` на первом деплое |
+| `LOST_DEAL_AUTOCLOSE_ENABLED` | `1`; worker включён, запись всё ещё блокирует `DRY_RUN=1` |
+| `LOST_DEAL_AUTOCLOSE_POLL_SECONDS` | `15`; период фонового опроса history ID |
+| `LOST_DEAL_AUTOCLOSE_GRACE_SECONDS` | `15`; окно отмены ошибочного проигрыша |
 | `BITRIX_CLAIM_MARKER_FIELD` | код отдельного строкового UF-поля сделки до `DRY_RUN=0` |
 | `GREETING_AUTO_SEND` | `0` на первом деплое; `1` только после controlled OpenLine smoke |
 | `GREETING_WORKER_POLL_SECONDS` | `1`; задержка запуска фоновой очереди приветствий |
