@@ -141,7 +141,7 @@ DEAL_ANALYSIS_CACHE_LOCK = threading.Lock()
 DEAL_HEADERS_CACHE_LOCK = threading.Lock()
 LOCAL_TZ = timezone(timedelta(hours=env_int("APP_TZ_OFFSET_HOURS", 6, -12, 14)))
 STATE_STORE = StateStore(APP_DIR, local_timezone=LOCAL_TZ, auto_initialize=False)
-APP_VERSION = "2026-08-17-bitrix-bootstrap-fix"
+APP_VERSION = "2026-08-17-bitrix-install-mode-fix"
 # Bump whenever classifier, eligibility, source-completeness or oldest-first
 # routing semantics change. Pre-deploy tokens must not authorize post-deploy
 # decisions under a different routing policy.
@@ -3268,14 +3268,23 @@ def render_index_html(install_mode=False, initial_auth=None, nonce=""):
 
 
 def looks_like_install_payload(raw_payload):
-    lowered = raw_payload.lower()
-    markers = [
-        b"install=y",
-        b"event=onappinstall",
-        b"application_token",
-        b"app_sid",
-    ]
-    return any(marker in lowered for marker in markers)
+    if not raw_payload:
+        return False
+    try:
+        parsed = urllib.parse.parse_qs(
+            raw_payload.decode("utf-8", errors="ignore"),
+            keep_blank_values=True,
+        )
+    except (TypeError, ValueError):
+        return False
+    normalized = {
+        str(key).strip().lower(): [str(value).strip().lower() for value in values]
+        for key, values in parsed.items()
+    }
+    return (
+        "y" in normalized.get("install", [])
+        or "onappinstall" in normalized.get("event", [])
+    )
 
 
 def _compute_readiness_state():
