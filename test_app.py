@@ -4842,6 +4842,11 @@ class TestLostDealAutoclose(TemporaryStateTestCase):
             "latestMessageAt": "2099-01-01T09:59:50+00:00",
             "historySignature": "a" * 64,
             "activityId": "8401",
+            "chatLookupMode": "active_registry",
+            "activityUpdatedAt": "",
+            "fallbackActivityCompleted": "",
+            "fallbackActivityStatus": "",
+            "fallbackActivityCreatedAt": "",
             "unreadId": "19",
             "counter": 1,
             "userCounter": 2,
@@ -5038,6 +5043,114 @@ class TestLostDealAutoclose(TemporaryStateTestCase):
             self.store.get_lost_deal_close_operation("9001")["status"], "uncertain"
         )
 
+    def test_fallback_finish_persists_provenance_and_dispatches_once(self):
+        fallback_snapshot = self.snapshot(
+            chatLookupMode="activity_fallback",
+            activityUpdatedAt=self.transition()["transitionTime"],
+            fallbackActivityCompleted="Y",
+            fallbackActivityStatus="3",
+            fallbackActivityCreatedAt="2099-01-01T09:59:50+00:00",
+        )
+
+        def finish_side_effect(method, params):
+            operation = self.store.get_lost_deal_close_operation("9001")
+            self.assertEqual(operation["status"], "dispatching")
+            self.assertEqual(operation["chatLookupMode"], "activity_fallback")
+            self.assertEqual(
+                operation["activityUpdatedAt"],
+                "2099-01-01T10:00:01.000000+00:00",
+            )
+            return True
+
+        with (
+            patch.object(app, "DRY_RUN", False),
+            patch.object(app, "exact_failed_transition", return_value=self.transition()),
+            patch.object(
+                app,
+                "read_single_active_deal_chat_snapshot",
+                return_value=fallback_snapshot,
+            ),
+            patch.object(app, "selected_chat_is_confirmed_inactive", return_value=True),
+            patch.object(app, "bitrix_call", side_effect=finish_side_effect) as finish,
+        ):
+            first = app.process_lost_deal_transition(
+                "7001", "9001", datetime.fromisoformat(self.REMOTE_TIME)
+            )
+            second = app.process_lost_deal_transition(
+                "7001", "9001", datetime.fromisoformat(self.REMOTE_TIME)
+            )
+
+        self.assertEqual(first, "closed")
+        self.assertEqual(second, "closed")
+        finish.assert_called_once_with(
+            "imopenlines.operator.another.finish", {"CHAT_ID": "8101"}
+        )
+
+    def test_fallback_timeout_is_never_reconciled_or_resent(self):
+        fallback_snapshot = self.snapshot(
+            chatLookupMode="activity_fallback",
+            activityUpdatedAt=self.transition()["transitionTime"],
+            fallbackActivityCompleted="Y",
+            fallbackActivityStatus="3",
+            fallbackActivityCreatedAt="2099-01-01T09:59:50+00:00",
+        )
+        selected = MagicMock(return_value=True)
+        finish = MagicMock(side_effect=TimeoutError("ambiguous"))
+        with (
+            patch.object(app, "DRY_RUN", False),
+            patch.object(app, "exact_failed_transition", return_value=self.transition()),
+            patch.object(
+                app,
+                "read_single_active_deal_chat_snapshot",
+                return_value=fallback_snapshot,
+            ),
+            patch.object(app, "selected_chat_is_confirmed_inactive", selected),
+            patch.object(app, "bitrix_call", finish),
+        ):
+            first = app.process_lost_deal_transition(
+                "7001", "9001", datetime.fromisoformat(self.REMOTE_TIME)
+            )
+            second = app.process_lost_deal_transition(
+                "7001", "9001", datetime.fromisoformat(self.REMOTE_TIME)
+            )
+            reconciled = app.reconcile_lost_deal_close_operations()
+
+        self.assertEqual(first, "uncertain")
+        self.assertEqual(second, "uncertain")
+        self.assertEqual(reconciled, 0)
+        self.assertEqual(finish.call_count, 1)
+        selected.assert_not_called()
+        operation = self.store.get_lost_deal_close_operation("9001")
+        self.assertEqual(operation["status"], "uncertain")
+        self.assertEqual(operation["chatLookupMode"], "activity_fallback")
+
+    def test_fallback_activity_timestamp_change_aborts_before_dispatch(self):
+        first = self.snapshot(
+            chatLookupMode="activity_fallback",
+            activityUpdatedAt="2099-01-01T10:00:01+00:00",
+            fallbackActivityCompleted="Y",
+            fallbackActivityStatus="3",
+            fallbackActivityCreatedAt="2099-01-01T09:59:50+00:00",
+        )
+        changed = {**first, "activityUpdatedAt": "2099-01-01T10:00:02+00:00"}
+        finish = MagicMock()
+        with (
+            patch.object(app, "DRY_RUN", False),
+            patch.object(app, "exact_failed_transition", return_value=self.transition()),
+            patch.object(
+                app,
+                "read_single_active_deal_chat_snapshot",
+                side_effect=[first, changed],
+            ),
+            patch.object(app, "bitrix_call", finish),
+        ):
+            result = app.process_lost_deal_transition(
+                "7001", "9001", datetime.fromisoformat(self.REMOTE_TIME)
+            )
+
+        self.assertEqual(result, "chat_changed_before_finish")
+        finish.assert_not_called()
+
     def test_final_chat_change_aborts_before_dispatch(self):
         first = self.snapshot()
         changed = self.snapshot(lastMessageId="8302", historySignature="b" * 64)
@@ -5136,7 +5249,7 @@ class TestLostDealAutoclose(TemporaryStateTestCase):
             ]
         )
 
-        def read_snapshot(_deal_id):
+        def read_snapshot(_deal_id, _transition=None):
             activity_id = app.exact_openline_activity("7001", "8201")
             return self.snapshot(activityId=activity_id)
 
@@ -5247,6 +5360,20 @@ class TestLostDealAutoclose(TemporaryStateTestCase):
             "COMPLETED": "Y",
             "STATUS": "2",
         }
+        closed_dialog = {
+            "id": "8101",
+            "type": "lines",
+            "entity_data_1": "Y|DEAL|7001|N|N|0|0|0|0|0",
+            "entity_data_2": "LEAD|0|COMPANY|0|CONTACT|0|DEAL|7001",
+        }
+
+        def completed_call(method, params=None, timeout=None):
+            if method == "imopenlines.dialog.get":
+                return closed_dialog
+            if method == "crm.activity.get":
+                return completed
+            raise AssertionError(method)
+
         with (
             patch.object(app, "active_chat_rows_for_deal", return_value=[]),
             patch.object(
@@ -5254,7 +5381,7 @@ class TestLostDealAutoclose(TemporaryStateTestCase):
                 "_history_identity",
                 return_value={"chatId": "8101", "sessionId": "8201"},
             ),
-            patch.object(app, "bitrix_call", return_value=completed),
+            patch.object(app, "bitrix_call", side_effect=completed_call),
             patch.object(app, "openline_session_activities", return_value=[completed]),
         ):
             self.assertTrue(app.selected_chat_is_confirmed_inactive(operation))
@@ -5285,6 +5412,20 @@ class TestLostDealAutoclose(TemporaryStateTestCase):
             "COMPLETED": "Y",
             "STATUS": "3",
         }
+        closed_dialog = {
+            "id": "8101",
+            "type": "lines",
+            "entity_data_1": "Y|DEAL|7001|N|N|0|0|0|0|0",
+            "entity_data_2": "LEAD|0|COMPANY|0|CONTACT|0|DEAL|7001",
+        }
+
+        def automatically_completed_call(method, params=None, timeout=None):
+            if method == "imopenlines.dialog.get":
+                return closed_dialog
+            if method == "crm.activity.get":
+                return automatically_completed
+            raise AssertionError(method)
+
         with (
             patch.object(app, "active_chat_rows_for_deal", return_value=[]),
             patch.object(
@@ -5292,7 +5433,11 @@ class TestLostDealAutoclose(TemporaryStateTestCase):
                 "_history_identity",
                 return_value={"chatId": "8101", "sessionId": "8201"},
             ),
-            patch.object(app, "bitrix_call", return_value=automatically_completed),
+            patch.object(
+                app,
+                "bitrix_call",
+                side_effect=automatically_completed_call,
+            ),
             patch.object(
                 app,
                 "openline_session_activities",
@@ -5300,6 +5445,302 @@ class TestLostDealAutoclose(TemporaryStateTestCase):
             ),
         ):
             self.assertTrue(app.selected_chat_is_confirmed_inactive(operation))
+
+    def test_post_confirm_rejects_still_embedded_fallback_session(self):
+        operation = {
+            "dealId": "7001",
+            "chatId": "8101",
+            "sessionId": "8201",
+            "activityId": "8401",
+        }
+        still_open = {
+            "id": "8101",
+            "type": "lines",
+            "entity_data_1": "Y|DEAL|7001|N|N|8201|0|0|0|0",
+            "entity_data_2": "LEAD|0|COMPANY|0|CONTACT|0|DEAL|7001",
+        }
+        with (
+            patch.object(app, "active_chat_rows_for_deal", return_value=[]),
+            patch.object(
+                app,
+                "_history_identity",
+                return_value={"chatId": "8101", "sessionId": "8201"},
+            ),
+            patch.object(app, "bitrix_call", return_value=still_open),
+        ):
+            self.assertFalse(app.selected_chat_is_confirmed_inactive(operation))
+
+    def test_post_confirm_rejects_rebound_newer_session(self):
+        operation = {
+            "dealId": "7001",
+            "chatId": "8101",
+            "sessionId": "8201",
+            "activityId": "8401",
+        }
+        rebound = {
+            "id": "8101",
+            "type": "lines",
+            "entity_data_1": "Y|DEAL|7001|N|N|8202|0|0|0|0",
+            "entity_data_2": "LEAD|0|COMPANY|0|CONTACT|0|DEAL|7001",
+        }
+        with (
+            patch.object(app, "active_chat_rows_for_deal", return_value=[]),
+            patch.object(
+                app,
+                "_history_identity",
+                return_value={"chatId": "8101", "sessionId": "8201"},
+            ),
+            patch.object(app, "bitrix_call", return_value=rebound),
+        ):
+            self.assertFalse(app.selected_chat_is_confirmed_inactive(operation))
+
+    def test_post_confirm_rejects_malformed_closed_session_marker(self):
+        operation = {
+            "dealId": "7001",
+            "chatId": "8101",
+            "sessionId": "8201",
+            "activityId": "8401",
+        }
+        for malformed in (
+            "",
+            "Y|DEAL|7001",
+            "N|DEAL|7001|N|N|0|0|0|0|0",
+            "Y|CONTACT|7001|N|N|0|0|0|0|0",
+            "Y|DEAL|7002|N|N|0|0|0|0|0",
+        ):
+            dialog = {
+                "id": "8101",
+                "type": "lines",
+                "entity_data_1": malformed,
+                "entity_data_2": "LEAD|0|COMPANY|0|CONTACT|0|DEAL|7001",
+            }
+            with self.subTest(entity_data_1=malformed):
+                with (
+                    patch.object(app, "active_chat_rows_for_deal", return_value=[]),
+                    patch.object(
+                        app,
+                        "_history_identity",
+                        return_value={"chatId": "8101", "sessionId": "8201"},
+                    ),
+                    patch.object(app, "bitrix_call", return_value=dialog),
+                ):
+                    self.assertFalse(
+                        app.selected_chat_is_confirmed_inactive(operation)
+                    )
+
+    def test_auto_completed_activity_recovers_exact_missing_registry_chat(self):
+        activity = {
+            "ID": "8401",
+            "OWNER_TYPE_ID": "2",
+            "OWNER_ID": "7001",
+            "PROVIDER_ID": "IMOPENLINES_SESSION",
+            "ASSOCIATED_ENTITY_ID": "8201",
+            "COMPLETED": "Y",
+            "STATUS": "3",
+            "CREATED": "2099-01-01T09:59:50+00:00",
+            "LAST_UPDATED": self.transition()["transitionTime"],
+        }
+        history = {
+            "chatId": "8101",
+            "sessionId": "8201",
+        }
+        with (
+            patch.object(
+                app,
+                "bitrix_call_full",
+                return_value={"result": [activity], "total": 1},
+            ) as activity_list,
+            patch.object(app, "_history_identity", return_value=history),
+        ):
+            result = app.auto_completed_chat_candidate("7001", self.transition())
+
+        self.assertEqual(result["chatId"], "8101")
+        self.assertEqual(result["sessionId"], "8201")
+        self.assertEqual(result["activityId"], "8401")
+        params = activity_list.call_args.args[1]
+        self.assertEqual(params["filter[OWNER_ID]"], "7001")
+        self.assertNotIn("CONTACT_ID", json.dumps(params))
+        self.assertNotIn("PHONE", json.dumps(params))
+
+    def test_stale_auto_completed_activity_cannot_recover_chat(self):
+        activity = {
+            "ID": "8401",
+            "OWNER_TYPE_ID": "2",
+            "OWNER_ID": "7001",
+            "PROVIDER_ID": "IMOPENLINES_SESSION",
+            "ASSOCIATED_ENTITY_ID": "8201",
+            "COMPLETED": "Y",
+            "STATUS": "3",
+            "CREATED": "2099-01-01T09:00:00+00:00",
+            "LAST_UPDATED": "2099-01-01T09:30:00+00:00",
+        }
+        with patch.object(
+            app,
+            "bitrix_call_full",
+            return_value={"result": [activity], "total": 1},
+        ):
+            with self.assertRaisesRegex(app.LostDealCloseGuardError, "no_active_chat"):
+                app.auto_completed_chat_candidate("7001", self.transition())
+
+    def test_multiple_auto_completed_candidates_fail_closed(self):
+        first = {
+            "ID": "8401",
+            "OWNER_TYPE_ID": "2",
+            "OWNER_ID": "7001",
+            "PROVIDER_ID": "IMOPENLINES_SESSION",
+            "ASSOCIATED_ENTITY_ID": "8201",
+            "COMPLETED": "Y",
+            "STATUS": "3",
+            "CREATED": "2099-01-01T09:59:40+00:00",
+            "LAST_UPDATED": self.transition()["transitionTime"],
+        }
+        second = {**first, "ID": "8402", "ASSOCIATED_ENTITY_ID": "8202"}
+
+        def history(_parameter, session_id):
+            return {"chatId": "8101" if session_id == "8201" else "8102", "sessionId": session_id}
+
+        with (
+            patch.object(
+                app,
+                "bitrix_call_full",
+                return_value={"result": [first, second], "total": 2},
+            ),
+            patch.object(app, "_history_identity", side_effect=history),
+        ):
+            with self.assertRaisesRegex(
+                app.LostDealCloseGuardError, "fallback_activity_not_unique"
+            ):
+                app.auto_completed_chat_candidate("7001", self.transition())
+
+    def test_second_pending_activity_makes_fallback_ambiguous(self):
+        candidate = {
+            "ID": "8401",
+            "OWNER_TYPE_ID": "2",
+            "OWNER_ID": "7001",
+            "PROVIDER_ID": "IMOPENLINES_SESSION",
+            "ASSOCIATED_ENTITY_ID": "8201",
+            "COMPLETED": "Y",
+            "STATUS": "3",
+            "CREATED": "2099-01-01T09:59:40+00:00",
+            "LAST_UPDATED": self.transition()["transitionTime"],
+        }
+        pending = {
+            **candidate,
+            "ID": "8402",
+            "ASSOCIATED_ENTITY_ID": "8202",
+            "COMPLETED": "N",
+            "STATUS": "1",
+            "CREATED": "2099-01-01T09:00:00+00:00",
+            "LAST_UPDATED": "2099-01-01T09:00:01+00:00",
+        }
+        with (
+            patch.object(
+                app,
+                "bitrix_call_full",
+                return_value={"result": [candidate, pending], "total": 2},
+            ),
+            patch.object(
+                app,
+                "_history_identity",
+                return_value={"chatId": "8101", "sessionId": "8201"},
+            ),
+        ):
+            with self.assertRaisesRegex(
+                app.LostDealCloseGuardError, "fallback_activity_ambiguous"
+            ):
+                app.auto_completed_chat_candidate("7001", self.transition())
+
+    def test_second_concurrent_completed_activity_makes_fallback_ambiguous(self):
+        candidate = {
+            "ID": "8401",
+            "OWNER_TYPE_ID": "2",
+            "OWNER_ID": "7001",
+            "PROVIDER_ID": "IMOPENLINES_SESSION",
+            "ASSOCIATED_ENTITY_ID": "8201",
+            "COMPLETED": "Y",
+            "STATUS": "3",
+            "CREATED": "2099-01-01T09:59:40+00:00",
+            "LAST_UPDATED": self.transition()["transitionTime"],
+        }
+        concurrent = {
+            **candidate,
+            "ID": "8402",
+            "ASSOCIATED_ENTITY_ID": "8202",
+            "STATUS": "2",
+            "CREATED": "2099-01-01T09:00:00+00:00",
+            "LAST_UPDATED": "2099-01-01T09:59:50+00:00",
+        }
+        with (
+            patch.object(
+                app,
+                "bitrix_call_full",
+                return_value={"result": [candidate, concurrent], "total": 2},
+            ),
+            patch.object(
+                app,
+                "_history_identity",
+                return_value={"chatId": "8101", "sessionId": "8201"},
+            ),
+        ):
+            with self.assertRaisesRegex(
+                app.LostDealCloseGuardError, "fallback_activity_ambiguous"
+            ):
+                app.auto_completed_chat_candidate("7001", self.transition())
+
+    def test_activity_registry_partial_pages_fail_closed(self):
+        partial = {"result": [{"ID": "8401"}], "total": 2, "next": 50}
+        with patch.object(app, "bitrix_call_full", return_value=partial):
+            with self.assertRaisesRegex(RuntimeError, "неполный реестр чатов"):
+                app.deal_openline_activities("7001")
+            with self.assertRaisesRegex(RuntimeError, "неполный реестр активной"):
+                app.openline_session_activities("8201")
+
+    def test_fallback_snapshot_requires_current_embedded_session_and_exact_binding(self):
+        fallback = {
+            "activityId": "8401",
+            "sessionId": "8201",
+            "chatId": "8101",
+            "activityCompleted": "Y",
+            "activityStatus": "3",
+            "activityCreatedAt": "2099-01-01T09:59:50+00:00",
+            "activityUpdatedAt": self.transition()["transitionTime"],
+        }
+        identity = {
+            "chatId": "8101",
+            "sessionId": "8201",
+            "messageCount": 1,
+            "lastMessageId": "8301",
+            "latestMessageAt": datetime.fromisoformat("2099-01-01T09:59:50+00:00"),
+            "historySignature": "a" * 64,
+        }
+        dialog = {
+            "id": "8101",
+            "type": "lines",
+            "entity_data_1": "Y|DEAL|7001|N|N|8201|0|0|0|0",
+            "entity_data_2": "LEAD|0|COMPANY|0|CONTACT|0|DEAL|7001",
+            "last_message_id": "8301",
+            "unread_id": "0",
+            "counter": 0,
+            "user_counter": 1,
+            "is_new": False,
+        }
+        with (
+            patch.object(app, "active_chat_rows_for_deal", side_effect=[[], []]),
+            patch.object(
+                app,
+                "auto_completed_chat_candidate",
+                side_effect=[fallback, fallback],
+            ),
+            patch.object(app, "bitrix_call", return_value=dialog),
+            patch.object(app, "_history_identity", return_value=identity),
+            patch.object(app, "exact_openline_activity", return_value="8401"),
+        ):
+            snapshot = app.read_single_active_deal_chat_snapshot(
+                "7001", self.transition()
+            )
+        self.assertEqual(snapshot["chatId"], "8101")
+        self.assertEqual(snapshot["sessionId"], "8201")
+        self.assertEqual(snapshot["activityId"], "8401")
 
     def test_transient_preflight_failure_does_not_advance_discovery_cursor(self):
         self.arm()

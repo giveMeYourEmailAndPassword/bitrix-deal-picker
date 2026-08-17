@@ -148,7 +148,10 @@ DEAL_ANALYSIS_CACHE_LOCK = threading.Lock()
 DEAL_HEADERS_CACHE_LOCK = threading.Lock()
 LOCAL_TZ = timezone(timedelta(hours=env_int("APP_TZ_OFFSET_HOURS", 6, -12, 14)))
 STATE_STORE = StateStore(APP_DIR, local_timezone=LOCAL_TZ, auto_initialize=False)
-APP_VERSION = "2026-08-18-office-extra-claims-lost-deal-autoclose"
+APP_VERSION = (
+    "2026-08-18-office-extra-claims-proven-greeting-"
+    "lost-deal-chat-autoclose-inbound-fix"
+)
 # Bump whenever classifier, eligibility, source-completeness or oldest-first
 # routing semantics change. Pre-deploy tokens must not authorize post-deploy
 # decisions under a different routing policy.
@@ -1962,6 +1965,19 @@ def _entity_data_session_id(value):
     return normalize_entity_id(parts[5]) if len(parts) > 5 else ""
 
 
+def _entity_data_has_closed_session_slot(value, deal_id):
+    """Require Bitrix's observed, well-formed post-finish session marker."""
+
+    parts = [str(item).strip() for item in str(value or "").split("|")]
+    return (
+        len(parts) == 10
+        and parts[0].upper() == "Y"
+        and parts[1].upper() == "DEAL"
+        and normalize_entity_id(parts[2]) == normalize_entity_id(deal_id)
+        and parts[5] == "0"
+    )
+
+
 def openline_session_activities(session_id):
     payload = bitrix_call_full(
         "crm.activity.list",
@@ -1978,11 +1994,133 @@ def openline_session_activities(session_id):
         },
     )
     rows = payload.get("result") or []
-    if not isinstance(rows, list) or int(payload.get("total") or len(rows)) > 50:
+    try:
+        total = int(payload["total"]) if "total" in payload else len(rows)
+    except (TypeError, ValueError):
+        raise RuntimeError("Bitrix вернул неполный реестр активной сессии")
+    if (
+        not isinstance(rows, list)
+        or total < 0
+        or total > 50
+        or total != len(rows)
+        or payload.get("next") not in (None, "")
+    ):
         raise RuntimeError("Bitrix вернул неполный реестр активной сессии")
     if any(not isinstance(row, dict) for row in rows):
         raise RuntimeError("Bitrix вернул повреждённый реестр активной сессии")
     return rows
+
+
+def deal_openline_activities(deal_id):
+    payload = bitrix_call_full(
+        "crm.activity.list",
+        {
+            "order[ID]": "ASC",
+            "filter[OWNER_TYPE_ID]": 2,
+            "filter[OWNER_ID]": str(deal_id),
+            "filter[PROVIDER_ID]": "IMOPENLINES_SESSION",
+            "select[]": [
+                "ID", "OWNER_TYPE_ID", "OWNER_ID", "PROVIDER_ID",
+                "ASSOCIATED_ENTITY_ID", "COMPLETED", "STATUS",
+                "CREATED", "LAST_UPDATED",
+            ],
+            "start": 0,
+        },
+    )
+    rows = payload.get("result") or []
+    try:
+        total = int(payload["total"]) if "total" in payload else len(rows)
+    except (TypeError, ValueError):
+        raise RuntimeError("Bitrix вернул неполный реестр чатов сделки")
+    if (
+        not isinstance(rows, list)
+        or total < 0
+        or total > 50
+        or total != len(rows)
+        or payload.get("next") not in (None, "")
+    ):
+        raise RuntimeError("Bitrix вернул неполный реестр чатов сделки")
+    if any(not isinstance(row, dict) for row in rows):
+        raise RuntimeError("Bitrix вернул повреждённый реестр чатов сделки")
+    return rows
+
+
+def auto_completed_chat_candidate(deal_id, transition):
+    transition_time = parse_source_message_time(transition.get("transitionTime"))
+    if transition_time is None or str(transition.get("dealId") or "") != str(deal_id):
+        raise LostDealCloseGuardError("invalid_fallback_transition")
+    parsed_rows = []
+    candidates = []
+    for row in deal_openline_activities(deal_id):
+        activity_id = normalize_entity_id(row.get("ID"))
+        session_id = normalize_entity_id(row.get("ASSOCIATED_ENTITY_ID"))
+        owner_id = normalize_entity_id(row.get("OWNER_ID"))
+        created_at = parse_source_message_time(row.get("CREATED"))
+        updated_at = parse_source_message_time(row.get("LAST_UPDATED"))
+        if not activity_id or not session_id or owner_id != str(deal_id):
+            raise RuntimeError("Bitrix вернул неполную активность чата сделки")
+        if str(row.get("OWNER_TYPE_ID") or "") != "2" or str(
+            row.get("PROVIDER_ID") or ""
+        ) != "IMOPENLINES_SESSION":
+            raise RuntimeError("Bitrix вернул чужую активность чата сделки")
+        if created_at is None or updated_at is None:
+            raise RuntimeError("Bitrix не дал время активности чата сделки")
+        completed = str(row.get("COMPLETED") or "").upper()
+        status = str(row.get("STATUS") or "")
+        if (completed, status) not in {("N", "1"), ("Y", "2"), ("Y", "3")}:
+            raise LostDealCloseGuardError("fallback_activity_state_unknown")
+        parsed = {
+            "activityId": activity_id,
+            "sessionId": session_id,
+            "completed": completed,
+            "status": status,
+            "createdAt": created_at,
+            "updatedAt": updated_at,
+        }
+        parsed_rows.append(parsed)
+        if (
+            completed == "Y"
+            and status == "3"
+            and created_at <= transition_time
+            and abs((updated_at - transition_time).total_seconds())
+            <= LOST_DEAL_HISTORY_MOVE_TOLERANCE_SECONDS
+        ):
+            history = _history_identity("SESSION_ID", session_id)
+            chat_id = history.get("chatId")
+            if history.get("sessionId") != session_id or not chat_id:
+                raise LostDealCloseGuardError("fallback_history_identity_mismatch")
+            candidates.append(
+                {
+                    "activityId": activity_id,
+                    "sessionId": session_id,
+                    "chatId": chat_id,
+                    "activityCompleted": completed,
+                    "activityStatus": status,
+                    "activityCreatedAt": created_at.isoformat(),
+                    "activityUpdatedAt": updated_at.isoformat(),
+                }
+            )
+    if not candidates:
+        raise LostDealCloseGuardError("no_active_chat")
+    if len(candidates) != 1:
+        raise LostDealCloseGuardError("fallback_activity_not_unique")
+    candidate = candidates[0]
+    candidate_created_at = parse_source_message_time(candidate["activityCreatedAt"])
+    ambiguity_boundary = min(
+        candidate_created_at,
+        transition_time
+        - timedelta(seconds=LOST_DEAL_HISTORY_MOVE_TOLERANCE_SECONDS),
+    )
+    for row in parsed_rows:
+        if row["activityId"] == candidate["activityId"]:
+            continue
+        if (
+            (row["completed"], row["status"]) == ("N", "1")
+            or row["createdAt"] >= transition_time
+            or row["updatedAt"] >= ambiguity_boundary
+        ):
+            raise LostDealCloseGuardError("fallback_activity_ambiguous")
+    return candidate
 
 
 def exact_openline_activity(deal_id, session_id):
@@ -2005,13 +2143,20 @@ def exact_openline_activity(deal_id, session_id):
     return activity_id
 
 
-def read_single_active_deal_chat_snapshot(deal_id):
+def read_single_active_deal_chat_snapshot(deal_id, transition=None):
     rows = active_chat_rows_for_deal(deal_id)
-    if not rows:
-        raise LostDealCloseGuardError("no_active_chat")
     if len(rows) != 1:
-        raise LostDealCloseGuardError("multiple_active_chats")
-    chat_id = rows[0]["chatId"]
+        if rows:
+            raise LostDealCloseGuardError("multiple_active_chats")
+        if transition is None:
+            raise LostDealCloseGuardError("no_active_chat")
+        fallback = auto_completed_chat_candidate(deal_id, transition)
+        chat_id = fallback["chatId"]
+        expected_registry = []
+    else:
+        fallback = None
+        chat_id = rows[0]["chatId"]
+        expected_registry = [{"chatId": chat_id}]
     dialog = bitrix_call("imopenlines.dialog.get", {"CHAT_ID": chat_id}) or {}
     if not isinstance(dialog, dict):
         raise RuntimeError("Bitrix вернул неожиданный формат диалога")
@@ -2035,7 +2180,9 @@ def read_single_active_deal_chat_snapshot(deal_id):
         if by_session[key] != by_chat[key]:
             raise LostDealCloseGuardError("history_changed_during_check")
     embedded_session = _entity_data_session_id(dialog.get("entity_data_1"))
-    if embedded_session and embedded_session != session_id:
+    if fallback and embedded_session != session_id:
+        raise LostDealCloseGuardError("fallback_session_not_current")
+    if not fallback and embedded_session and embedded_session != session_id:
         raise LostDealCloseGuardError("dialog_session_mismatch")
     last_message_id = normalize_entity_id(dialog.get("last_message_id"))
     if (
@@ -2045,8 +2192,15 @@ def read_single_active_deal_chat_snapshot(deal_id):
     ):
         raise LostDealCloseGuardError("dialog_history_message_mismatch")
     activity_id = exact_openline_activity(deal_id, session_id)
-    if active_chat_rows_for_deal(deal_id) != [{"chatId": chat_id}]:
+    if fallback and (
+        fallback["sessionId"] != session_id
+        or fallback["activityId"] != activity_id
+    ):
+        raise LostDealCloseGuardError("fallback_activity_binding_mismatch")
+    if active_chat_rows_for_deal(deal_id) != expected_registry:
         raise LostDealCloseGuardError("active_chat_changed_during_check")
+    if fallback and auto_completed_chat_candidate(deal_id, transition) != fallback:
+        raise LostDealCloseGuardError("fallback_activity_changed_during_check")
     late_by_chat = _history_identity("CHAT_ID", chat_id)
     late_by_session = _history_identity("SESSION_ID", session_id)
     if late_by_chat != by_chat or late_by_session != by_session:
@@ -2070,6 +2224,13 @@ def read_single_active_deal_chat_snapshot(deal_id):
         ),
         "historySignature": by_chat["historySignature"],
         "activityId": activity_id,
+        "chatLookupMode": "activity_fallback" if fallback else "active_registry",
+        "activityUpdatedAt": fallback["activityUpdatedAt"] if fallback else "",
+        "fallbackActivityCompleted": (
+            fallback["activityCompleted"] if fallback else ""
+        ),
+        "fallbackActivityStatus": fallback["activityStatus"] if fallback else "",
+        "fallbackActivityCreatedAt": fallback["activityCreatedAt"] if fallback else "",
         "unreadId": str(dialog.get("unread_id") or "0"),
         "counter": int(dialog.get("counter") or 0),
         "userCounter": int(dialog.get("user_counter") or 0),
@@ -2100,6 +2261,19 @@ def selected_chat_is_confirmed_inactive(operation):
         return False
     history = _history_identity("SESSION_ID", session_id)
     if history["sessionId"] != session_id or history["chatId"] != chat_id:
+        return False
+    dialog = bitrix_call("imopenlines.dialog.get", {"CHAT_ID": chat_id}) or {}
+    if not (
+        isinstance(dialog, dict)
+        and normalize_entity_id(dialog.get("id")) == chat_id
+        and str(dialog.get("type") or "").strip().lower() == "lines"
+        and openline_chat_is_bound_to_deal(
+            str(dialog.get("entity_data_2") or ""), operation.get("dealId")
+        )
+        and _entity_data_has_closed_session_slot(
+            dialog.get("entity_data_1"), operation.get("dealId")
+        )
+    ):
         return False
     activity_id = str(operation.get("activityId") or "")
     activity = bitrix_call("crm.activity.get", {"id": activity_id}) or {}
@@ -2133,6 +2307,12 @@ def selected_chat_is_confirmed_inactive(operation):
 def reconcile_lost_deal_close_operations():
     reconciled = 0
     for operation in STATE_STORE.list_lost_deal_close_reconciliation(limit=100):
+        # For the incoming-chat fallback, ACTIVE_ONLY=Y and STATUS=3 were
+        # already absent/completed before finish.  A later chat rebind is not
+        # causal proof that our call succeeded, so an ambiguous result stays
+        # uncertain forever and is never retried or auto-reconciled.
+        if operation.get("chatLookupMode") == "activity_fallback":
+            continue
         try:
             if selected_chat_is_confirmed_inactive(operation):
                 STATE_STORE.mark_lost_deal_close_reconciled(operation["transitionId"])
@@ -2163,7 +2343,7 @@ def process_lost_deal_transition(deal_id, transition_id, observed_at=None):
         return claim.get("status") or "already_processed"
     lease_token = claim["leaseToken"]
     try:
-        first_snapshot = read_single_active_deal_chat_snapshot(deal_id)
+        first_snapshot = read_single_active_deal_chat_snapshot(deal_id, transition)
         latest_message_at = parse_source_message_time(first_snapshot["latestMessageAt"])
         # Bitrix message timestamps can have only second precision.  Equality
         # is therefore ambiguous: the message may have arrived just after the
@@ -2173,7 +2353,9 @@ def process_lost_deal_transition(deal_id, transition_id, observed_at=None):
         final_transition = exact_failed_transition(deal_id, transition_id)
         if not _same_transition(transition, final_transition):
             raise LostDealCloseGuardError("transition_changed_before_finish")
-        final_snapshot = read_single_active_deal_chat_snapshot(deal_id)
+        final_snapshot = read_single_active_deal_chat_snapshot(
+            deal_id, final_transition
+        )
         if final_snapshot != first_snapshot:
             raise LostDealCloseGuardError("chat_changed_before_finish")
         if DRY_RUN:
@@ -2194,6 +2376,8 @@ def process_lost_deal_transition(deal_id, transition_id, observed_at=None):
             final_snapshot["historyMessageCount"],
             final_snapshot["historySignature"],
             final_snapshot["activityId"],
+            final_snapshot["chatLookupMode"],
+            final_snapshot["activityUpdatedAt"],
         )
     except LostDealCloseGuardError as exc:
         STATE_STORE.finalize_lost_deal_close_check(
@@ -2227,12 +2411,13 @@ def process_lost_deal_transition(deal_id, transition_id, observed_at=None):
             transition_id, "finish_result_uncertain"
         )
         operation = STATE_STORE.get_lost_deal_close_operation(transition_id)
-        try:
-            if selected_chat_is_confirmed_inactive(operation):
-                STATE_STORE.mark_lost_deal_close_reconciled(transition_id)
-                return "closed_reconciled"
-        except Exception:
-            pass
+        if operation.get("chatLookupMode") != "activity_fallback":
+            try:
+                if selected_chat_is_confirmed_inactive(operation):
+                    STATE_STORE.mark_lost_deal_close_reconciled(transition_id)
+                    return "closed_reconciled"
+            except Exception:
+                pass
         return "uncertain"
     if not acknowledged:
         STATE_STORE.mark_lost_deal_close_uncertain(
