@@ -768,6 +768,32 @@ class TestHttpBoundary(unittest.TestCase):
         self.assertIn("frame-ancestors https://test-fake.bitrix24.test", csp)
         self.assertNotIn("must-not-appear", body)
 
+    def test_regular_bitrix_launch_tokens_do_not_trigger_install_mode(self):
+        payload = (
+            b"AUTH_ID=access-token&DOMAIN=test-fake.bitrix24.test"
+            b"&APP_SID=regular-placement&application_token=callback-token"
+            b"&PLACEMENT=LEFT_MENU"
+        )
+        handler = HandlerHarness.make("POST", "/", payload)
+        handler.do_POST()
+        body = handler.wfile.getvalue().decode("utf-8")
+
+        self.assertEqual(HandlerHarness.status(handler), 200)
+        self.assertIn("const INSTALL_MODE = false;", body)
+
+    def test_only_explicit_bitrix_install_signals_trigger_install_mode(self):
+        for marker in (b"INSTALL=Y", b"event=ONAPPINSTALL"):
+            with self.subTest(marker=marker):
+                payload = (
+                    b"AUTH_ID=access-token&DOMAIN=test-fake.bitrix24.test&" + marker
+                )
+                handler = HandlerHarness.make("POST", "/", payload)
+                handler.do_POST()
+                body = handler.wfile.getvalue().decode("utf-8")
+
+                self.assertEqual(HandlerHarness.status(handler), 200)
+                self.assertIn("const INSTALL_MODE = true;", body)
+
 
 class TestRejectionRecording(TemporaryStateTestCase):
     def test_rejection_uses_live_server_deal_and_ignores_browser_deal(self):
