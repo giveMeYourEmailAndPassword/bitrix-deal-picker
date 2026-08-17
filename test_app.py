@@ -1,0 +1,2832 @@
+#!/usr/bin/env python3
+"""Security, reliability and business-contract tests for ``app.py``.
+
+The suite is deliberately hermetic: application state lives in temporary
+directories and every accidental HTTP request fails immediately.  These tests
+therefore cannot mutate Bitrix or the repository while they run.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import sys
+import tempfile
+import threading
+import unittest
+from contextlib import ExitStack, contextmanager
+from datetime import datetime
+from io import BytesIO
+from pathlib import Path
+from unittest.mock import MagicMock, call, patch
+
+
+# Import-time configuration is security-sensitive in app.py.  Override (not
+# setdefault) every relevant value before importing it so a developer's real
+# credentials can never leak into this process.
+_BOOT_DATA_DIR = tempfile.mkdtemp(prefix="bitrix-picker-app-tests-")
+_TEST_ENV = {
+    "APP_DATA_DIR": _BOOT_DATA_DIR,
+    "BITRIX_WEBHOOK_BASE": "https://test-fake.bitrix24.test/rest/1/not-a-secret/",
+    "BITRIX_ALLOWED_DOMAINS": "test-fake.bitrix24.test",
+    "APP_ALLOWED_ORIGINS": "https://picker.example.test",
+    "PUBLIC_APP_URL": "https://picker.example.test",
+    "ADMIN_USER_IDS": "1,2",
+    "CLAIM_STATS_SOURCE": "app_events",
+    "DRY_RUN": "1",
+    "BITRIX_CLAIM_MARKER_FIELD": "UF_CRM_TEST_CLAIM_MARKER",
+    "GREETING_AUTO_SEND": "0",
+    "ALLOW_UNVERIFIED_USERS": "0",
+    "HOST": "127.0.0.1",
+    "APP_TZ_OFFSET_HOURS": "6",
+    "SELECTION_TOKEN_TTL_SECONDS": "1800",
+    "CLAIM_OPERATION_PENDING_TTL_SECONDS": "300",
+    # Most workflow tests focus on claim/rejection mechanics.  Dedicated
+    # authorization tests below exercise the production fail-closed defaults.
+    "REQUIRE_LEGACY_MIGRATION": "0",
+    "REQUIRE_EXPLICIT_ACCESS_RULE": "0",
+}
+_ORIGINAL_ENV = {name: os.environ.get(name) for name in _TEST_ENV}
+os.environ.update(_TEST_ENV)
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import app  # noqa: E402  (environment must be installed first)
+from state_store import StateStore  # noqa: E402
+
+
+def _network_is_forbidden(*args, **kwargs):
+    target = args[0] if args else "unknown URL"
+    raise AssertionError(f"unexpected network request in unit test: {target!r}")
+
+
+_NETWORK_GUARD = patch.object(app.urllib.request, "urlopen", _network_is_forbidden)
+
+
+def test_manager_policy(competencies=("Турция",), rule=None):
+    return app.manager_policy_hash(
+        {
+            "active": True,
+            "intranet": True,
+            "competencies": list(competencies),
+        },
+        rule or {"enabled": True, "dailyLimit": None},
+    )
+
+
+def setUpModule():
+    _NETWORK_GUARD.start()
+
+
+def tearDownModule():
+    _NETWORK_GUARD.stop()
+    shutil.rmtree(_BOOT_DATA_DIR, ignore_errors=True)
+    for name, value in _ORIGINAL_ENV.items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
+
+
+class TemporaryStateTestCase(unittest.TestCase):
+    """Give each stateful test a fresh SQLite database outside the repo."""
+
+    def setUp(self):
+        self._temp_dir = tempfile.TemporaryDirectory(prefix="bitrix-picker-test-state-")
+        self.data_dir = Path(self._temp_dir.name)
+        self.store = StateStore(self.data_dir, db_filename="state.sqlite3", local_timezone=app.LOCAL_TZ)
+        self._store_patch = patch.object(app, "STATE_STORE", self.store)
+        self._store_patch.start()
+        app.DEAL_ANALYSIS_CACHE.clear()
+        app.DEAL_HEADERS_CACHE.clear()
+        app.PORTAL_USERS_CACHE.clear()
+        app.USER_VERIFY_CACHE.clear()
+        app.READINESS_CACHE.update({"checkedAt": 0.0, "state": None})
+
+    def tearDown(self):
+        self._store_patch.stop()
+        self._temp_dir.cleanup()
+
+
+class HandlerHarness:
+    """Construct a BaseHTTPRequestHandler without binding a socket."""
+
+    @staticmethod
+    def make(method="GET", path="/", body=None, *, origin=None, headers=None):
+        if body is None:
+            raw = b""
+        elif isinstance(body, bytes):
+            raw = body
+        else:
+            raw = json.dumps(body).encode("utf-8")
+
+        handler = app.Handler.__new__(app.Handler)
+        handler.command = method
+        handler.path = path
+        handler.client_address = ("127.0.0.1", 12345)
+        handler.server = MagicMock()
+        handler.close_connection = True
+        handler.headers = {
+            "Content-Length": str(len(raw)),
+            **({"Origin": origin} if origin else {}),
+            **(headers or {}),
+        }
+        handler.rfile = BytesIO(raw)
+        handler.wfile = BytesIO()
+        handler.send_response = MagicMock()
+        handler.send_header = MagicMock()
+        handler.end_headers = MagicMock()
+        return handler
+
+    @staticmethod
+    def status(handler):
+        return handler.send_response.call_args.args[0]
+
+    @staticmethod
+    def json(handler):
+        return json.loads(handler.wfile.getvalue().decode("utf-8"))
+
+    @staticmethod
+    def headers(handler):
+        return [item.args for item in handler.send_header.call_args_list]
+
+
+class TestStrictIdentityAndAuthorization(unittest.TestCase):
+    @patch.object(app, "verify_bitrix_user", return_value={"id": "42", "name": "Verified"})
+    def test_actor_identity_always_comes_from_verified_bitrix_user(self, _verify):
+        payload = {
+            "auth": {"AUTH_ID": "fake", "DOMAIN": "test-fake.bitrix24.test"},
+            "managerId": "77",
+            "currentUserId": "1",
+        }
+        self.assertEqual(app.actor_id_from_payload(payload), "42")
+
+    @patch.object(app, "verify_bitrix_user", return_value=None)
+    def test_current_user_id_and_manager_id_are_ignored_when_auth_fails(self, _verify):
+        with patch.multiple(app, ALLOW_UNVERIFIED_USERS=False, DRY_RUN=True):
+            self.assertIsNone(
+                app.actor_id_from_payload(
+                    {"currentUserId": "1", "managerId": "1", "auth": {"AUTH_ID": "forged"}}
+                )
+            )
+
+    @patch.object(app, "verify_bitrix_user", return_value=None)
+    def test_admin_cannot_be_impersonated_with_current_user_id(self, _verify):
+        self.assertIsNone(app.require_admin({"currentUserId": "1", "managerId": "1"}))
+
+    @patch.object(app, "verify_bitrix_user", return_value={"id": "99", "name": "Not admin"})
+    def test_verified_non_admin_cannot_override_identity(self, _verify):
+        self.assertIsNone(app.require_admin({"currentUserId": "1", "auth": {"AUTH_ID": "token"}}))
+
+    @patch.object(
+        app,
+        "verify_bitrix_user",
+        return_value={
+            "id": "2",
+            "name": "Admin",
+            "raw": {"ACTIVE": True, "UF_DEPARTMENT": [1]},
+        },
+    )
+    def test_verified_configured_admin_is_accepted(self, _verify):
+        self.assertEqual(app.require_admin({"auth": {"AUTH_ID": "token"}})["id"], "2")
+
+    @patch.object(app, "bitrix_call")
+    def test_actor_call_never_falls_back_to_privileged_webhook(self, webhook_call):
+        with self.assertRaises(PermissionError):
+            app.bitrix_call_for_actor({}, "crm.deal.get", {"id": "10"})
+        webhook_call.assert_not_called()
+
+    @patch.object(app, "bitrix_call")
+    @patch.object(app, "bitrix_oauth_call", side_effect=RuntimeError("invalid token"))
+    def test_fake_oauth_token_does_not_fallback_to_webhook(self, oauth_call, webhook_call):
+        auth = {"AUTH_ID": "fake", "DOMAIN": "test-fake.bitrix24.test"}
+        self.assertIsNone(app.verify_bitrix_user(auth))
+        self.assertEqual(oauth_call.call_count, 2)  # user.current, then profile
+        webhook_call.assert_not_called()
+
+
+class TestOAuthDomainAllowlist(unittest.TestCase):
+    def test_exact_configured_domain_is_allowed(self):
+        self.assertEqual(
+            app.normalize_bitrix_domain("https://test-fake.bitrix24.test/"),
+            "test-fake.bitrix24.test",
+        )
+
+    def test_subdomain_and_lookalike_are_rejected(self):
+        for domain in (
+            "evil.test-fake.bitrix24.test",
+            "test-fake.bitrix24.test.evil.example",
+            "evil.example",
+        ):
+            with self.subTest(domain=domain), self.assertRaises(PermissionError):
+                app.normalize_bitrix_domain(domain)
+
+    def test_credentials_paths_queries_and_http_are_rejected(self):
+        invalid = (
+            "http://test-fake.bitrix24.test",
+            "https://user:pass@test-fake.bitrix24.test",
+            "https://test-fake.bitrix24.test/rest/",
+            "https://test-fake.bitrix24.test/?next=evil",
+        )
+        for domain in invalid:
+            with self.subTest(domain=domain), self.assertRaises(PermissionError):
+                app.normalize_bitrix_domain(domain)
+
+    def test_oauth_rejects_domain_before_any_http_request(self):
+        with patch.object(app.urllib.request, "urlopen") as urlopen:
+            with self.assertRaises(PermissionError):
+                app.bitrix_oauth_call("evil.example", "token", "user.current")
+            urlopen.assert_not_called()
+
+    def test_malformed_ipv6_domains_are_rejected_without_parser_exception(self):
+        for domain in ("https://[", "https://[::1", "["):
+            with self.subTest(domain=domain), self.assertRaises(PermissionError):
+                app.normalize_bitrix_domain(domain)
+
+
+class TestBrowserBootstrapSafety(unittest.TestCase):
+    def test_json_for_script_neutralizes_script_breakout(self):
+        encoded = app.json_for_script({"token": "</script><script>alert(1)</script>&"})
+        self.assertNotIn("</script", encoded.lower())
+        self.assertNotIn("<script", encoded.lower())
+        self.assertNotIn("&", encoded)
+        self.assertIn("\\u003c", encoded)
+
+    def test_sanitized_initial_auth_drops_refresh_and_unneeded_fields(self):
+        sanitized = app.sanitize_initial_auth(
+            {
+                "AUTH_ID": "access-token",
+                "REFRESH_ID": "refresh-token-must-never-reach-browser",
+                "DOMAIN": "test-fake.bitrix24.test",
+                "member_id": "member",
+                "client_endpoint": "https://test-fake.bitrix24.test/rest/",
+            }
+        )
+        self.assertEqual(
+            sanitized,
+            {"AUTH_ID": "access-token", "DOMAIN": "test-fake.bitrix24.test"},
+        )
+
+    def test_rendered_bootstrap_does_not_contain_refresh_token_or_xss_payload(self):
+        rendered = app.render_index_html(
+            initial_auth={
+                "AUTH_ID": "</script><script>alert(1)</script>",
+                "REFRESH_ID": "super-secret-refresh",
+                "DOMAIN": "test-fake.bitrix24.test",
+            },
+            nonce="fixed-nonce",
+        )
+        self.assertNotIn("super-secret-refresh", rendered)
+        self.assertNotIn("</script><script>alert(1)</script>", rendered.lower())
+        self.assertIn('nonce="fixed-nonce"', rendered)
+
+    def test_malformed_client_endpoint_is_dropped_without_exposing_auth(self):
+        malformed_auth = {"AUTH_ID": "must-not-be-rendered", "client_endpoint": "https://["}
+
+        self.assertEqual(app.extract_auth_credentials(malformed_auth), (None, None))
+        rendered = app.render_index_html(initial_auth=malformed_auth, nonce="fixed-nonce")
+        self.assertNotIn("must-not-be-rendered", rendered)
+
+
+class TestSelectionTokens(unittest.TestCase):
+    def test_token_is_bound_to_deal_and_manager(self):
+        token = app.issue_selection_token("100", "42", "version-1", "a" * 64, now=1_000)
+        self.assertTrue(app.verify_selection_token(token, "100", "42", now=1_000))
+        self.assertFalse(app.verify_selection_token(token, "101", "42", now=1_000))
+        self.assertFalse(app.verify_selection_token(token, "100", "43", now=1_000))
+
+    def test_expired_token_is_rejected(self):
+        token = app.issue_selection_token("100", "42", "version-1", "a" * 64, now=1_000)
+        self.assertTrue(
+            app.verify_selection_token(
+                token,
+                "100",
+                "42",
+                now=1_000 + app.SELECTION_TOKEN_TTL_SECONDS,
+            )
+        )
+        self.assertFalse(
+            app.verify_selection_token(
+                token,
+                "100",
+                "42",
+                now=1_001 + app.SELECTION_TOKEN_TTL_SECONDS,
+            )
+        )
+
+    def test_tampered_token_is_rejected(self):
+        token = app.issue_selection_token("100", "42", "version-1", "a" * 64, now=1_000)
+        encoded, signature = token.split(".", 1)
+        replacement = ("0" if signature[0] != "0" else "1") + signature[1:]
+        self.assertFalse(app.verify_selection_token(f"{encoded}.{replacement}", "100", "42", now=1_000))
+
+    def test_malformed_and_missing_tokens_are_rejected(self):
+        for token in (None, "", "one.two.three", "not-base64.signature"):
+            with self.subTest(token=token):
+                self.assertFalse(app.verify_selection_token(token, "100", "42"))
+
+    def test_last_timeline_activity_changes_the_signed_deal_lifecycle(self):
+        before = {
+            "DATE_MODIFY": "2026-08-17T09:00:00+06:00",
+            "LAST_ACTIVITY_TIME": "2026-08-17T09:01:00+06:00",
+        }
+        after = {**before, "LAST_ACTIVITY_TIME": "2026-08-17T09:02:00+06:00"}
+
+        self.assertNotEqual(app.deal_version(before), app.deal_version(after))
+
+    def test_token_from_previous_routing_policy_is_rejected_after_deploy(self):
+        token = app.issue_selection_token(
+            "100", "42", "version-1", "a" * 64, now=1_000
+        )
+        with patch.object(app, "ROUTING_POLICY_VERSION", "next-routing-policy"):
+            self.assertFalse(
+                app.verify_selection_token(token, "100", "42", now=1_000)
+            )
+
+
+class TestClassifierBoundaries(unittest.TestCase):
+    def test_female_does_not_match_male_or_maldives(self):
+        result = app.classify(["A female traveller asked for a quiet resort"])
+        self.assertEqual(result["direction"], "Не определено")
+
+    def test_inside_does_not_match_side_or_turkey(self):
+        result = app.classify(["We will stay inside the hotel all week"])
+        self.assertEqual(result["direction"], "Не определено")
+
+    def test_cyrillic_stem_still_matches_inflected_destination(self):
+        result = app.classify(["Хотим отдохнуть на Мальдивах"])
+        self.assertEqual(result["direction"], "Мальдивы")
+
+
+class TestPagination(unittest.TestCase):
+    def test_list_all_follows_every_next_cursor(self):
+        pages = {
+            0: {"result": [{"ID": "1"}, {"ID": "2"}], "next": 50},
+            50: {"result": [{"ID": "3"}], "next": 100},
+            100: {"result": [{"ID": "4"}]},
+        }
+
+        def fake_call(_method, params, timeout=None):
+            return pages[params["start"]]
+
+        with patch.object(app, "bitrix_call_full", side_effect=fake_call) as call_full:
+            result = app.bitrix_list_all("crm.deal.list", {"filter[X]": "Y"}, max_items=10)
+        self.assertEqual([item["ID"] for item in result], ["1", "2", "3", "4"])
+        self.assertEqual([item.args[1]["start"] for item in call_full.call_args_list], [0, 50, 100])
+        self.assertTrue(all(item.args[1]["filter[X]"] == "Y" for item in call_full.call_args_list))
+
+    def test_list_all_respects_max_items(self):
+        with patch.object(
+            app,
+            "bitrix_call_full",
+            return_value={"result": [{"ID": str(i)} for i in range(10)], "next": 50},
+        ) as call_full:
+            result = app.bitrix_list_all("crm.deal.list", max_items=3)
+        self.assertEqual(len(result), 3)
+        call_full.assert_called_once()
+
+    def test_repeated_cursor_fails_instead_of_looping_forever(self):
+        with patch.object(
+            app,
+            "bitrix_call_full",
+            side_effect=[{"result": [], "next": 50}, {"result": [], "next": 50}],
+        ):
+            with self.assertRaises(RuntimeError):
+                app.bitrix_list_all("crm.deal.list", max_items=10)
+
+    def test_list_deadline_is_checked_after_page_response(self):
+        with (
+            patch.object(app, "bitrix_call_full", return_value={"result": []}),
+            patch.object(app.time, "monotonic", side_effect=[0.0, 0.1, 1.1]),
+        ):
+            with self.assertRaisesRegex(TimeoutError, "общий таймаут списка"):
+                app.bitrix_list_all("crm.deal.list", max_items=10, timeout=1.0)
+
+
+class TestBitrixResponseBounds(unittest.TestCase):
+    class FakeResponse:
+        def __init__(self, body, content_length=None):
+            self.body = body
+            self.headers = {}
+            if content_length is not None:
+                self.headers["Content-Length"] = str(content_length)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, limit=-1):
+            return self.body if limit < 0 else self.body[:limit]
+
+    def test_webhook_response_without_length_is_bounded_and_never_echoed(self):
+        secret_body = b'{"result":"private-customer-data-' + (b"x" * 100) + b'"}'
+        response = self.FakeResponse(secret_body)
+        with (
+            patch.object(app, "MAX_BITRIX_RESPONSE_BYTES", 32),
+            patch.object(app.urllib.request, "urlopen", return_value=response),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "безопасный размер") as raised:
+                app.bitrix_call_full("crm.deal.get", {"id": "1"})
+
+        self.assertNotIn("private-customer-data", str(raised.exception))
+
+    def test_oauth_response_content_length_is_rejected_before_decode(self):
+        response = self.FakeResponse(b'{"result":{}}', content_length=10_000)
+        with (
+            patch.object(app, "MAX_BITRIX_RESPONSE_BYTES", 32),
+            patch.object(app.urllib.request, "urlopen", return_value=response),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "безопасный размер"):
+                app.bitrix_oauth_call(
+                    "test-fake.bitrix24.test", "token", "user.current"
+                )
+
+
+class TestManagerMatching(unittest.TestCase):
+    def test_competency_matching_uses_word_boundaries(self):
+        deal = {
+            "messages": ["female traveler"],
+            "classification": {"direction": "Не определено", "confidence": "низкая"},
+        }
+        # Unknown directions remain available to skilled managers by policy,
+        # so use a known direction to verify the text score itself.
+        deal["classification"]["direction"] = "Египет"
+        self.assertEqual(app.deal_score_for_manager(deal, {"competencies": ["male"]}), 0)
+
+    def test_manager_without_skills_gets_zero_even_for_unknown_direction(self):
+        deal = {
+            "messages": [],
+            "classification": {"direction": "Не определено", "confidence": "низкая"},
+        }
+        self.assertEqual(app.deal_score_for_manager(deal, {"competencies": []}), 0)
+
+    def test_manager_without_skills_gets_zero_for_known_direction(self):
+        deal = {
+            "messages": ["Хочу в Турцию"],
+            "classification": {"direction": "Турция", "confidence": "средняя"},
+        }
+        self.assertEqual(app.deal_score_for_manager(deal, {"competencies": []}), 0)
+
+
+class TestExactApplicationEventStats(TemporaryStateTestCase):
+    def test_admin_stats_use_only_persisted_application_events(self):
+        self.store.append_claim(
+            {
+                "timestamp": "2026-08-17T10:00:00+06:00",
+                "managerId": "1001",
+                "managerName": "Manager",
+                "dealId": "100",
+                "dealTitle": "One",
+            }
+        )
+        self.store.append_claim(
+            {
+                "timestamp": "2026-08-17T11:00:00+06:00",
+                "managerId": "1001",
+                "managerName": "Manager",
+                "dealId": "101",
+                "dealTitle": "Two",
+            }
+        )
+        payload = {"dateFrom": "2026-08-17", "dateTo": "2026-08-17", "currentUserId": "999"}
+        with (
+            patch.object(app, "require_admin", return_value={"id": "1", "name": "Admin"}),
+            patch.object(app, "local_date", return_value="2026-08-17"),
+            patch.object(app, "list_portal_users", return_value=[{"ID": "1001", "NAME": "M"}]),
+            patch.object(
+                app,
+                "get_manager_profiles_bulk",
+                return_value={"1001": {"name": "Manager", "competencies": ["Турция"]}},
+            ),
+            patch.object(app, "bitrix_call") as crm_call,
+        ):
+            result = app.admin_state(payload)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["statsSource"], "app_events")
+        self.assertEqual(result["statsLabel"], "Взято через приложение")
+        self.assertEqual(result["managers"][0]["takenInPeriod"], 2)
+        self.assertTrue(any("Ручные переводы" in warning for warning in result["warnings"]))
+        crm_call.assert_not_called()
+
+
+class TestReadiness(TemporaryStateTestCase):
+    def _ready_patches(self, **overrides):
+        values = {
+            "APP_DIR": self.data_dir,
+            "MANAGERS_FILE": self.data_dir / "managers.json",
+            "PUBLIC_APP_URL": "https://picker.example.test",
+            "RAW_APP_ALLOWED_ORIGINS": {"https://picker.example.test"},
+            "APP_ALLOWED_ORIGINS": {"https://picker.example.test"},
+            "RAW_BITRIX_ALLOWED_DOMAINS": {"test-fake.bitrix24.test"},
+            "ALLOWED_BITRIX_DOMAINS": {"test-fake.bitrix24.test"},
+            "ADMIN_USER_IDS": {"1"},
+            "CLAIM_STATS_SOURCE": "app_events",
+            "REQUIRE_LEGACY_MIGRATION": False,
+            "REQUIRE_EXPLICIT_ACCESS_RULE": True,
+            "STATE_STORE": self.store,
+        }
+        values.update(overrides)
+        return patch.multiple(app, **values)
+
+    def test_valid_configuration_and_store_are_ready(self):
+        with self._ready_patches():
+            result = app.readiness_state(force=True)
+        self.assertTrue(result["ok"], result["errors"])
+        self.assertTrue(result["storage"]["ok"])
+        self.assertEqual(result["storage"]["journalMode"], "wal")
+
+    def test_unsupported_stats_source_fails_closed(self):
+        with self._ready_patches(CLAIM_STATS_SOURCE="crm_guess"):
+            result = app.readiness_state(force=True)
+        self.assertFalse(result["ok"])
+        self.assertTrue(any("app_events" in error for error in result["errors"]))
+
+    def test_production_cannot_disable_explicit_manager_rules(self):
+        with self._ready_patches(REQUIRE_EXPLICIT_ACCESS_RULE=False):
+            result = app.readiness_state(force=True)
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(
+            any("REQUIRE_EXPLICIT_ACCESS_RULE" in error for error in result["errors"])
+        )
+
+    def test_broken_store_fails_readiness(self):
+        broken = MagicMock()
+        broken.readiness_check.return_value = {"ok": False, "error": "corrupt database"}
+        with self._ready_patches(STATE_STORE=broken):
+            result = app.readiness_state(force=True)
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["storage"]["ok"])
+        self.assertNotIn("corrupt database", result["errors"])
+
+    def test_missing_public_url_and_origins_fail_readiness(self):
+        with self._ready_patches(PUBLIC_APP_URL="", RAW_APP_ALLOWED_ORIGINS=set(), APP_ALLOWED_ORIGINS=set()):
+            result = app.readiness_state(force=True)
+        self.assertFalse(result["ok"])
+        self.assertTrue(any("PUBLIC_APP_URL" in error for error in result["errors"]))
+        self.assertTrue(any("APP_ALLOWED_ORIGINS" in error for error in result["errors"]))
+
+    def test_malformed_url_configuration_returns_not_ready_instead_of_crashing(self):
+        with (
+            patch.dict(os.environ, {"BITRIX_WEBHOOK_BASE": "https://["}),
+            self._ready_patches(
+                PUBLIC_APP_URL="https://[",
+                RAW_APP_ALLOWED_ORIGINS={"https://["},
+                APP_ALLOWED_ORIGINS=set(),
+            ),
+        ):
+            with self.assertRaises(RuntimeError):
+                app.load_env()
+            result = app.readiness_state(force=True)
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(any("BITRIX_WEBHOOK_BASE" in error for error in result["errors"]))
+        self.assertTrue(any("PUBLIC_APP_URL" in error for error in result["errors"]))
+        self.assertTrue(any("APP_ALLOWED_ORIGINS" in error for error in result["errors"]))
+
+    def test_railway_runtime_without_attached_volume_fails_readiness(self):
+        railway_env = {**_TEST_ENV, "RAILWAY_PROJECT_ID": "project-test"}
+        with patch.dict(os.environ, railway_env, clear=True), self._ready_patches():
+            result = app.readiness_state(force=True)
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(any("Volume" in error for error in result["errors"]))
+
+    def test_railway_volume_must_match_application_data_directory(self):
+        railway_env = {
+            **_TEST_ENV,
+            "RAILWAY_PROJECT_ID": "project-test",
+            "RAILWAY_VOLUME_NAME": "picker-data",
+            "RAILWAY_VOLUME_MOUNT_PATH": str(self.data_dir.parent),
+        }
+        with patch.dict(os.environ, railway_env, clear=True), self._ready_patches():
+            result = app.readiness_state(force=True)
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(any("APP_DATA_DIR" in error for error in result["errors"]))
+
+    def test_matching_official_railway_volume_variables_pass_readiness(self):
+        railway_env = {
+            **_TEST_ENV,
+            "RAILWAY_PROJECT_ID": "project-test",
+            "RAILWAY_VOLUME_NAME": "picker-data",
+            "RAILWAY_VOLUME_MOUNT_PATH": str(self.data_dir),
+        }
+        with patch.dict(os.environ, railway_env, clear=True), self._ready_patches():
+            result = app.readiness_state(force=True)
+
+        self.assertTrue(result["ok"], result["errors"])
+
+    def test_malformed_manager_list_item_fails_readiness(self):
+        (self.data_dir / "managers.json").write_text(
+            json.dumps(["not-an-object"]),
+            encoding="utf-8",
+        )
+        with self._ready_patches():
+            result = app.readiness_state(force=True)
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(any("managers.json" in error for error in result["errors"]))
+
+
+class TestHttpBoundary(unittest.TestCase):
+    def test_access_log_does_not_persist_full_client_ip(self):
+        handler = HandlerHarness.make("GET", "/api/health")
+        handler.client_address = ("203.0.113.42", 12345)
+        with patch.object(app.sys.stderr, "write") as write:
+            handler.log_message('"%s" %s %s', "GET /api/health", "200", "2")
+
+        rendered = "".join(item.args[0] for item in write.call_args_list)
+        self.assertNotIn("203.0.113.42", rendered)
+        self.assertEqual(rendered, "GET /api/health\n")
+
+    def test_sensitive_get_routes_are_closed(self):
+        for path in (
+            "/api/deals?auth=secret",
+            "/api/next-deal?managerId=1",
+            "/api/managers",
+            "/api/manager?id=1",
+        ):
+            with self.subTest(path=path):
+                handler = HandlerHarness.make("GET", path)
+                handler.do_GET()
+                self.assertEqual(HandlerHarness.status(handler), 404)
+
+    def test_malformed_urls_fail_closed_at_helpers_and_http_boundary(self):
+        self.assertIsNone(app.safe_urlparse("https://["))
+        self.assertEqual(app.url_origin("https://["), "")
+        self.assertFalse(app.is_loopback_http_url("http://["))
+
+        get_handler = HandlerHarness.make("GET", "https://[")
+        get_handler.do_GET()
+        self.assertEqual(HandlerHarness.status(get_handler), 400)
+
+        post_handler = HandlerHarness.make("POST", "https://[", b"{}")
+        post_handler.do_POST()
+        self.assertEqual(HandlerHarness.status(post_handler), 400)
+
+        origin_handler = HandlerHarness.make(
+            "OPTIONS", "/api/next-deal", origin="http://["
+        )
+        with patch.multiple(app, ALLOW_UNVERIFIED_USERS=True, DRY_RUN=True):
+            origin_handler.do_OPTIONS()
+        self.assertEqual(HandlerHarness.status(origin_handler), 403)
+
+    def test_cors_allows_only_exact_configured_origin(self):
+        allowed = HandlerHarness.make("OPTIONS", "/api/next-deal", origin="https://picker.example.test")
+        allowed.do_OPTIONS()
+        self.assertEqual(HandlerHarness.status(allowed), 204)
+        self.assertIn(
+            ("Access-Control-Allow-Origin", "https://picker.example.test"),
+            HandlerHarness.headers(allowed),
+        )
+
+        denied = HandlerHarness.make("OPTIONS", "/api/next-deal", origin="https://evil.example")
+        denied.do_OPTIONS()
+        self.assertEqual(HandlerHarness.status(denied), 403)
+        self.assertNotIn(
+            ("Access-Control-Allow-Origin", "https://evil.example"),
+            HandlerHarness.headers(denied),
+        )
+
+    def test_missing_origin_is_allowed_for_same_origin_clients_without_wildcard_cors(self):
+        handler = HandlerHarness.make("GET", "/api/health")
+        handler.do_GET()
+        self.assertEqual(HandlerHarness.status(handler), 200)
+        self.assertFalse(any(name == "Access-Control-Allow-Origin" for name, _ in HandlerHarness.headers(handler)))
+
+    def test_railway_real_ip_is_used_only_with_official_runtime_identity(self):
+        headers = {
+            "X-Railway-Edge": "edge",
+            "X-Real-IP": "203.0.113.42",
+        }
+        handler = HandlerHarness.make("POST", "/api/current-user", headers=headers)
+        with patch.dict(
+            os.environ,
+            {"RAILWAY_PROJECT_ID": "project-test"},
+            clear=True,
+        ):
+            self.assertEqual(handler.client_key(), "203.0.113.42")
+
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(handler.client_key(), "127.0.0.1")
+
+    def test_oversized_request_body_is_rejected_before_read(self):
+        handler = HandlerHarness.make(
+            "POST",
+            "/api/current-user",
+            b"{}",
+            headers={"Content-Length": str(app.MAX_REQUEST_BODY_BYTES + 1)},
+        )
+        with self.assertRaises(OverflowError):
+            handler.read_body()
+        self.assertEqual(handler.rfile.tell(), 0)
+
+    def test_transfer_encoding_is_rejected(self):
+        handler = HandlerHarness.make(
+            "POST",
+            "/api/current-user",
+            b"{}",
+            headers={"Transfer-Encoding": "chunked"},
+        )
+        with self.assertRaises(ValueError):
+            handler.read_body()
+
+    def test_json_body_must_be_an_object(self):
+        handler = HandlerHarness.make("POST", "/api/current-user", b"[]")
+        with self.assertRaises(ValueError):
+            handler.read_json()
+
+    def test_root_html_has_nonce_csp_and_does_not_reflect_query_auth(self):
+        handler = HandlerHarness.make("GET", "/?AUTH_ID=must-not-appear&DOMAIN=evil.example")
+        handler.do_GET()
+        body = handler.wfile.getvalue().decode("utf-8")
+        headers = HandlerHarness.headers(handler)
+        csp = next(value for name, value in headers if name == "Content-Security-Policy")
+        self.assertIn("script-src 'self' 'nonce-", csp)
+        self.assertIn("frame-ancestors https://test-fake.bitrix24.test", csp)
+        self.assertNotIn("must-not-appear", body)
+
+
+class TestRejectionRecording(TemporaryStateTestCase):
+    def test_rejection_uses_live_server_deal_and_ignores_browser_deal(self):
+        token = app.issue_selection_token(
+            "100", "42", "version-1", test_manager_policy(), now=1_000
+        )
+        payload = {
+            "dealId": "100",
+            "reason": "duplicate",
+            "selectionToken": token,
+            "deal": {
+                "ID": "999",
+                "TITLE": "CLIENT-CONTROLLED",
+                "STAGE_ID": app.TARGET_STAGE,
+                "classification": {"direction": "CLIENT-CONTROLLED"},
+            },
+        }
+        server_deal = {
+            "ID": "100",
+            "TITLE": "SERVER-TITLE",
+            "STAGE_ID": next(iter(app.SOURCE_STAGES)),
+            "DATE_MODIFY": "version-1",
+        }
+        with (
+            patch.object(app.time, "time", return_value=1_000),
+            patch.object(app, "bitrix_call", return_value=server_deal) as bitrix_call,
+            patch.object(
+                app,
+                "get_manager_profile",
+                return_value={
+                    "id": "42",
+                    "name": "Manager",
+                    "active": True,
+                    "intranet": True,
+                    "competencies": ["Турция"],
+                },
+            ),
+        ):
+            result = app.record_rejection("42", payload)
+
+        self.assertTrue(result["ok"])
+        saved = self.store.list_rejections()
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(saved[0]["dealId"], "100")
+        self.assertEqual(saved[0]["dealTitle"], "")
+        self.assertNotIn("CLIENT-CONTROLLED", json.dumps(saved[0], ensure_ascii=False))
+        bitrix_call.assert_called_once_with("crm.deal.get", {"id": "100"})
+
+    def test_repeated_rejection_token_is_idempotent(self):
+        token = app.issue_selection_token(
+            "100", "42", "version-1", test_manager_policy(), now=1_000
+        )
+        payload = {"dealId": "100", "reason": "other", "selectionToken": token}
+        server_deal = {
+            "ID": "100",
+            "TITLE": "Server",
+            "STAGE_ID": next(iter(app.SOURCE_STAGES)),
+            "DATE_MODIFY": "version-1",
+        }
+        with (
+            patch.object(app.time, "time", return_value=1_000),
+            patch.object(app, "bitrix_call", return_value=server_deal) as bitrix_call,
+            patch.object(
+                app,
+                "get_manager_profile",
+                return_value={
+                    "id": "42",
+                    "name": "Manager",
+                    "active": True,
+                    "intranet": True,
+                    "competencies": ["Турция"],
+                },
+            ),
+        ):
+            first = app.record_rejection("42", payload)
+            second = app.record_rejection("42", payload)
+
+        self.assertTrue(first["ok"])
+        self.assertTrue(second["ok"])
+        self.assertTrue(second["idempotentReplay"])
+        self.assertEqual(len(self.store.list_rejections()), 1)
+        bitrix_call.assert_called_once()
+
+    def test_invalid_selection_token_never_reads_bitrix(self):
+        with patch.object(app, "bitrix_call") as bitrix_call:
+            result = app.record_rejection(
+                "42", {"dealId": "100", "reason": "other", "selectionToken": "forged"}
+            )
+        self.assertFalse(result["ok"])
+        bitrix_call.assert_not_called()
+
+
+class ClaimWorkflowTestCase(TemporaryStateTestCase):
+    manager_id = "42"
+    deal_id = "100"
+    version = "version-1"
+
+    def operation_key(self):
+        return app.claim_operation_key(self.deal_id, self.version)
+
+    def attempt_marker(self, manager_id=None):
+        return app.claim_attempt_marker(
+            self.operation_key(), manager_id or self.manager_id, nonce="test-attempt"
+        )
+
+    def begin_operation(self, manager_id=None):
+        manager_id = manager_id or self.manager_id
+        return self.store.begin_claim_operation(
+            self.deal_id,
+            manager_id,
+            operation_key=self.operation_key(),
+            request={
+                "claimMarker": self.attempt_marker(manager_id),
+                "dealVersion": self.version,
+            },
+        )
+
+    def token(self, manager_id=None):
+        return app.issue_selection_token(
+            self.deal_id,
+            manager_id or self.manager_id,
+            self.version,
+            test_manager_policy(),
+            now=1_000,
+        )
+
+    def source_deal(self, *, manager="9"):
+        return {
+            "ID": self.deal_id,
+            "TITLE": "Server deal",
+            "STAGE_ID": next(iter(app.SOURCE_STAGES)),
+            "ASSIGNED_BY_ID": manager,
+            "DATE_MODIFY": self.version,
+        }
+
+    def claimed_deal(self, *, manager=None):
+        return {
+            "ID": self.deal_id,
+            "TITLE": "Server deal",
+            "STAGE_ID": app.TARGET_STAGE,
+            "ASSIGNED_BY_ID": manager or self.manager_id,
+            "DATE_MODIFY": "version-after-claim",
+            app.BITRIX_CLAIM_MARKER_FIELD: self.attempt_marker(manager),
+        }
+
+    def claim_side_effect(self, get_results, *, update_error=None):
+        remaining = iter(get_results)
+
+        def fake_bitrix(method, params=None, timeout=None):
+            if method == "crm.deal.get":
+                return next(remaining)
+            if method == "crm.deal.update":
+                if update_error:
+                    raise update_error
+                return True
+            raise AssertionError(f"unexpected Bitrix method: {method}")
+
+        return fake_bitrix
+
+    @contextmanager
+    def common_claim_context(self, *, dry_run=False, greeting=True):
+        patchers = [
+            patch.object(app, "DRY_RUN", dry_run),
+            patch.object(app.time, "time", return_value=1_000),
+            patch.object(app.secrets, "token_hex", return_value="test-attempt"),
+            patch.object(
+                app,
+                "get_manager_profile",
+                return_value={
+                    "id": self.manager_id,
+                    "name": "Manager",
+                    "active": True,
+                    "intranet": True,
+                    "competencies": ["Турция"],
+                },
+            ),
+        ]
+        if greeting:
+            patchers.append(
+                patch.object(app, "prepare_greeting", return_value={"ok": True, "status": "manual"})
+            )
+        with ExitStack() as stack:
+            for patcher in patchers:
+                stack.enter_context(patcher)
+            yield
+
+    def backdate_operation(self, operation_key=None):
+        operation_key = operation_key or self.operation_key()
+        with self.store._connect() as connection:
+            connection.execute(
+                "UPDATE claim_operations SET created_at=?, updated_at=? WHERE operation_key=?",
+                ("2000-01-01T00:00:00+00:00", "2000-01-01T00:00:00+00:00", operation_key),
+            )
+
+    def set_operation_timestamps(
+        self,
+        created_at,
+        *,
+        updated_at=None,
+        finalized_at=None,
+        operation_key=None,
+    ):
+        operation_key = operation_key or self.operation_key()
+        with self.store._connect() as connection:
+            connection.execute(
+                """
+                UPDATE claim_operations
+                SET created_at=?, updated_at=?, finalized_at=?
+                WHERE operation_key=?
+                """,
+                (
+                    created_at,
+                    updated_at or created_at,
+                    finalized_at,
+                    operation_key,
+                ),
+            )
+
+
+class TestClaimWorkflow(ClaimWorkflowTestCase):
+    def test_unknown_live_claim_marker_without_local_operation_is_never_overwritten(self):
+        live = self.source_deal()
+        live[app.BITRIX_CLAIM_MARKER_FIELD] = "claim:unknown-surviving-evidence"
+        with (
+            self.common_claim_context(),
+            patch.object(app, "bitrix_call", return_value=live) as bitrix_call,
+        ):
+            result = app.preview_claim(
+                self.deal_id,
+                self.manager_id,
+                selection_token=self.token(),
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["_httpStatus"], 409)
+        self.assertTrue(result["recoveryPending"])
+        self.assertNotIn(
+            "crm.deal.update",
+            [item.args[0] for item in bitrix_call.call_args_list],
+        )
+        self.assertIsNone(self.store.get_claim_operation(self.operation_key()))
+
+    def test_marker_appearing_between_reads_is_preserved_and_operation_stays_unresolved(self):
+        first = self.source_deal()
+        second = self.source_deal()
+        second[app.BITRIX_CLAIM_MARKER_FIELD] = "claim:foreign-racing-evidence"
+        with (
+            self.common_claim_context(),
+            patch.object(
+                app,
+                "bitrix_call",
+                side_effect=[first, second],
+            ) as bitrix_call,
+        ):
+            result = app.preview_claim(
+                self.deal_id,
+                self.manager_id,
+                selection_token=self.token(),
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["_httpStatus"], 409)
+        self.assertTrue(result["recoveryPending"])
+        self.assertNotIn(
+            "crm.deal.update",
+            [item.args[0] for item in bitrix_call.call_args_list],
+        )
+        operation = self.store.get_claim_operation(self.operation_key())
+        self.assertEqual(operation["status"], "failed")
+        self.assertTrue(operation["result"]["recoveryRequired"])
+
+    def test_resolved_old_marker_allows_an_intentional_new_lifecycle(self):
+        old_version = "old-version"
+        old_key = app.claim_operation_key(self.deal_id, old_version)
+        old_marker = app.claim_attempt_marker(
+            old_key,
+            self.manager_id,
+            nonce="old-attempt",
+        )
+        self.store.begin_claim_operation(
+            self.deal_id,
+            self.manager_id,
+            operation_key=old_key,
+            request={
+                "claimMarker": old_marker,
+                "dealVersion": old_version,
+            },
+        )
+        self.store.finalize_claim_operation(
+            old_key,
+            claim={"managerId": self.manager_id, "dealId": self.deal_id},
+            expected_claim_marker=old_marker,
+        )
+        source_with_old_marker = self.source_deal()
+        source_with_old_marker[app.BITRIX_CLAIM_MARKER_FIELD] = old_marker
+        side_effect = self.claim_side_effect(
+            [
+                source_with_old_marker,
+                source_with_old_marker,
+                self.claimed_deal(),
+            ]
+        )
+        with (
+            self.common_claim_context(),
+            patch.object(app, "bitrix_call", side_effect=side_effect) as bitrix_call,
+        ):
+            result = app.preview_claim(
+                self.deal_id,
+                self.manager_id,
+                selection_token=self.token(),
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(
+            [item.args[0] for item in bitrix_call.call_args_list].count("crm.deal.update"),
+            1,
+        )
+        self.assertEqual(self.store.get_claim_operation(self.operation_key())["status"], "succeeded")
+
+    def test_dry_run_never_updates_crm_or_writes_claim_event(self):
+        token = self.token()
+        with (
+            self.common_claim_context(dry_run=True),
+            patch.object(app, "bitrix_call", return_value=self.source_deal()) as bitrix_call,
+        ):
+            result = app.preview_claim(self.deal_id, self.manager_id, selection_token=token)
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["dryRun"])
+        self.assertEqual(self.store.count_claims(self.manager_id), 0)
+        self.assertIsNone(self.store.get_claim_operation(self.operation_key()))
+        self.assertNotIn("crm.deal.update", [item.args[0] for item in bitrix_call.call_args_list])
+
+    def test_new_timeline_activity_invalidates_old_selection_before_crm_update(self):
+        selected = self.source_deal()
+        selected["LAST_ACTIVITY_TIME"] = "2026-08-17T09:01:00+06:00"
+        selected_version = app.deal_version(selected)
+        token = app.issue_selection_token(
+            self.deal_id,
+            self.manager_id,
+            selected_version,
+            test_manager_policy(),
+            now=1_000,
+        )
+        live = dict(selected)
+        live["LAST_ACTIVITY_TIME"] = "2026-08-17T09:02:00+06:00"
+
+        with (
+            self.common_claim_context(),
+            patch.object(app, "bitrix_call", return_value=live) as bitrix_call,
+        ):
+            result = app.preview_claim(
+                self.deal_id,
+                self.manager_id,
+                selection_token=token,
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["_httpStatus"], 409)
+        self.assertNotIn(
+            "crm.deal.update",
+            [item.args[0] for item in bitrix_call.call_args_list],
+        )
+
+    def test_success_updates_verifies_and_atomically_finalizes_audit(self):
+        token = self.token()
+        side_effect = self.claim_side_effect(
+            [self.source_deal(), self.source_deal(), self.claimed_deal()]
+        )
+        with (
+            self.common_claim_context(),
+            patch.object(app, "bitrix_call", side_effect=side_effect) as bitrix_call,
+        ):
+            result = app.preview_claim(self.deal_id, self.manager_id, selection_token=token)
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["auditRecorded"])
+        self.assertEqual(result["updated"]["ASSIGNED_BY_ID"], self.manager_id)
+        self.assertIn(
+            call(
+                "crm.deal.update",
+                {
+                    "id": self.deal_id,
+                    "fields[ASSIGNED_BY_ID]": self.manager_id,
+                    "fields[STAGE_ID]": app.TARGET_STAGE,
+                    f"fields[{app.BITRIX_CLAIM_MARKER_FIELD}]": self.attempt_marker(),
+                },
+            ),
+            bitrix_call.call_args_list,
+        )
+        operation = self.store.get_claim_operation(self.operation_key())
+        self.assertEqual(operation["status"], "succeeded")
+        self.assertEqual(self.store.count_claims(self.manager_id), 1)
+
+    def test_new_success_uses_current_local_time_for_claim_event(self):
+        current_time = datetime(2026, 8, 17, 0, 1, tzinfo=app.LOCAL_TZ)
+        side_effect = self.claim_side_effect(
+            [self.source_deal(), self.source_deal(), self.claimed_deal()]
+        )
+        with (
+            self.common_claim_context(),
+            patch.object(app, "local_now", return_value=current_time),
+            patch.object(app, "bitrix_call", side_effect=side_effect),
+        ):
+            result = app.preview_claim(
+                self.deal_id,
+                self.manager_id,
+                selection_token=self.token(),
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(
+            self.store.list_claims(self.manager_id)[0]["timestamp"],
+            "2026-08-17T00:01:00.000000+06:00",
+        )
+
+    def test_successful_replay_is_idempotent_and_does_not_update_twice(self):
+        token = self.token()
+        side_effect = self.claim_side_effect(
+            [self.source_deal(), self.source_deal(), self.claimed_deal(), self.claimed_deal()]
+        )
+        with (
+            self.common_claim_context(),
+            patch.object(app, "bitrix_call", side_effect=side_effect) as bitrix_call,
+        ):
+            first = app.preview_claim(self.deal_id, self.manager_id, selection_token=token)
+            second = app.preview_claim(self.deal_id, self.manager_id, selection_token=token)
+
+        self.assertTrue(first["ok"])
+        self.assertTrue(second["ok"])
+        self.assertTrue(second["idempotentReplay"])
+        self.assertEqual(self.store.count_claims(self.manager_id), 1)
+        methods = [item.args[0] for item in bitrix_call.call_args_list]
+        self.assertEqual(methods.count("crm.deal.update"), 1)
+
+    def test_concurrent_succeeded_operation_is_live_marker_verified_before_replay(self):
+        token = self.token()
+        operation = {
+            "operationKey": self.operation_key(),
+            "dealId": self.deal_id,
+            "managerId": self.manager_id,
+            "status": "succeeded",
+            "request": {"claimMarker": self.attempt_marker()},
+            "result": {"dealId": self.deal_id, "auditRecorded": True},
+        }
+        with (
+            self.common_claim_context(),
+            patch.object(self.store, "begin_claim_operation", return_value=operation),
+            patch.object(
+                app,
+                "bitrix_call",
+                side_effect=[self.source_deal(), self.claimed_deal()],
+            ) as bitrix_call,
+        ):
+            result = app.preview_claim(self.deal_id, self.manager_id, selection_token=token)
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["idempotentReplay"])
+        self.assertNotIn(
+            "crm.deal.update",
+            [item.args[0] for item in bitrix_call.call_args_list],
+        )
+
+    def test_lost_update_response_is_success_when_live_state_confirms_claim(self):
+        token = self.token()
+        side_effect = self.claim_side_effect(
+            [self.source_deal(), self.source_deal(), self.claimed_deal()],
+            update_error=TimeoutError("response lost"),
+        )
+        with (
+            self.common_claim_context(),
+            patch.object(app, "bitrix_call", side_effect=side_effect),
+        ):
+            result = app.preview_claim(self.deal_id, self.manager_id, selection_token=token)
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["auditRecorded"])
+        self.assertTrue(any("потерян" in warning for warning in result["warnings"]))
+        self.assertEqual(self.store.get_claim_operation(self.operation_key())["status"], "succeeded")
+
+    def test_remote_success_then_audit_failure_is_reported_as_success_with_warning(self):
+        token = self.token()
+        side_effect = self.claim_side_effect(
+            [self.source_deal(), self.source_deal(), self.claimed_deal()]
+        )
+        original_finalize = self.store.finalize_claim_operation
+        with (
+            self.common_claim_context(),
+            patch.object(app, "bitrix_call", side_effect=side_effect),
+            patch.object(self.store, "finalize_claim_operation", side_effect=RuntimeError("disk full")),
+        ):
+            result = app.preview_claim(self.deal_id, self.manager_id, selection_token=token)
+
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["auditRecorded"])
+        self.assertTrue(any("журнал" in warning for warning in result["warnings"]))
+        self.assertEqual(self.store.get_claim_operation(self.operation_key())["status"], "failed")
+        self.assertEqual(self.store.count_claims(self.manager_id), 0)
+        self.assertTrue(callable(original_finalize))
+
+    def test_remote_success_then_greeting_failure_keeps_claim_successful(self):
+        token = self.token()
+        side_effect = self.claim_side_effect(
+            [self.source_deal(), self.source_deal(), self.claimed_deal()]
+        )
+        with (
+            self.common_claim_context(greeting=False),
+            patch.object(app, "prepare_greeting", side_effect=RuntimeError("chat unavailable")),
+            patch.object(app, "bitrix_call", side_effect=side_effect),
+        ):
+            result = app.preview_claim(self.deal_id, self.manager_id, selection_token=token)
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["auditRecorded"])
+        self.assertNotIn("greeting", result)
+        self.assertTrue(any("приветствие" in warning for warning in result["warnings"]))
+        self.assertEqual(self.store.count_claims(self.manager_id), 1)
+
+    def test_unconfirmed_remote_update_is_failed_and_marked_uncertain(self):
+        token = self.token()
+
+        def fake_bitrix(method, params=None, timeout=None):
+            if method == "crm.deal.get":
+                if fake_bitrix.reads < 2:
+                    fake_bitrix.reads += 1
+                    return self.source_deal()
+                raise TimeoutError("cannot verify")
+            if method == "crm.deal.update":
+                return True
+            raise AssertionError(method)
+
+        fake_bitrix.reads = 0
+        with (
+            self.common_claim_context(),
+            patch.object(app, "bitrix_call", side_effect=fake_bitrix),
+        ):
+            result = app.preview_claim(self.deal_id, self.manager_id, selection_token=token)
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["remoteUpdateUncertain"])
+        self.assertEqual(result["_httpStatus"], 503)
+        self.assertEqual(self.store.get_claim_operation(self.operation_key())["status"], "failed")
+
+
+class TestStalePendingRecovery(ClaimWorkflowTestCase):
+    def test_other_lifecycle_cannot_overwrite_an_unresolved_deal_operation(self):
+        old_version = "older-lifecycle"
+        old_manager = "1001"
+        old_key = app.claim_operation_key(self.deal_id, old_version)
+        old_marker = app.claim_attempt_marker(old_key, old_manager, nonce="old-attempt")
+        self.store.begin_claim_operation(
+            self.deal_id,
+            old_manager,
+            operation_key=old_key,
+            request={
+                "dealVersion": old_version,
+                "claimMarker": old_marker,
+                "attemptStartedAt": "2026-08-17T09:00:00+06:00",
+            },
+        )
+        self.store.fail_claim_operation(
+            old_key,
+            "verification timeout",
+            result={"remoteUpdateUncertain": True},
+        )
+
+        with (
+            self.common_claim_context(),
+            patch.object(app, "bitrix_call") as bitrix_call,
+        ):
+            result = app.preview_claim(
+                self.deal_id,
+                self.manager_id,
+                selection_token=self.token(),
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["_httpStatus"], 409)
+        self.assertTrue(result["recoveryPending"])
+        bitrix_call.assert_not_called()
+        self.assertEqual(self.store.get_claim_operation(old_key)["status"], "failed")
+        self.assertEqual(self.store.list_claims(), [])
+
+    def test_failed_uncertain_retry_never_overwrites_a_foreign_marker(self):
+        self.begin_operation()
+        self.store.fail_claim_operation(
+            self.operation_key(),
+            "verification timeout",
+            result={"remoteUpdateUncertain": True},
+        )
+        live = self.source_deal()
+        live[app.BITRIX_CLAIM_MARKER_FIELD] = "claim:foreign-attempt"
+        with (
+            self.common_claim_context(),
+            patch.object(app, "bitrix_call", return_value=live) as bitrix_call,
+        ):
+            result = app.preview_claim(
+                self.deal_id,
+                self.manager_id,
+                selection_token=self.token(),
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["recoveryPending"])
+        self.assertEqual(result["_httpStatus"], 409)
+        self.assertNotIn(
+            "crm.deal.update",
+            [item.args[0] for item in bitrix_call.call_args_list],
+        )
+        self.assertEqual(
+            len(self.store.list_unresolved_claim_operations(self.manager_id)),
+            1,
+        )
+        self.assertEqual(self.store.count_claims(self.manager_id), 0)
+
+    def test_young_pending_operation_stays_locked_without_crm_write(self):
+        self.begin_operation()
+        with (
+            self.common_claim_context(),
+            patch.object(app, "bitrix_call") as bitrix_call,
+        ):
+            result = app.preview_claim(
+                self.deal_id,
+                self.manager_id,
+                selection_token=self.token(),
+            )
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["_httpStatus"], 409)
+        self.assertEqual(self.store.get_claim_operation(self.operation_key())["status"], "pending")
+        bitrix_call.assert_not_called()
+
+    def test_stale_pending_recovers_already_completed_remote_claim_without_second_update(self):
+        self.begin_operation()
+        self.backdate_operation()
+        with (
+            self.common_claim_context(),
+            patch.object(app, "bitrix_call", return_value=self.claimed_deal()) as bitrix_call,
+        ):
+            result = app.preview_claim(
+                self.deal_id,
+                self.manager_id,
+                selection_token=self.token(),
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result.get("recoveredAfterRetry") or result.get("recoveredStaleOperation"))
+        self.assertNotIn("crm.deal.update", [item.args[0] for item in bitrix_call.call_args_list])
+        self.assertEqual(self.store.get_claim_operation(self.operation_key())["status"], "succeeded")
+        self.assertEqual(self.store.count_claims(self.manager_id), 1)
+
+    def test_browser_recovery_after_midnight_keeps_original_reservation_date(self):
+        reservation_time = "2026-08-16T23:59:00+06:00"
+        reconciliation_time = datetime(2026, 8, 17, 0, 1, tzinfo=app.LOCAL_TZ)
+        self.store.begin_claim_operation(
+            self.deal_id,
+            self.manager_id,
+            operation_key=self.operation_key(),
+            request={
+                "claimMarker": self.attempt_marker(),
+                "dealVersion": self.version,
+                "attemptStartedAt": reservation_time,
+            },
+        )
+        self.set_operation_timestamps(reservation_time)
+
+        with (
+            self.common_claim_context(),
+            patch.object(app, "local_now", return_value=reconciliation_time),
+            patch.object(app, "bitrix_call", return_value=self.claimed_deal()),
+        ):
+            result = app.preview_claim(
+                self.deal_id,
+                self.manager_id,
+                selection_token=self.token(),
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(
+            self.store.count_claims(self.manager_id, "2026-08-16", "2026-08-16"),
+            1,
+        )
+        self.assertEqual(
+            self.store.count_claims(self.manager_id, "2026-08-17", "2026-08-17"),
+            0,
+        )
+        finalized = self.store.get_claim_operation(self.operation_key())
+        self.assertEqual(finalized["request"]["attemptStartedAt"], reservation_time)
+        self.assertTrue(finalized["request"]["recovery"])
+
+    def test_legacy_retried_pending_recovery_uses_pre_transition_updated_at(self):
+        first_operation_time = "2026-08-15T10:00:00+06:00"
+        retry_reservation_time = "2026-08-16T23:59:00+06:00"
+        reconciliation_time = datetime(2026, 8, 17, 0, 1, tzinfo=app.LOCAL_TZ)
+        self.begin_operation()
+        self.set_operation_timestamps(first_operation_time)
+        self.store.fail_claim_operation(
+            self.operation_key(),
+            "legacy first attempt failed",
+            result={"remoteUpdated": False},
+        )
+        retried = self.store.retry_failed_claim_operation(
+            self.deal_id,
+            self.manager_id,
+            operation_key=self.operation_key(),
+        )
+        self.assertTrue(retried["retried"])
+        self.set_operation_timestamps(
+            first_operation_time,
+            updated_at=retry_reservation_time,
+        )
+
+        with (
+            self.common_claim_context(),
+            patch.object(app, "local_now", return_value=reconciliation_time),
+            patch.object(app, "bitrix_call", return_value=self.claimed_deal()),
+        ):
+            result = app.preview_claim(
+                self.deal_id,
+                self.manager_id,
+                selection_token=self.token(),
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(
+            self.store.count_claims(self.manager_id, "2026-08-15", "2026-08-15"),
+            0,
+        )
+        self.assertEqual(
+            self.store.count_claims(self.manager_id, "2026-08-16", "2026-08-16"),
+            1,
+        )
+        self.assertEqual(
+            self.store.count_claims(self.manager_id, "2026-08-17", "2026-08-17"),
+            0,
+        )
+
+    def test_stale_pending_in_source_stage_retries_same_identity_and_updates(self):
+        self.begin_operation()
+        self.backdate_operation()
+        side_effect = self.claim_side_effect(
+            [self.source_deal(), self.source_deal(), self.claimed_deal()]
+        )
+        with (
+            self.common_claim_context(),
+            patch.object(app, "bitrix_call", side_effect=side_effect) as bitrix_call,
+        ):
+            result = app.preview_claim(
+                self.deal_id,
+                self.manager_id,
+                selection_token=self.token(),
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual([item.args[0] for item in bitrix_call.call_args_list].count("crm.deal.update"), 1)
+        self.assertEqual(self.store.get_claim_operation(self.operation_key())["status"], "succeeded")
+        self.assertEqual(self.store.count_claims(self.manager_id), 1)
+
+    def test_stale_pending_from_other_manager_can_be_safely_reassigned_in_source_stage(self):
+        old_manager = "1001"
+        new_manager = "42"
+        self.begin_operation(old_manager)
+        self.backdate_operation()
+        side_effect = self.claim_side_effect(
+            [self.source_deal(manager=old_manager), self.source_deal(manager=old_manager), self.claimed_deal(manager=new_manager)]
+        )
+        with (
+            self.common_claim_context(),
+            patch.object(app, "bitrix_call", side_effect=side_effect),
+        ):
+            result = app.preview_claim(
+                self.deal_id,
+                new_manager,
+                selection_token=self.token(new_manager),
+            )
+
+        self.assertTrue(result["ok"])
+        operation = self.store.get_claim_operation(self.operation_key())
+        self.assertEqual(operation["managerId"], new_manager)
+        self.assertEqual(operation["status"], "succeeded")
+        self.assertEqual(self.store.count_claims(new_manager), 1)
+        self.assertEqual(self.store.count_claims(old_manager), 0)
+
+
+class TestEligibilityAndAccessPolicy(ClaimWorkflowTestCase):
+    def test_selection_token_is_revoked_when_competencies_change(self):
+        with (
+            self.common_claim_context(dry_run=True),
+            patch.object(
+                app,
+                "get_manager_profile",
+                return_value={
+                    "id": self.manager_id,
+                    "name": "Manager",
+                    "active": True,
+                    "intranet": True,
+                    "competencies": [],
+                },
+            ),
+            patch.object(app, "bitrix_call") as bitrix_call,
+        ):
+            result = app.preview_claim(
+                self.deal_id,
+                self.manager_id,
+                selection_token=self.token(),
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["_httpStatus"], 409)
+        bitrix_call.assert_not_called()
+
+    def test_inactive_boolean_and_string_users_are_denied(self):
+        for active in (False, "N", "0"):
+            with self.subTest(active=active):
+                profile = app.manager_profile_from_user(
+                    {"ID": "42", "ACTIVE": active, "UF_DEPARTMENT": [1]}, "42"
+                )
+                self.assertFalse(profile["active"])
+
+    def test_extranet_user_is_not_an_internal_employee(self):
+        profile = app.manager_profile_from_user(
+            {"ID": "42", "ACTIVE": True, "UF_DEPARTMENT": []}, "42"
+        )
+        self.assertTrue(profile["active"])
+        self.assertFalse(profile["intranet"])
+
+    def test_cleared_live_skills_never_restore_stale_local_skills_in_production(self):
+        local_manager = {
+            "id": "42",
+            "name": "Old local manager",
+            "active": True,
+            "competencies": ["Турция"],
+        }
+        with (
+            patch.object(app, "load_managers", return_value=[local_manager]),
+            patch.object(app, "is_unverified_dev_mode", return_value=False),
+        ):
+            profile = app.manager_profile_from_user(
+                {
+                    "ID": "42",
+                    "ACTIVE": True,
+                    "UF_DEPARTMENT": [1],
+                    "UF_SKILLS": [],
+                },
+                "42",
+            )
+
+        self.assertEqual(profile["competencies"], [])
+        self.assertEqual(profile["source"], "empty")
+
+    def test_inactive_or_extranet_configured_admin_is_denied(self):
+        for raw in (
+            {"ACTIVE": False, "UF_DEPARTMENT": [1]},
+            {"ACTIVE": True, "UF_DEPARTMENT": []},
+        ):
+            with self.subTest(raw=raw), patch.object(
+                app,
+                "verify_bitrix_user",
+                return_value={"id": "1", "name": "Admin", "raw": raw},
+            ):
+                self.assertIsNone(app.require_admin({"auth": {"AUTH_ID": "token"}}))
+
+    def test_missing_explicit_rule_denies_even_with_valid_selection(self):
+        with (
+            self.common_claim_context(dry_run=True),
+            patch.object(app, "REQUIRE_EXPLICIT_ACCESS_RULE", True),
+            patch.object(app, "bitrix_call") as bitrix_call,
+        ):
+            result = app.preview_claim(
+                self.deal_id, self.manager_id, selection_token=self.token()
+            )
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["_httpStatus"], 403)
+        bitrix_call.assert_not_called()
+
+    def test_revoked_rule_and_exhausted_limit_deny_a_previously_issued_token(self):
+        for rule in (
+            {"enabled": False, "daily_limit": None},
+            {"enabled": True, "daily_limit": 0},
+        ):
+            with self.subTest(rule=rule):
+                self.store.set_rule(
+                    self.manager_id,
+                    enabled=rule["enabled"],
+                    daily_limit=rule["daily_limit"],
+                )
+                with (
+                    self.common_claim_context(dry_run=True),
+                    patch.object(app, "REQUIRE_EXPLICIT_ACCESS_RULE", True),
+                    patch.object(app, "is_limit_bypassed_now", return_value=False),
+                    patch.object(app, "bitrix_call") as bitrix_call,
+                ):
+                    result = app.preview_claim(
+                        self.deal_id, self.manager_id, selection_token=self.token()
+                    )
+                self.assertFalse(result["ok"])
+                self.assertEqual(result["_httpStatus"], 403)
+                bitrix_call.assert_not_called()
+
+    def test_succeeded_replay_survives_new_quota_without_second_update(self):
+        self.store.set_rule(self.manager_id, enabled=True, daily_limit=None)
+        side_effect = self.claim_side_effect(
+            [self.source_deal(), self.source_deal(), self.claimed_deal(), self.claimed_deal()]
+        )
+        with (
+            self.common_claim_context(),
+            patch.object(app, "REQUIRE_EXPLICIT_ACCESS_RULE", True),
+            patch.object(app, "bitrix_call", side_effect=side_effect) as bitrix_call,
+        ):
+            first = app.preview_claim(
+                self.deal_id, self.manager_id, selection_token=self.token()
+            )
+            self.store.set_rule(self.manager_id, enabled=True, daily_limit=0)
+            replay = app.preview_claim(
+                self.deal_id, self.manager_id, selection_token=self.token()
+            )
+        self.assertTrue(first["ok"])
+        self.assertTrue(replay["ok"])
+        self.assertTrue(replay["idempotentReplay"])
+        self.assertEqual(
+            [item.args[0] for item in bitrix_call.call_args_list].count("crm.deal.update"),
+            1,
+        )
+
+
+class TestAdminRuleSerialization(unittest.TestCase):
+    def test_admin_rule_update_waits_for_claim_and_reject_critical_section(self):
+        shared_lock = threading.Lock()
+        saved = threading.Event()
+        results = []
+
+        def save_rule(*args, **kwargs):
+            saved.set()
+            return {
+                "enabled": kwargs["enabled"],
+                "dailyLimit": kwargs.get("daily_limit"),
+                "note": kwargs.get("note") or "",
+            }
+
+        with (
+            patch.object(app, "DATA_LOCK", shared_lock),
+            patch.object(app, "require_admin", return_value={"id": "1"}),
+            patch.object(app, "set_manager_rule", side_effect=save_rule),
+        ):
+            shared_lock.acquire()
+            worker = threading.Thread(
+                target=lambda: results.append(
+                    app.update_admin_rule({"managerId": "42", "enabled": False})
+                )
+            )
+            worker.start()
+            self.assertFalse(saved.wait(0.05))
+            shared_lock.release()
+            worker.join(timeout=1)
+
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(saved.is_set())
+        self.assertTrue(results[0]["ok"])
+        self.assertFalse(results[0]["rule"]["enabled"])
+
+
+class TestBitrixSourceCompleteness(TemporaryStateTestCase):
+    def _header(self):
+        return {
+            "ID": "100",
+            "TITLE": "Oldest deal",
+            "STAGE_ID": next(iter(app.SOURCE_STAGES)),
+            "DATE_CREATE": "2026-01-01T00:00:00+06:00",
+            "DATE_MODIFY": "version-1",
+        }
+
+    def _manager(self):
+        return {
+            "id": "42",
+            "name": "Manager",
+            "active": True,
+            "intranet": True,
+            "competencies": ["Турция"],
+        }
+
+    def test_confirmed_empty_mandatory_sources_are_a_valid_empty_request(self):
+        with patch.object(app, "bitrix_list_all", side_effect=[[], []]) as bitrix_list_all:
+            result = app.get_deal_messages("100")
+
+        self.assertEqual(result["useful"], [])
+        self.assertEqual(result["rawCount"], 0)
+        self.assertEqual(result["openlineSessionIds"], [])
+        self.assertEqual(
+            [item.args[0] for item in bitrix_list_all.call_args_list],
+            ["crm.timeline.comment.list", "crm.activity.list"],
+        )
+
+    def test_mandatory_source_failure_is_not_misclassified_as_empty(self):
+        def list_side_effect(method, *args, **kwargs):
+            if method == "crm.timeline.comment.list":
+                raise RuntimeError("private upstream detail")
+            if method == "crm.activity.list":
+                return []
+            self.fail(f"unexpected Bitrix method: {method}")
+
+        with patch.object(app, "bitrix_list_all", side_effect=list_side_effect):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "Не удалось полностью прочитать историю сделки из Bitrix",
+            ) as raised:
+                app.get_deal_messages("100")
+
+        self.assertNotIn("private upstream detail", str(raised.exception))
+
+    def test_openline_history_failure_propagates_and_is_not_cached_as_empty(self):
+        with patch.object(
+            app,
+            "bitrix_call",
+            side_effect=RuntimeError("history unavailable"),
+        ) as bitrix_call:
+            for _ in range(2):
+                with self.assertRaisesRegex(RuntimeError, "history unavailable"):
+                    app.get_openline_history_messages("session-100")
+
+        self.assertEqual(bitrix_call.call_count, 2)
+
+    def test_openline_history_prefers_newest_useful_messages(self):
+        history = {
+            "message": {
+                "1": {
+                    "senderid": "123",
+                    "date": "2026-08-17T09:00:00+06:00",
+                    "text": "Сначала хотели Турцию и Анталью",
+                },
+                "2": {
+                    "senderid": "123",
+                    "date": "2026-08-17T10:00:00+06:00",
+                    "text": "Теперь нужен Египет, Шарм и Хургада",
+                },
+            }
+        }
+        with patch.object(app, "bitrix_call", return_value=history):
+            messages = app.get_openline_history_messages("session-100")
+
+        self.assertIn("Египет", messages[0])
+        self.assertEqual(app.classify(messages)["direction"], "Египет")
+
+    def test_newest_openline_is_not_suppressed_by_two_old_timeline_comments(self):
+        def list_side_effect(method, *args, **kwargs):
+            if method == "crm.timeline.comment.list":
+                return [
+                    {
+                        "COMMENT": "Раньше хотели Турцию",
+                        "CREATED": "2026-08-17T08:00:00+06:00",
+                    },
+                    {
+                        "COMMENT": "Смотрели отели Антальи",
+                        "CREATED": "2026-08-17T08:01:00+06:00",
+                    },
+                ]
+            if method == "crm.activity.list":
+                return [
+                    {
+                        "ID": "100",
+                        "PROVIDER_ID": "IMOPENLINES_SESSION",
+                        "ASSOCIATED_ENTITY_ID": "session-100",
+                        "DESCRIPTION": "",
+                        "CREATED": "2026-08-17T08:02:00+06:00",
+                    }
+                ]
+            self.fail(f"unexpected Bitrix list method: {method}")
+
+        history = {
+            "message": {
+                "1": {
+                    "senderid": "123",
+                    "date": "2026-08-17T10:00:00+06:00",
+                    "text": "Передумали: теперь нужен Египет",
+                }
+            }
+        }
+        with (
+            patch.object(app, "bitrix_list_all", side_effect=list_side_effect),
+            patch.object(app, "bitrix_call", return_value=history) as bitrix_call,
+        ):
+            result = app.get_deal_messages("100")
+
+        self.assertIn("Египет", result["useful"][0])
+        self.assertEqual(app.classify(result["useful"])["direction"], "Египет")
+        self.assertEqual(len(result["useful"]), 1)
+        bitrix_call.assert_called_once()
+
+    def test_newest_openline_message_supersedes_older_same_session_destination(self):
+        def list_side_effect(method, *args, **kwargs):
+            if method == "crm.timeline.comment.list":
+                return []
+            if method == "crm.activity.list":
+                return [
+                    {
+                        "ID": "100",
+                        "PROVIDER_ID": "IMOPENLINES_SESSION",
+                        "ASSOCIATED_ENTITY_ID": "session-100",
+                        "DESCRIPTION": "",
+                        "CREATED": "2026-08-17T10:00:00+06:00",
+                    }
+                ]
+            self.fail(f"unexpected Bitrix list method: {method}")
+
+        history = {
+            "message": {
+                "1": {
+                    "senderid": "123",
+                    "date": "2026-08-17T10:00:00+06:00",
+                    "text": "Раньше хотели Турцию и Анталью",
+                },
+                "2": {
+                    "senderid": "123",
+                    "date": "2026-08-17T10:00:00+06:00",
+                    "text": "Теперь нужен Египет",
+                },
+            }
+        }
+        with (
+            patch.object(app, "bitrix_list_all", side_effect=list_side_effect),
+            patch.object(app, "bitrix_call", return_value=history),
+        ):
+            result = app.get_deal_messages("100")
+
+        self.assertEqual(result["useful"], ["Теперь нужен Египет"])
+        self.assertEqual(app.classify(result["useful"])["direction"], "Египет")
+
+    def test_equal_time_openline_sessions_choose_highest_activity_id(self):
+        def list_side_effect(method, *args, **kwargs):
+            if method == "crm.timeline.comment.list":
+                return []
+            if method == "crm.activity.list":
+                return [
+                    {
+                        "ID": "100",
+                        "PROVIDER_ID": "IMOPENLINES_SESSION",
+                        "ASSOCIATED_ENTITY_ID": "old-session",
+                        "DESCRIPTION": "",
+                        "CREATED": "2026-08-17T10:00:00+06:00",
+                    },
+                    {
+                        "ID": "101",
+                        "PROVIDER_ID": "IMOPENLINES_SESSION",
+                        "ASSOCIATED_ENTITY_ID": "new-session",
+                        "DESCRIPTION": "",
+                        "CREATED": "2026-08-17T10:00:00+06:00",
+                    },
+                ]
+            self.fail(f"unexpected Bitrix list method: {method}")
+
+        def history_side_effect(method, params=None, **kwargs):
+            self.assertEqual(method, "imopenlines.session.history.get")
+            self.assertEqual(params["SESSION_ID"], "new-session")
+            return {
+                "message": {
+                    "1": {
+                        "senderid": "123",
+                        "date": "2026-08-17T10:01:00+06:00",
+                        "text": "Теперь нужен Египет",
+                    }
+                }
+            }
+
+        with (
+            patch.object(app, "bitrix_list_all", side_effect=list_side_effect),
+            patch.object(app, "bitrix_call", side_effect=history_side_effect) as history_call,
+        ):
+            result = app.get_deal_messages("100")
+
+        self.assertEqual(result["openlineSessionIds"], ["new-session"])
+        self.assertEqual(result["useful"], ["Теперь нужен Египет"])
+        history_call.assert_called_once()
+
+    def test_openline_history_over_safe_record_bound_fails_closed(self):
+        history = {
+            "message": {
+                str(index): {
+                    "senderid": "123",
+                    "date": "2026-08-17T10:00:00+06:00",
+                    "text": "Хотим Египет",
+                }
+                for index in range(1, 4)
+            }
+        }
+        with (
+            patch.object(app, "MAX_OPENLINE_MESSAGES_PER_SESSION", 2),
+            patch.object(app, "bitrix_call", return_value=history),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "безопасный лимит"):
+                app.get_openline_history_messages("session-100")
+
+    def test_openline_deadline_is_checked_after_history_response(self):
+        with (
+            patch.object(app, "bitrix_call", return_value={"message": {}}),
+            patch.object(app.time, "monotonic", side_effect=[0.0, 1.1]),
+        ):
+            with self.assertRaisesRegex(TimeoutError, "таймаут истории"):
+                app.get_openline_history_messages("session-100", timeout=1.0)
+
+    def test_second_source_page_is_read_before_empty_is_confirmed(self):
+        service_page = [
+            {
+                "COMMENT": "Создана новая сделка",
+                "CREATED": f"2026-08-17T09:{index % 60:02d}:00+06:00",
+            }
+            for index in range(50)
+        ]
+
+        def full_side_effect(method, params=None, timeout=None):
+            start = int((params or {}).get("start", 0))
+            if method == "crm.timeline.comment.list" and start == 0:
+                return {"result": service_page, "next": 50}
+            if method == "crm.timeline.comment.list" and start == 50:
+                return {
+                    "result": [
+                        {
+                            "COMMENT": "Клиент хочет Египет и Шарм",
+                            "CREATED": "2026-08-16T09:00:00+06:00",
+                        }
+                    ]
+                }
+            if method == "crm.activity.list":
+                return {"result": []}
+            self.fail(f"unexpected page request: {method} start={start}")
+
+        with patch.object(app, "bitrix_call_full", side_effect=full_side_effect) as full_call:
+            result = app.get_deal_messages("100")
+
+        self.assertEqual(result["rawCount"], 51)
+        self.assertEqual(app.classify(result["useful"])["direction"], "Египет")
+        self.assertEqual(
+            [
+                item.kwargs.get("timeout") is not None
+                for item in full_call.call_args_list
+            ],
+            [True, True, True],
+        )
+
+    def test_second_source_page_failure_is_not_treated_as_complete(self):
+        def full_side_effect(method, params=None, timeout=None):
+            start = int((params or {}).get("start", 0))
+            if method == "crm.timeline.comment.list" and start == 0:
+                return {
+                    "result": [
+                        {"COMMENT": "Создана новая сделка", "CREATED": "2026-08-17T09:00:00+06:00"}
+                    ],
+                    "next": 50,
+                }
+            if method == "crm.timeline.comment.list" and start == 50:
+                raise TimeoutError("second page unavailable")
+            if method == "crm.activity.list":
+                return {"result": []}
+            self.fail(f"unexpected page request: {method} start={start}")
+
+        with patch.object(app, "bitrix_call_full", side_effect=full_side_effect):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "Не удалось полностью прочитать историю сделки из Bitrix",
+            ):
+                app.get_deal_messages("100")
+
+    def test_new_activity_in_same_openline_session_refetches_and_reclassifies(self):
+        history_texts = iter(
+            [
+                "Хотим подобрать семейный тур в Турцию",
+                "Передумали, теперь хотим Египет и хороший семейный отель",
+            ]
+        )
+
+        def list_side_effect(method, *args, **kwargs):
+            if method == "crm.timeline.comment.list":
+                return []
+            if method == "crm.activity.list":
+                return [
+                    {
+                        "ID": "100",
+                        "PROVIDER_ID": "IMOPENLINES_SESSION",
+                        "ASSOCIATED_ENTITY_ID": "session-100",
+                        "DESCRIPTION": "",
+                        "CREATED": "2026-08-17T09:00:00+06:00",
+                    }
+                ]
+            self.fail(f"unexpected Bitrix list method: {method}")
+
+        def bitrix_side_effect(method, *args, **kwargs):
+            if method == "imopenlines.session.history.get":
+                return {
+                    "message": {
+                        "1": {
+                            "senderid": "123",
+                            "date": "2026-08-17T09:00:00+06:00",
+                            "text": next(history_texts),
+                        }
+                    }
+                }
+            self.fail(f"unexpected Bitrix method: {method}")
+
+        base_deal = {
+            "ID": "100",
+            "TITLE": "Deal",
+            "STAGE_ID": next(iter(app.SOURCE_STAGES)),
+            "DATE_CREATE": "2026-08-17T08:00:00+06:00",
+            "DATE_MODIFY": "2026-08-17T08:30:00+06:00",
+            "LAST_ACTIVITY_TIME": "2026-08-17T09:00:00+06:00",
+        }
+        with (
+            patch.object(app, "bitrix_list_all", side_effect=list_side_effect),
+            patch.object(app, "bitrix_call", side_effect=bitrix_side_effect) as bitrix_call,
+        ):
+            first = app.analyze_deal_header(base_deal)
+            second = app.analyze_deal_header(
+                {**base_deal, "LAST_ACTIVITY_TIME": "2026-08-17T09:01:00+06:00"}
+            )
+
+        self.assertEqual(first["classification"]["direction"], "Турция")
+        self.assertEqual(second["classification"]["direction"], "Египет")
+        self.assertEqual(
+            [item.args[0] for item in bitrix_call.call_args_list].count(
+                "imopenlines.session.history.get"
+            ),
+            2,
+        )
+
+    def test_required_openline_history_failure_propagates_from_deal_analysis(self):
+        def list_side_effect(method, *args, **kwargs):
+            if method == "crm.timeline.comment.list":
+                return []
+            if method == "crm.activity.list":
+                return [
+                    {
+                        "ID": "100",
+                        "PROVIDER_ID": "IMOPENLINES_SESSION",
+                        "ASSOCIATED_ENTITY_ID": "session-100",
+                        "DESCRIPTION": "",
+                        "CREATED": "2026-01-01T00:00:00+06:00",
+                    }
+                ]
+            self.fail(f"unexpected Bitrix list method: {method}")
+
+        def bitrix_side_effect(method, *args, **kwargs):
+            if method == "imopenlines.session.history.get":
+                raise RuntimeError("history unavailable")
+            self.fail(f"unexpected Bitrix method: {method}")
+
+        with (
+            patch.object(app, "bitrix_list_all", side_effect=list_side_effect),
+            patch.object(app, "bitrix_call", side_effect=bitrix_side_effect),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "history unavailable"):
+                app.get_deal_messages("100")
+
+    def test_real_search_path_returns_generic_503_without_selection_on_source_failure(self):
+        def list_side_effect(method, *args, **kwargs):
+            if method == "crm.timeline.comment.list":
+                raise RuntimeError("private upstream detail")
+            if method == "crm.activity.list":
+                return []
+            self.fail(f"unexpected Bitrix method: {method}")
+
+        with (
+            patch.object(app, "get_manager_profile", return_value=self._manager()),
+            patch.object(app, "check_manager_access", return_value={"ok": True, "rule": {}}),
+            patch.object(app, "list_allowed_deal_headers", return_value=[self._header()]),
+            patch.object(app, "bitrix_list_all", side_effect=list_side_effect),
+            patch.object(app, "issue_selection_token") as issue_selection_token,
+        ):
+            result = app._get_next_deal_for_manager("42")
+
+        self.assertEqual(result["_httpStatus"], 503)
+        self.assertIsNone(result["deal"])
+        self.assertIsNone(result["continuationToken"])
+        self.assertNotIn("selectionToken", result)
+        self.assertNotIn("private upstream detail", result["reason"])
+        issue_selection_token.assert_not_called()
+
+
+class TestSearchContinuation(TemporaryStateTestCase):
+    def _deal(self, header, direction):
+        return {
+            "id": header["ID"],
+            "title": f"Deal {header['ID']}",
+            "stageId": header["STAGE_ID"],
+            "version": header["DATE_MODIFY"],
+            "messages": [direction],
+            "classification": {"direction": direction, "confidence": "high"},
+        }
+
+    def test_only_server_signed_cursor_can_advance_oldest_first_search(self):
+        headers = [
+            {"ID": "1", "STAGE_ID": next(iter(app.SOURCE_STAGES)), "DATE_MODIFY": "v1"},
+            {"ID": "2", "STAGE_ID": next(iter(app.SOURCE_STAGES)), "DATE_MODIFY": "v2"},
+        ]
+
+        def analyze(batch):
+            header = batch[0]
+            direction = "Египет" if header["ID"] == "1" else "Турция"
+            return {header["ID"]: self._deal(header, direction)}, {}
+
+        manager = {
+            "id": "42",
+            "name": "Manager",
+            "active": True,
+            "intranet": True,
+            "competencies": ["Турция"],
+        }
+        with (
+            patch.object(app, "NEXT_DEAL_SCAN_LIMIT", 1),
+            patch.object(app, "get_manager_profile", return_value=dict(manager)),
+            patch.object(app, "check_manager_access", return_value={"ok": True, "rule": {}}),
+            patch.object(app, "list_allowed_deal_headers", return_value=headers),
+            patch.object(app, "analyze_deal_headers", side_effect=analyze),
+        ):
+            first = app._get_next_deal_for_manager("42")
+            second = app._get_next_deal_for_manager("42", first["continuationToken"])
+            forged_skip = app._get_next_deal_for_manager("42", ["1"])
+
+        self.assertIsNone(first["deal"])
+        self.assertTrue(first["hasMore"])
+        self.assertNotIn("scannedDealIds", first)
+        self.assertEqual(second["deal"]["id"], "2")
+        self.assertIsNone(second["continuationToken"])
+        self.assertFalse(second["hasMore"])
+        self.assertEqual(forged_skip["_httpStatus"], 409)
+
+    def test_cursor_is_bound_to_manager_and_snapshot(self):
+        snapshot = "a" * 64
+        token = app.issue_search_cursor("42", 12, snapshot, now=1_000)
+        self.assertEqual(app.decode_search_cursor(token, "42", snapshot, now=1_000), 12)
+        self.assertIsNone(app.decode_search_cursor(token, "43", snapshot, now=1_000))
+        self.assertIsNone(app.decode_search_cursor(token, "42", "b" * 64, now=1_000))
+
+    def test_new_timeline_activity_invalidates_existing_search_cursor(self):
+        manager = {
+            "active": True,
+            "intranet": True,
+            "competencies": ["Турция"],
+        }
+        before = [{
+            "ID": "1",
+            "DATE_MODIFY": "2026-08-17T09:00:00+06:00",
+            "LAST_ACTIVITY_TIME": "2026-08-17T09:01:00+06:00",
+        }]
+        after = [{**before[0], "LAST_ACTIVITY_TIME": "2026-08-17T09:02:00+06:00"}]
+        before_snapshot = app.search_snapshot(before, manager, {})
+        after_snapshot = app.search_snapshot(after, manager, {})
+        token = app.issue_search_cursor("42", 1, before_snapshot, now=1_000)
+
+        self.assertNotEqual(before_snapshot, after_snapshot)
+        self.assertIsNone(
+            app.decode_search_cursor(token, "42", after_snapshot, now=1_000)
+        )
+
+    def test_cursor_from_previous_routing_policy_is_rejected_after_deploy(self):
+        snapshot = "a" * 64
+        token = app.issue_search_cursor("42", 1, snapshot, now=1_000)
+
+        with patch.object(app, "ROUTING_POLICY_VERSION", "next-routing-policy"):
+            self.assertIsNone(
+                app.decode_search_cursor(token, "42", snapshot, now=1_000)
+            )
+
+    def test_timeout_on_older_deal_never_skips_to_a_later_match(self):
+        headers = [
+            {"ID": "1", "STAGE_ID": next(iter(app.SOURCE_STAGES)), "DATE_MODIFY": "v1"},
+            {"ID": "2", "STAGE_ID": next(iter(app.SOURCE_STAGES)), "DATE_MODIFY": "v2"},
+        ]
+        manager = {
+            "id": "42",
+            "name": "Manager",
+            "active": True,
+            "intranet": True,
+            "competencies": ["Турция"],
+        }
+        with (
+            patch.object(app, "get_manager_profile", return_value=manager),
+            patch.object(app, "check_manager_access", return_value={"ok": True, "rule": {}}),
+            patch.object(app, "list_allowed_deal_headers", return_value=headers),
+            patch.object(
+                app,
+                "analyze_deal_headers",
+                return_value=({"2": self._deal(headers[1], "Турция")}, {"1": "timeout"}),
+            ),
+        ):
+            result = app._get_next_deal_for_manager("42")
+
+        self.assertIsNone(result["deal"])
+        self.assertEqual(result["_httpStatus"], 503)
+        self.assertIsNone(result["continuationToken"])
+
+    def test_unresolved_deal_lifecycle_is_hidden_from_every_other_manager(self):
+        headers = [
+            {"ID": "1", "STAGE_ID": next(iter(app.SOURCE_STAGES)), "DATE_MODIFY": "v2"},
+            {"ID": "2", "STAGE_ID": next(iter(app.SOURCE_STAGES)), "DATE_MODIFY": "v1"},
+        ]
+        old_key = app.claim_operation_key("1", "v1")
+        self.store.begin_claim_operation(
+            "1", "1001", operation_key=old_key, request={"dealVersion": "v1"}
+        )
+        self.store.fail_claim_operation(
+            old_key,
+            "remote state unknown",
+            result={"remoteUpdateUncertain": True},
+        )
+        manager = {
+            "id": "42",
+            "name": "Manager",
+            "active": True,
+            "intranet": True,
+            "competencies": ["Турция"],
+        }
+
+        def analyze(batch):
+            self.assertEqual([item["ID"] for item in batch], ["2"])
+            return {"2": self._deal(headers[1], "Турция")}, {}
+
+        with (
+            patch.object(app, "get_manager_profile", return_value=manager),
+            patch.object(app, "check_manager_access", return_value={"ok": True, "rule": {}}),
+            patch.object(app, "list_allowed_deal_headers", return_value=headers),
+            patch.object(app, "analyze_deal_headers", side_effect=analyze),
+        ):
+            result = app._get_next_deal_for_manager("42")
+
+        self.assertEqual(result["deal"]["id"], "2")
+
+    def test_profile_policy_change_invalidates_cursor_instead_of_skipping_oldest(self):
+        headers = [
+            {"ID": "1", "STAGE_ID": next(iter(app.SOURCE_STAGES)), "DATE_MODIFY": "v1"},
+            {"ID": "2", "STAGE_ID": next(iter(app.SOURCE_STAGES)), "DATE_MODIFY": "v2"},
+        ]
+        profiles = [
+            {
+                "id": "42",
+                "name": "Manager",
+                "active": True,
+                "intranet": True,
+                "competencies": ["Египет"],
+            },
+            {
+                "id": "42",
+                "name": "Manager",
+                "active": True,
+                "intranet": True,
+                "competencies": ["Турция"],
+            },
+        ]
+
+        def analyze(batch):
+            header = batch[0]
+            return {header["ID"]: self._deal(header, "Турция")}, {}
+
+        with (
+            patch.object(app, "NEXT_DEAL_SCAN_LIMIT", 1),
+            patch.object(app, "get_manager_profile", side_effect=profiles),
+            patch.object(app, "check_manager_access", return_value={"ok": True, "rule": {}}),
+            patch.object(app, "list_allowed_deal_headers", return_value=headers),
+            patch.object(app, "analyze_deal_headers", side_effect=analyze),
+        ):
+            first = app._get_next_deal_for_manager("42")
+            after_profile_change = app._get_next_deal_for_manager(
+                "42", first["continuationToken"]
+            )
+
+        self.assertIsNone(first["deal"])
+        self.assertEqual(after_profile_change["_httpStatus"], 409)
+        self.assertIsNone(after_profile_change["deal"])
+
+
+class TestSemanticRejectionLifecycle(TemporaryStateTestCase):
+    def _profile(self):
+        return {
+            "id": "42",
+            "name": "Manager",
+            "active": True,
+            "intranet": True,
+            "competencies": ["Турция"],
+        }
+
+    def _deal(self, version="version-1"):
+        return {
+            "ID": "100",
+            "STAGE_ID": next(iter(app.SOURCE_STAGES)),
+            "DATE_MODIFY": version,
+        }
+
+    def test_new_token_cannot_duplicate_same_manager_deal_lifecycle_rejection(self):
+        first_token = app.issue_selection_token(
+            "100", "42", "version-1", test_manager_policy(), now=1_000
+        )
+        second_token = app.issue_selection_token(
+            "100", "42", "version-1", test_manager_policy(), now=1_001
+        )
+        with (
+            patch.object(app.time, "time", return_value=1_001),
+            patch.object(app, "bitrix_call", return_value=self._deal()) as bitrix_call,
+            patch.object(app, "get_manager_profile", return_value=self._profile()),
+        ):
+            first = app.record_rejection(
+                "42", {"dealId": "100", "reason": "other", "selectionToken": first_token}
+            )
+            second = app.record_rejection(
+                "42", {"dealId": "100", "reason": "duplicate", "selectionToken": second_token}
+            )
+        self.assertTrue(first["ok"])
+        self.assertTrue(second["idempotentReplay"])
+        self.assertEqual(len(self.store.list_rejections()), 1)
+        bitrix_call.assert_called_once()
+
+    def test_rejected_selection_cannot_later_be_claimed(self):
+        token = app.issue_selection_token(
+            "100", "42", "version-1", test_manager_policy(), now=1_000
+        )
+        with (
+            patch.object(app.time, "time", return_value=1_000),
+            patch.object(app, "bitrix_call", return_value=self._deal()) as bitrix_call,
+            patch.object(app, "get_manager_profile", return_value=self._profile()),
+        ):
+            rejected = app.record_rejection(
+                "42", {"dealId": "100", "reason": "other", "selectionToken": token}
+            )
+            claimed = app.preview_claim("100", "42", selection_token=token)
+        self.assertTrue(rejected["ok"])
+        self.assertFalse(claimed["ok"])
+        self.assertEqual(claimed["_httpStatus"], 409)
+        bitrix_call.assert_called_once()
+
+    def test_other_unresolved_lifecycle_blocks_rejection_without_bitrix_read(self):
+        old_key = app.claim_operation_key("100", "older-version")
+        self.store.begin_claim_operation(
+            "100", "1001", operation_key=old_key, request={"dealVersion": "older-version"}
+        )
+        self.store.fail_claim_operation(
+            old_key,
+            "remote state unknown",
+            result={"remoteUpdateUncertain": True},
+        )
+        token = app.issue_selection_token(
+            "100", "42", "version-1", test_manager_policy(), now=1_000
+        )
+
+        with (
+            patch.object(app.time, "time", return_value=1_000),
+            patch.object(app, "bitrix_call") as bitrix_call,
+        ):
+            result = app.record_rejection(
+                "42",
+                {"dealId": "100", "reason": "other", "selectionToken": token},
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(self.store.list_rejections(), [])
+        bitrix_call.assert_not_called()
+
+    def test_rejection_committed_while_claim_waits_for_lock_wins_atomically(self):
+        token = app.issue_selection_token(
+            "100", "42", "version-1", test_manager_policy()
+        )
+        semantic_key = app.rejection_semantic_key("42", "100", "version-1")
+        store = self.store
+
+        class RejectBeforeClaimLock:
+            def __enter__(self):
+                store.append_reject(
+                    {
+                        "timestamp": app.local_now().isoformat(),
+                        "managerId": "42",
+                        "dealId": "100",
+                        "reason": "other",
+                        "semanticKey": semantic_key,
+                    }
+                )
+
+            def __exit__(self, *_args):
+                return False
+
+        with (
+            patch.object(app, "DATA_LOCK", RejectBeforeClaimLock()),
+            patch.object(app, "bitrix_call") as bitrix_call,
+        ):
+            claimed = app.preview_claim("100", "42", selection_token=token)
+
+        self.assertFalse(claimed["ok"])
+        self.assertEqual(claimed["_httpStatus"], 409)
+        self.assertEqual(len(self.store.list_rejections()), 1)
+        self.assertEqual(self.store.list_claims(), [])
+        bitrix_call.assert_not_called()
+
+
+class TestClaimReconciliation(ClaimWorkflowTestCase):
+    def test_uncertain_remote_update_blocks_new_claims_before_audit_recovery(self):
+        self.store.set_manager_rule(self.manager_id, enabled=True, daily_limit=1, note="")
+        self.begin_operation()
+        self.store.fail_claim_operation(
+            self.operation_key(),
+            "verification timeout",
+            result={"remoteUpdateUncertain": True},
+        )
+
+        access = app.check_manager_access(self.manager_id)
+
+        self.assertFalse(access["ok"])
+        self.assertTrue(access["recoveryPending"])
+        self.assertEqual(self.store.count_claims(self.manager_id), 0)
+
+
+    def test_stale_pending_with_exact_marker_recovers_after_deal_progressed(self):
+        self.begin_operation()
+        self.backdate_operation()
+        progressed = self.claimed_deal()
+        progressed["STAGE_ID"] = "WON"
+        with patch.object(app, "bitrix_call", return_value=progressed):
+            summary = app.reconcile_stale_claim_operations()
+        self.assertEqual(summary["recovered"], 1)
+        self.assertEqual(self.store.count_claims(self.manager_id), 1)
+
+    def test_maintenance_recovery_after_midnight_keeps_original_reservation_date(self):
+        reservation_time = "2026-08-16T23:59:00+06:00"
+        reconciliation_time = datetime(2026, 8, 17, 0, 1, tzinfo=app.LOCAL_TZ)
+        self.begin_operation()
+        self.set_operation_timestamps(reservation_time)
+
+        with (
+            patch.object(app, "local_now", return_value=reconciliation_time),
+            patch.object(app, "bitrix_call", return_value=self.claimed_deal()),
+        ):
+            summary = app.reconcile_stale_claim_operations()
+
+        self.assertEqual(summary["recovered"], 1)
+        self.assertEqual(
+            self.store.count_claims(self.manager_id, "2026-08-16", "2026-08-16"),
+            1,
+        )
+        self.assertEqual(
+            self.store.count_claims(self.manager_id, "2026-08-17", "2026-08-17"),
+            0,
+        )
+
+    def test_retried_attempt_recovery_uses_latest_attempt_start_date(self):
+        first_started_at = "2026-08-16T23:50:00+06:00"
+        second_started_at = datetime(2026, 8, 17, 0, 5, tzinfo=app.LOCAL_TZ)
+        recovered_at = datetime(2026, 8, 18, 9, 0, tzinfo=app.LOCAL_TZ)
+        self.store.begin_claim_operation(
+            self.deal_id,
+            self.manager_id,
+            operation_key=self.operation_key(),
+            request={
+                "claimMarker": self.attempt_marker(),
+                "dealVersion": self.version,
+                "attemptStartedAt": first_started_at,
+            },
+        )
+        self.store.fail_claim_operation(
+            self.operation_key(),
+            "first attempt safely failed",
+            result={"remoteUpdated": False},
+        )
+        second_marker = app.claim_attempt_marker(
+            self.operation_key(), self.manager_id, nonce="second-attempt"
+        )
+
+        def lose_second_verification(method, params=None, timeout=None):
+            if method == "crm.deal.get":
+                lose_second_verification.reads += 1
+                if lose_second_verification.reads <= 2:
+                    return self.source_deal()
+                raise TimeoutError("second attempt verification lost")
+            if method == "crm.deal.update":
+                return True
+            raise AssertionError(method)
+
+        lose_second_verification.reads = 0
+        with (
+            self.common_claim_context(),
+            patch.object(app, "local_now", return_value=second_started_at),
+            patch.object(app.secrets, "token_hex", return_value="second-attempt"),
+            patch.object(app, "bitrix_call", side_effect=lose_second_verification),
+        ):
+            failed = app.preview_claim(
+                self.deal_id,
+                self.manager_id,
+                selection_token=self.token(),
+            )
+
+        self.assertFalse(failed["ok"])
+        operation = self.store.get_claim_operation(self.operation_key())
+        self.assertEqual(operation["status"], "failed")
+        self.assertEqual(
+            operation["request"]["attemptStartedAt"],
+            second_started_at.isoformat(),
+        )
+        claimed = self.claimed_deal()
+        claimed[app.BITRIX_CLAIM_MARKER_FIELD] = second_marker
+        with (
+            patch.object(app, "local_now", return_value=recovered_at),
+            patch.object(app, "bitrix_call", return_value=claimed),
+        ):
+            summary = app.reconcile_stale_claim_operations()
+
+        self.assertEqual(summary["recovered"], 1)
+        self.assertEqual(
+            self.store.count_claims(self.manager_id, "2026-08-16", "2026-08-16"),
+            0,
+        )
+        self.assertEqual(
+            self.store.count_claims(self.manager_id, "2026-08-17", "2026-08-17"),
+            1,
+        )
+        self.assertEqual(
+            self.store.count_claims(self.manager_id, "2026-08-18", "2026-08-18"),
+            0,
+        )
+        finalized = self.store.get_claim_operation(self.operation_key())
+        self.assertEqual(
+            finalized["request"]["attemptStartedAt"],
+            second_started_at.isoformat(),
+        )
+
+    def test_reassigned_attempt_recovery_uses_new_managers_attempt_date(self):
+        old_manager = "1001"
+        first_started_at = "2026-08-16T23:50:00+06:00"
+        reassigned_started_at = datetime(2026, 8, 17, 0, 5, tzinfo=app.LOCAL_TZ)
+        self.store.begin_claim_operation(
+            self.deal_id,
+            old_manager,
+            operation_key=self.operation_key(),
+            request={
+                "claimMarker": self.attempt_marker(old_manager),
+                "dealVersion": self.version,
+                "attemptStartedAt": first_started_at,
+            },
+        )
+        self.store.fail_claim_operation(
+            self.operation_key(),
+            "old manager attempt safely failed",
+            result={"remoteUpdated": False},
+        )
+        reassigned_marker = app.claim_attempt_marker(
+            self.operation_key(), self.manager_id, nonce="reassigned-attempt"
+        )
+
+        def lose_reassigned_verification(method, params=None, timeout=None):
+            if method == "crm.deal.get":
+                lose_reassigned_verification.reads += 1
+                if lose_reassigned_verification.reads <= 2:
+                    return self.source_deal(manager=old_manager)
+                raise TimeoutError("reassigned attempt verification lost")
+            if method == "crm.deal.update":
+                return True
+            raise AssertionError(method)
+
+        lose_reassigned_verification.reads = 0
+        with (
+            self.common_claim_context(),
+            patch.object(app, "local_now", return_value=reassigned_started_at),
+            patch.object(app.secrets, "token_hex", return_value="reassigned-attempt"),
+            patch.object(app, "bitrix_call", side_effect=lose_reassigned_verification),
+        ):
+            failed = app.preview_claim(
+                self.deal_id,
+                self.manager_id,
+                selection_token=self.token(),
+            )
+
+        self.assertFalse(failed["ok"])
+        operation = self.store.get_claim_operation(self.operation_key())
+        self.assertEqual(operation["managerId"], self.manager_id)
+        self.assertEqual(
+            operation["request"]["attemptStartedAt"],
+            reassigned_started_at.isoformat(),
+        )
+        claimed = self.claimed_deal()
+        claimed[app.BITRIX_CLAIM_MARKER_FIELD] = reassigned_marker
+        with patch.object(app, "bitrix_call", return_value=claimed):
+            summary = app.reconcile_stale_claim_operations()
+
+        self.assertEqual(summary["recovered"], 1)
+        self.assertEqual(self.store.count_claims(old_manager), 0)
+        self.assertEqual(
+            self.store.count_claims(self.manager_id, "2026-08-17", "2026-08-17"),
+            1,
+        )
+
+    def test_failed_uncertain_update_is_recovered_without_browser_retry(self):
+        self.begin_operation()
+        self.store.fail_claim_operation(
+            self.operation_key(),
+            "update_verification_failed",
+            result={"remoteUpdateUncertain": True},
+        )
+        with patch.object(app, "bitrix_call", return_value=self.claimed_deal()):
+            summary = app.reconcile_stale_claim_operations()
+        self.assertEqual(summary["recovered"], 1)
+        self.assertEqual(self.store.count_claims(self.manager_id), 1)
+
+    def test_failed_uncertain_unchanged_source_is_released_for_safe_retry(self):
+        self.begin_operation()
+        self.store.fail_claim_operation(
+            self.operation_key(),
+            "update verification timeout",
+            result={"remoteUpdateUncertain": True},
+        )
+        with patch.object(app, "bitrix_call", return_value=self.source_deal()):
+            summary = app.reconcile_stale_claim_operations()
+
+        self.assertEqual(summary["released"], 1)
+        self.assertEqual(
+            self.store.list_unresolved_claim_operations(self.manager_id),
+            [],
+        )
+        self.assertTrue(app.check_manager_access(self.manager_id)["ok"])
+
+        new_marker = app.claim_attempt_marker(
+            self.operation_key(), self.manager_id, nonce="new-attempt"
+        )
+        claimed = self.claimed_deal()
+        claimed[app.BITRIX_CLAIM_MARKER_FIELD] = new_marker
+        side_effect = self.claim_side_effect(
+            [self.source_deal(), self.source_deal(), claimed]
+        )
+        with (
+            self.common_claim_context(),
+            patch.object(app.secrets, "token_hex", return_value="new-attempt"),
+            patch.object(app, "bitrix_call", side_effect=side_effect),
+        ):
+            result = app.preview_claim(
+                self.deal_id,
+                self.manager_id,
+                selection_token=self.token(),
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(self.store.count_claims(self.manager_id), 1)
+
+    def test_matching_stage_and_manager_without_marker_is_not_attributed_to_app(self):
+        self.begin_operation()
+        self.backdate_operation()
+        live = self.claimed_deal()
+        live.pop(app.BITRIX_CLAIM_MARKER_FIELD)
+        with patch.object(app, "bitrix_call", return_value=live):
+            summary = app.reconcile_stale_claim_operations()
+        self.assertEqual(summary["recovered"], 0)
+        self.assertEqual(self.store.count_claims(self.manager_id), 0)
+        self.assertEqual(
+            len(self.store.list_unresolved_claim_operations(self.manager_id)),
+            1,
+        )
+        access = app.check_manager_access(self.manager_id)
+        self.assertFalse(access["ok"])
+        self.assertTrue(access["recoveryPending"])
+
+
+class TestGreetingLifecycle(TemporaryStateTestCase):
+    def test_new_claim_lifecycle_never_reuses_an_old_managers_greeting(self):
+        self.store.append_greeting(
+            {
+                "timestamp": "2026-08-17T09:00:00+06:00",
+                "managerId": "1001",
+                "dealId": "100",
+                "operationKey": "claim:old-lifecycle",
+                "direction": "Египет",
+                "text": "Здравствуйте! Старый текст менеджера.",
+                "status": "manual",
+            }
+        )
+        context = {
+            "classification": {
+                "direction": "Турция",
+                "confidence": "средняя",
+                "matched": ["Турция"],
+            },
+            "messages": ["Хочу в Турцию"],
+            "openlineSessionIds": [],
+        }
+        with (
+            patch.object(
+                app,
+                "get_manager_profile",
+                return_value={
+                    "id": "2002",
+                    "name": "Новый Менеджер",
+                    "active": True,
+                    "intranet": True,
+                    "competencies": ["Турция"],
+                },
+            ),
+            patch.object(app, "greeting_context_from_deal", return_value=context) as context_call,
+        ):
+            first = app.prepare_greeting(
+                "2002",
+                "100",
+                operation_key="claim:new-lifecycle",
+            )
+            repeated = app.prepare_greeting(
+                "2002",
+                "100",
+                operation_key="claim:new-lifecycle",
+            )
+
+        self.assertIn("Новый", first["text"])
+        self.assertNotIn("Старый текст", first["text"])
+        self.assertEqual(repeated["status"], "skipped_duplicate")
+        self.assertEqual(len(self.store.list_greetings()), 2)
+        self.assertEqual(
+            self.store.latest_greeting_by_operation("claim:new-lifecycle")["managerId"],
+            "2002",
+        )
+        context_call.assert_called_once_with("100")
+
+
+class TestSafeConfigurationAndMinimization(TemporaryStateTestCase):
+    def test_unknown_dry_run_boolean_keeps_safe_default_and_marks_readiness_error(self):
+        original = set(app.INVALID_ENV_VALUES)
+        try:
+            app.INVALID_ENV_VALUES.clear()
+            with patch.dict(os.environ, {"DRY_RUN": "treu"}):
+                self.assertTrue(app.env_bool("DRY_RUN", True))
+            self.assertIn("DRY_RUN", app.INVALID_ENV_VALUES)
+        finally:
+            app.INVALID_ENV_VALUES.clear()
+            app.INVALID_ENV_VALUES.update(original)
+
+    def test_invalid_numeric_env_keeps_safe_default_and_is_reported(self):
+        with (
+            patch.object(app, "INVALID_ENV_VALUES", set()),
+            patch.dict(os.environ, {"APP_TZ_OFFSET_HOURS": "not-a-number"}),
+        ):
+            self.assertEqual(app.env_int("APP_TZ_OFFSET_HOURS", 6, -12, 14), 6)
+            self.assertIn("APP_TZ_OFFSET_HOURS", app.INVALID_ENV_VALUES)
+
+    def test_admin_ids_are_not_embedded_in_public_html(self):
+        with patch.object(app, "ADMIN_USER_IDS", {"987654321"}):
+            rendered = app.render_index_html(nonce="nonce")
+        self.assertNotIn("987654321", rendered)
+
+    def test_greeting_auto_send_and_untrusted_cors_fail_readiness_without_reflection(self):
+        secretish_origin = "https://user:secret@evil.example/path?token=hidden"
+        with patch.multiple(
+            app,
+            APP_DIR=self.data_dir,
+            MANAGERS_FILE=self.data_dir / "managers.json",
+            PUBLIC_APP_URL="https://picker.example.test",
+            RAW_APP_ALLOWED_ORIGINS={secretish_origin},
+            APP_ALLOWED_ORIGINS={"https://evil.example"},
+            RAW_BITRIX_ALLOWED_DOMAINS={"test-fake.bitrix24.test"},
+            ALLOWED_BITRIX_DOMAINS={"test-fake.bitrix24.test"},
+            ADMIN_USER_IDS={"1"},
+            CLAIM_STATS_SOURCE="app_events",
+            REQUIRE_LEGACY_MIGRATION=False,
+            GREETING_AUTO_SEND=True,
+            STATE_STORE=self.store,
+        ):
+            result = app.readiness_state(force=True)
+        rendered = json.dumps(result, ensure_ascii=False)
+        self.assertFalse(result["ok"])
+        self.assertNotIn("secret", rendered)
+        self.assertNotIn("hidden", rendered)
+
+    def test_write_mode_requires_valid_claim_marker_field(self):
+        with patch.multiple(
+            app,
+            APP_DIR=self.data_dir,
+            MANAGERS_FILE=self.data_dir / "managers.json",
+            PUBLIC_APP_URL="https://picker.example.test",
+            RAW_APP_ALLOWED_ORIGINS={"https://picker.example.test"},
+            APP_ALLOWED_ORIGINS={"https://picker.example.test"},
+            RAW_BITRIX_ALLOWED_DOMAINS={"test-fake.bitrix24.test"},
+            ALLOWED_BITRIX_DOMAINS={"test-fake.bitrix24.test"},
+            ADMIN_USER_IDS={"1"},
+            CLAIM_STATS_SOURCE="app_events",
+            REQUIRE_LEGACY_MIGRATION=False,
+            DRY_RUN=False,
+            BITRIX_CLAIM_MARKER_FIELD="UF_CRM_REPLACE_WITH_FIELD",
+            STATE_STORE=self.store,
+        ):
+            result = app.readiness_state(force=True)
+        self.assertFalse(result["ok"])
+        self.assertTrue(any("BITRIX_CLAIM_MARKER_FIELD" in item for item in result["errors"]))
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

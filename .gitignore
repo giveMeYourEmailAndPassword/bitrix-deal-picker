@@ -9,16 +9,33 @@ env/
 
 # Секреты — никогда в репозиторий
 .env
-.env.bitrix
-.env.vibecode
+.env.*
 !.env.example
 
-# Файлы состояния (runtime-логи) — живут в Volume, не в репозитории.
-# managers.json хранится в репозитории как статический список компетенций.
+# Runtime state lives on the Railway Volume, never in Git.
+*.sqlite3
+*.sqlite3-journal
+*.sqlite3-shm
+*.sqlite3-wal
+*.sqlite
+*.sqlite-journal
+*.sqlite-shm
+*.sqlite-wal
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
 access_rules.json
 claim_log.json
 reject_log.json
 greeting_log.json
+
+# Local state backups and scratch work.
+*.bak
+*.backup
+*.tar
+*.tar.gz
+work/
 
 # OS
 .DS_Store
