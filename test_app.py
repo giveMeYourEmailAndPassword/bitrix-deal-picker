@@ -11,10 +11,12 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from contextlib import ExitStack, contextmanager
 from datetime import datetime
@@ -205,6 +207,82 @@ class TestStrictIdentityAndAuthorization(unittest.TestCase):
         self.assertIsNone(app.verify_bitrix_user(auth))
         self.assertEqual(oauth_call.call_count, 2)  # user.current, then profile
         webhook_call.assert_not_called()
+
+
+class TestVerifiedUserCache(unittest.TestCase):
+    def setUp(self):
+        app.USER_VERIFY_CACHE.clear()
+
+    def tearDown(self):
+        app.USER_VERIFY_CACHE.clear()
+
+    def test_verified_token_is_reused_without_a_second_oauth_call(self):
+        auth = {"AUTH_ID": "token-a", "DOMAIN": "test-fake.bitrix24.test"}
+        upstream_user = {
+            "ID": "42",
+            "NAME": "Verified",
+            "ACTIVE": True,
+            "UF_DEPARTMENT": [1],
+        }
+        with (
+            patch.object(app, "USER_VERIFY_CACHE_TTL_SECONDS", 300),
+            patch.object(app.time, "monotonic", side_effect=[100.0, 101.0]),
+            patch.object(app, "bitrix_oauth_call", return_value=upstream_user) as oauth_call,
+        ):
+            first = app.verify_bitrix_user(auth, allow_cached=False)
+            second = app.verify_bitrix_user(auth, allow_cached=True)
+
+        self.assertEqual(first["id"], "42")
+        self.assertEqual(second["id"], "42")
+        oauth_call.assert_called_once()
+
+    def test_cache_is_bound_to_the_exact_oauth_token(self):
+        auth_a = {"AUTH_ID": "token-a", "DOMAIN": "test-fake.bitrix24.test"}
+        auth_b = {"AUTH_ID": "token-b", "DOMAIN": "test-fake.bitrix24.test"}
+        with patch.object(app.time, "monotonic", return_value=100.0):
+            with patch.object(
+                app,
+                "bitrix_oauth_call",
+                return_value={"ID": "42", "NAME": "Verified"},
+            ):
+                self.assertEqual(
+                    app.verify_bitrix_user(auth_a, allow_cached=False)["id"],
+                    "42",
+                )
+            with patch.object(
+                app,
+                "bitrix_oauth_call",
+                side_effect=RuntimeError("upstream unavailable"),
+            ) as oauth_call:
+                self.assertIsNone(app.verify_bitrix_user(auth_b, allow_cached=True))
+
+        self.assertEqual(oauth_call.call_count, 2)
+
+    def test_expired_cache_fails_closed_when_oauth_is_unavailable(self):
+        auth = {"AUTH_ID": "token-a", "DOMAIN": "test-fake.bitrix24.test"}
+        with (
+            patch.object(app, "USER_VERIFY_CACHE_TTL_SECONDS", 300),
+            patch.object(app.time, "monotonic", return_value=100.0),
+            patch.object(
+                app,
+                "bitrix_oauth_call",
+                return_value={"ID": "42", "NAME": "Verified"},
+            ),
+        ):
+            self.assertEqual(app.verify_bitrix_user(auth, allow_cached=False)["id"], "42")
+
+        with (
+            patch.object(app, "USER_VERIFY_CACHE_TTL_SECONDS", 300),
+            patch.object(app.time, "monotonic", return_value=401.0),
+            patch.object(
+                app,
+                "bitrix_oauth_call",
+                side_effect=RuntimeError("upstream unavailable"),
+            ) as oauth_call,
+        ):
+            self.assertIsNone(app.verify_bitrix_user(auth, allow_cached=True))
+
+        self.assertEqual(oauth_call.call_count, 2)
 
 
 class TestOAuthDomainAllowlist(unittest.TestCase):
@@ -914,6 +992,45 @@ class TestReadiness(TemporaryStateTestCase):
 
 
 class TestHttpBoundary(unittest.TestCase):
+    def test_manager_action_cache_policy_keeps_search_fresh(self):
+        cases = (
+            ("/api/next-deal", False, "get_next_deal_for_manager", {"deal": None}),
+            ("/api/claim", True, "preview_claim", {"ok": True}),
+            ("/api/reject", True, "record_rejection", {"ok": True}),
+        )
+        for path, allow_cached, operation_name, operation_result in cases:
+            with self.subTest(path=path):
+                payload = {
+                    "auth": {
+                        "AUTH_ID": "verified-token",
+                        "DOMAIN": "test-fake.bitrix24.test",
+                    },
+                    "managerId": "999",
+                    "dealId": "100",
+                    "selectionToken": "signed-selection",
+                }
+                handler = HandlerHarness.make("POST", path, payload)
+                with (
+                    patch.object(app, "rate_limit_allowed", return_value=True),
+                    patch.object(app, "readiness_state", return_value={"ok": True}),
+                    patch.object(app, "actor_id_from_payload", return_value="42") as actor,
+                    patch.object(app, operation_name, return_value=dict(operation_result)),
+                ):
+                    handler.do_POST()
+
+                self.assertEqual(HandlerHarness.status(handler), 200)
+                actor.assert_called_once_with(payload, allow_cached=allow_cached)
+
+    def test_admin_and_current_user_checks_remain_fresh(self):
+        auth = {"AUTH_ID": "verified-token", "DOMAIN": "test-fake.bitrix24.test"}
+        with patch.object(app, "verify_bitrix_user", return_value=None) as verify:
+            app.current_user_state({"auth": auth})
+            verify.assert_called_once_with(auth, allow_cached=False)
+
+        with patch.object(app, "verify_bitrix_user", return_value=None) as verify:
+            app.require_admin({"auth": auth})
+            verify.assert_called_once_with(auth, allow_cached=False)
+
     def test_access_log_does_not_persist_full_client_ip(self):
         handler = HandlerHarness.make("GET", "/api/health")
         handler.client_address = ("203.0.113.42", 12345)
@@ -1557,14 +1674,20 @@ class TestClaimWorkflow(ClaimWorkflowTestCase):
         self.assertEqual(self.store.count_claims(self.manager_id), 0)
         self.assertTrue(callable(original_finalize))
 
-    def test_remote_success_then_greeting_failure_keeps_claim_successful(self):
+    def test_success_does_not_wait_for_disabled_greeting_preparation(self):
         token = self.token()
         side_effect = self.claim_side_effect(
             [self.source_deal(), self.source_deal(), self.claimed_deal()]
         )
         with (
             self.common_claim_context(greeting=False),
-            patch.object(app, "prepare_greeting", side_effect=RuntimeError("chat unavailable")),
+            patch.object(app, "GREETING_AUTO_SEND", False),
+            patch.object(app, "GREETING_AUTO_SEND_SUPPORTED", False),
+            patch.object(
+                app,
+                "prepare_greeting",
+                side_effect=RuntimeError("slow chat history must not run"),
+            ) as prepare_greeting,
             patch.object(app, "bitrix_call", side_effect=side_effect),
         ):
             result = app.preview_claim(self.deal_id, self.manager_id, selection_token=token)
@@ -1572,7 +1695,8 @@ class TestClaimWorkflow(ClaimWorkflowTestCase):
         self.assertTrue(result["ok"])
         self.assertTrue(result["auditRecorded"])
         self.assertNotIn("greeting", result)
-        self.assertTrue(any("приветствие" in warning for warning in result["warnings"]))
+        self.assertNotIn("warnings", result)
+        prepare_greeting.assert_not_called()
         self.assertEqual(self.store.count_claims(self.manager_id), 1)
 
     def test_unconfirmed_remote_update_is_failed_and_marked_uncertain(self):
@@ -2324,6 +2448,29 @@ class TestAdminRuleSerialization(unittest.TestCase):
 
 
 class TestBitrixSourceCompleteness(TemporaryStateTestCase):
+    def test_private_greeting_session_is_version_bound_and_never_in_browser_deal(self):
+        deal = {
+            "ID": "100",
+            "TITLE": "Deal",
+            "STAGE_ID": next(iter(app.SOURCE_STAGES)),
+            "DATE_MODIFY": "v1",
+        }
+        message_data = {
+            "useful": ["Хочу в Турцию"],
+            "rawCount": 1,
+            "sources": ["openline_session:321"],
+            "openlineSessionIds": ["321"],
+        }
+        with patch.object(app, "get_deal_messages", return_value=message_data):
+            public_deal = app.analyze_deal_header(deal)
+
+        self.assertNotIn("openlineSessionIds", public_deal)
+        self.assertNotIn("greetingContext", public_deal)
+        private = app.cached_greeting_context("100", "v1")
+        self.assertEqual(private["openlineSessionIds"], ["321"])
+        self.assertEqual(private["classification"]["direction"], "Турция")
+        self.assertIsNone(app.cached_greeting_context("100", "v2"))
+
     def _header(self):
         return {
             "ID": "100",
@@ -3313,6 +3460,123 @@ class TestClaimReconciliation(ClaimWorkflowTestCase):
 
 
 class TestGreetingLifecycle(TemporaryStateTestCase):
+    @staticmethod
+    def official_history(*, session_id="321", chat_id="1763", deal_id="100"):
+        return {
+            "sessionId": int(session_id),
+            "chatId": int(chat_id),
+            "chat": {
+                str(chat_id): {
+                    "id": str(chat_id),
+                    "entityType": "LINES",
+                    "entityData2": f"LEAD|0|COMPANY|0|CONTACT|42|DEAL|{deal_id}",
+                    "textFieldEnabled": True,
+                    "messageType": "L",
+                }
+            },
+        }
+
+    def test_openline_history_uses_official_nested_chat_shape(self):
+        with patch.object(app, "bitrix_call", return_value=self.official_history()):
+            context = app.get_openline_chat_context("321")
+
+        self.assertEqual(context["sessionId"], "321")
+        self.assertEqual(context["chatId"], "1763")
+        self.assertEqual(context["entityType"], "LINES")
+        self.assertTrue(context["textFieldEnabled"])
+
+    def test_actor_path_accepts_the_previous_flat_chat_shape(self):
+        old_portal_history = {
+            "chatId": 1763,
+            "chat": {"id": 1763, "name": "OpenLine chat"},
+        }
+        with patch.object(app, "bitrix_call", return_value=old_portal_history):
+            context = app.actor_greeting_chat_context("100", "321")
+
+        self.assertEqual(context["sessionId"], "321")
+        self.assertEqual(context["chatId"], "1763")
+        self.assertIsNone(context["textFieldEnabled"])
+
+    def test_actor_path_allows_unbound_deal_zero_metadata(self):
+        history = self.official_history()
+        history["chat"]["1763"]["entityData2"] = "LEAD|0|DEAL|0"
+        with patch.object(app, "bitrix_call", return_value=history):
+            context = app.actor_greeting_chat_context("100", "321")
+
+        self.assertEqual(context["chatId"], "1763")
+
+    def test_entity_binding_requires_one_exact_deal_pair(self):
+        self.assertTrue(
+            app.openline_chat_is_bound_to_deal(
+                "LEAD|0|COMPANY|0|CONTACT|42|DEAL|100",
+                "100",
+            )
+        )
+        self.assertFalse(app.openline_chat_is_bound_to_deal("DEAL|1000", "100"))
+        self.assertFalse(app.openline_chat_is_bound_to_deal("DEAL|100|DEAL|100", "100"))
+        self.assertFalse(app.openline_chat_is_bound_to_deal("prefixDEAL|100", "100"))
+
+    def test_auto_greeting_uses_only_exact_crm_bound_message_method(self):
+        history = self.official_history()
+
+        def fake_bitrix(method, params=None, timeout=None):
+            if method == "imopenlines.session.history.get":
+                return history
+            if method == "imopenlines.crm.chat.get":
+                return [{"CHAT_ID": "1763", "CONNECTOR_ID": "instagram"}]
+            if method == "imopenlines.crm.chat.getLastId":
+                return 1763
+            if method == "imopenlines.crm.chat.user.add":
+                return 1763
+            if method == "imopenlines.crm.message.add":
+                return 85851
+            raise AssertionError(f"unsafe or unexpected method: {method}")
+
+        with patch.object(app, "bitrix_call", side_effect=fake_bitrix) as bitrix_call:
+            result = app.send_greeting_message(
+                "100",
+                "2002",
+                "Здравствуйте!",
+                {"openlineSessionIds": ["321"]},
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["messageId"], "85851")
+        methods = [item.args[0] for item in bitrix_call.call_args_list]
+        self.assertNotIn("im.message.add", methods)
+        self.assertNotIn("imopenlines.operator.answer", methods)
+        self.assertIn(
+            call(
+                "imopenlines.crm.message.add",
+                {
+                    "CRM_ENTITY_TYPE": "deal",
+                    "CRM_ENTITY": "100",
+                    "USER_ID": "2002",
+                    "CHAT_ID": "1763",
+                    "MESSAGE": "Здравствуйте!",
+                },
+            ),
+            bitrix_call.call_args_list,
+        )
+
+    def test_auto_greeting_never_sends_when_history_points_to_another_deal(self):
+        with patch.object(
+            app,
+            "bitrix_call",
+            return_value=self.official_history(deal_id="999"),
+        ) as bitrix_call:
+            with self.assertRaisesRegex(RuntimeError, "chat_entity_mismatch"):
+                app.resolve_greeting_target(
+                    "100",
+                    "2002",
+                    {"openlineSessionIds": ["321"]},
+                )
+
+        self.assertEqual(
+            [item.args[0] for item in bitrix_call.call_args_list],
+            ["imopenlines.session.history.get"],
+        )
+
     def test_new_claim_lifecycle_never_reuses_an_old_managers_greeting(self):
         self.store.append_greeting(
             {
@@ -3368,6 +3632,564 @@ class TestGreetingLifecycle(TemporaryStateTestCase):
             "2002",
         )
         context_call.assert_called_once_with("100")
+
+
+class TestGreetingOutboxWorker(ClaimWorkflowTestCase):
+    """The claim response stays fast while delivery remains durable and safe."""
+
+    def greeting_context(self, *, deal_id=None):
+        return {
+            "classification": {
+                "direction": "Турция",
+                "confidence": "средняя",
+                "matched": ["Турция"],
+            },
+            "messages": ["Хочу в Турцию"],
+            "openlineSessionIds": ["321"],
+        }
+
+    def official_history(self, *, deal_id=None):
+        deal_id = str(deal_id or self.deal_id)
+        return {
+            "sessionId": 321,
+            "chatId": 1763,
+            "chat": {
+                "1763": {
+                    "id": "1763",
+                    "entityType": "LINES",
+                    "entityData2": f"LEAD|0|COMPANY|0|CONTACT|42|DEAL|{deal_id}",
+                    "textFieldEnabled": True,
+                    "messageType": "L",
+                }
+            },
+        }
+
+    def seed_greeting_outbox(self):
+        marker = self.attempt_marker()
+        self.store.begin_claim_operation(
+            self.deal_id,
+            self.manager_id,
+            operation_key=self.operation_key(),
+            request={
+                "claimMarker": marker,
+                "dealVersion": self.version,
+                "greetingRequested": True,
+                "greetingContext": {
+                    "sessionId": "321",
+                    "direction": "Турция",
+                },
+            },
+        )
+        finalized = self.store.finalize_claim_operation(
+            self.operation_key(),
+            claim=app.claim_log_entry(self.manager_id, self.claimed_deal()),
+            result={"ok": True, "auditRecorded": True, "dealId": self.deal_id},
+            expected_claim_marker=marker,
+        )
+        self.assertTrue(finalized["greetingQueued"])
+        return self.store.get_greeting_outbox(self.operation_key())
+
+    def active_manager(self):
+        return {
+            "id": self.manager_id,
+            "name": "Manager",
+            "active": True,
+            "intranet": True,
+            "competencies": ["Турция"],
+        }
+
+    def actor_auth(self):
+        return {
+            "access_token": "actor-oauth-secret-must-stay-in-memory",
+            "domain": "test-fake.bitrix24.test",
+        }
+
+    def test_attach_returns_without_waiting_for_actor_network_and_never_persists_token(self):
+        self.seed_greeting_outbox()
+        with patch.object(
+            app,
+            "bitrix_oauth_call",
+            return_value={"ID": self.manager_id, "NAME": "Manager"},
+        ):
+            self.assertEqual(
+                app.verify_bitrix_user(self.actor_auth(), allow_cached=False)["id"],
+                self.manager_id,
+            )
+        started = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+
+        def blocked_delivery(job, worker_token, auth, manager):
+            started.set()
+            release.wait(timeout=2)
+            finished.set()
+
+        original = {"ok": True, "auditRecorded": True, "dealId": self.deal_id}
+        try:
+            with (
+                patch.multiple(
+                    app,
+                    GREETING_AUTO_SEND=True,
+                    GREETING_AUTO_SEND_SUPPORTED=True,
+                ),
+                patch.object(
+                    app,
+                    "process_actor_greeting_outbox_job",
+                    side_effect=blocked_delivery,
+                ),
+            ):
+                before = time.monotonic()
+                response = app.attach_greeting_to_claim(
+                    original,
+                    self.manager_id,
+                    self.deal_id,
+                    self.actor_auth(),
+                    self.operation_key(),
+                    self.active_manager(),
+                )
+                elapsed = time.monotonic() - before
+
+            self.assertTrue(started.wait(timeout=1))
+            self.assertLess(elapsed, 0.5)
+            self.assertEqual(response["greeting"]["status"], "queued")
+            self.assertEqual(
+                self.store.get_greeting_outbox(self.operation_key())["status"],
+                "checking",
+            )
+            with self.store._connect() as connection:
+                database_dump = "\n".join(connection.iterdump())
+            self.assertNotIn("actor-oauth-secret-must-stay-in-memory", database_dump)
+        finally:
+            release.set()
+            finished.wait(timeout=2)
+
+    def test_actor_sender_uses_proven_methods_and_sends_only_once(self):
+        self.seed_greeting_outbox()
+        worker_token = "actor-worker"
+        job = self.store.lease_exact_greeting_outbox(
+            self.operation_key(),
+            worker_token,
+        )
+
+        def fake_bitrix(method, params=None, timeout=None):
+            if method == "crm.deal.get":
+                return self.claimed_deal()
+            if method == "imopenlines.session.history.get":
+                return self.official_history()
+            raise AssertionError(f"unexpected webhook method: {method}")
+
+        def fake_actor_call(auth, method, params=None):
+            self.assertEqual(auth, self.actor_auth())
+            if method == "imopenlines.operator.answer":
+                raise RuntimeError("Bitrix API error: ALREADY_RESPONSIBLE")
+            if method == "im.message.add":
+                return 85851
+            raise AssertionError(f"unexpected actor method: {method}")
+
+        with (
+            patch.object(app, "bitrix_call", side_effect=fake_bitrix),
+            patch.object(
+                app,
+                "bitrix_call_for_actor",
+                side_effect=fake_actor_call,
+            ) as actor_call,
+        ):
+            result = app.process_actor_greeting_outbox_job(
+                job,
+                worker_token,
+                self.actor_auth(),
+                self.active_manager(),
+            )
+            fallback = self.store.lease_greeting_outbox("fallback-worker")
+
+        self.assertEqual(result["status"], "sent")
+        self.assertEqual(result["messageId"], "85851")
+        self.assertEqual(fallback, [])
+        self.assertEqual(
+            actor_call.call_args_list,
+            [
+                call(
+                    self.actor_auth(),
+                    "imopenlines.operator.answer",
+                    {"CHAT_ID": "1763"},
+                ),
+                call(
+                    self.actor_auth(),
+                    "im.message.add",
+                    {
+                        "DIALOG_ID": "chat1763",
+                        "MESSAGE": (
+                            "Здравствуйте! Меня зовут Manager. "
+                            "Я эксперт по направлению Турция. "
+                            "Сейчас посмотрю варианты и посчитаю для вас стоимость тура."
+                        ),
+                    },
+                ),
+            ],
+        )
+
+    def test_actor_sender_rejects_an_explicit_foreign_deal_binding_without_send(self):
+        self.seed_greeting_outbox()
+        worker_token = "actor-worker"
+        job = self.store.lease_exact_greeting_outbox(
+            self.operation_key(),
+            worker_token,
+        )
+
+        def fake_bitrix(method, params=None, timeout=None):
+            if method == "crm.deal.get":
+                return self.claimed_deal()
+            if method == "imopenlines.session.history.get":
+                return self.official_history(deal_id="999")
+            raise AssertionError(f"unexpected webhook method: {method}")
+
+        with (
+            patch.object(app, "bitrix_call", side_effect=fake_bitrix),
+            patch.object(app, "bitrix_call_for_actor") as actor_call,
+        ):
+            result = app.process_actor_greeting_outbox_job(
+                job,
+                worker_token,
+                self.actor_auth(),
+                self.active_manager(),
+            )
+
+        self.assertEqual(result["status"], "manual")
+        self.assertEqual(result["errorCode"], "chat_entity_mismatch")
+        actor_call.assert_not_called()
+        self.assertEqual(
+            self.store.get_greeting_outbox(self.operation_key())["status"],
+            "manual",
+        )
+
+    def test_actor_history_timeout_stays_pending_for_bounded_pre_send_retry(self):
+        self.seed_greeting_outbox()
+        worker_token = "actor-worker"
+        job = self.store.lease_exact_greeting_outbox(
+            self.operation_key(),
+            worker_token,
+        )
+
+        def fake_bitrix(method, params=None, timeout=None):
+            if method == "crm.deal.get":
+                return self.claimed_deal()
+            if method == "imopenlines.session.history.get":
+                raise TimeoutError("history timed out")
+            raise AssertionError(f"unexpected webhook method: {method}")
+
+        with (
+            patch.object(app, "bitrix_call", side_effect=fake_bitrix),
+            patch.object(app, "bitrix_call_for_actor") as actor_call,
+        ):
+            result = app.process_actor_greeting_outbox_job(
+                job,
+                worker_token,
+                self.actor_auth(),
+                self.active_manager(),
+            )
+
+        self.assertEqual(result["status"], "pending")
+        self.assertEqual(result["errorCode"], "actor_greeting_preflight_failed")
+        self.assertEqual(result["attemptCount"], 1)
+        self.assertIsNotNone(result["nextAttemptAt"])
+        actor_call.assert_not_called()
+
+    def test_actor_message_timeout_is_uncertain_and_never_retried(self):
+        self.seed_greeting_outbox()
+        worker_token = "actor-worker"
+        job = self.store.lease_exact_greeting_outbox(
+            self.operation_key(),
+            worker_token,
+        )
+
+        def fake_bitrix(method, params=None, timeout=None):
+            if method == "crm.deal.get":
+                return self.claimed_deal()
+            if method == "imopenlines.session.history.get":
+                return self.official_history()
+            raise AssertionError(f"unexpected webhook method: {method}")
+
+        def fake_actor_call(auth, method, params=None):
+            if method == "imopenlines.operator.answer":
+                return True
+            if method == "im.message.add":
+                raise TimeoutError("response lost after dispatch")
+            raise AssertionError(f"unexpected actor method: {method}")
+
+        with (
+            patch.object(app, "bitrix_call", side_effect=fake_bitrix),
+            patch.object(
+                app,
+                "bitrix_call_for_actor",
+                side_effect=fake_actor_call,
+            ) as actor_call,
+        ):
+            result = app.process_actor_greeting_outbox_job(
+                job,
+                worker_token,
+                self.actor_auth(),
+                self.active_manager(),
+            )
+            fallback = self.store.lease_greeting_outbox("fallback-worker")
+
+        self.assertEqual(result["status"], "uncertain")
+        self.assertEqual(result["errorCode"], "send_result_uncertain")
+        self.assertEqual(fallback, [])
+        self.assertEqual(
+            [item.args[1] for item in actor_call.call_args_list],
+            ["imopenlines.operator.answer", "im.message.add"],
+        )
+
+    def test_successful_claim_queues_greeting_without_synchronous_chat_work(self):
+        side_effect = self.claim_side_effect(
+            [self.source_deal(), self.source_deal(), self.claimed_deal()]
+        )
+        with (
+            self.common_claim_context(greeting=False),
+            patch.multiple(
+                app,
+                DRY_RUN=False,
+                GREETING_AUTO_SEND=True,
+                GREETING_AUTO_SEND_SUPPORTED=True,
+            ),
+            patch.object(
+                app,
+                "cached_greeting_context",
+                return_value=self.greeting_context(),
+            ) as cached_context,
+            patch.object(
+                app,
+                "prepare_greeting",
+                side_effect=AssertionError("claim path must not prepare greeting"),
+            ) as prepare_greeting,
+            patch.object(
+                app,
+                "resolve_greeting_target",
+                side_effect=AssertionError("claim path must not inspect chat"),
+            ) as resolve_target,
+            patch.object(
+                app,
+                "send_greeting_message",
+                side_effect=AssertionError("claim path must not send greeting"),
+            ) as send_greeting,
+            patch.object(app, "bitrix_call", side_effect=side_effect),
+        ):
+            result = app.preview_claim(
+                self.deal_id,
+                self.manager_id,
+                selection_token=self.token(),
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["auditRecorded"])
+        self.assertEqual(result["greeting"]["status"], "queued")
+        self.assertEqual(result["greeting"]["text"], "")
+        job = self.store.get_greeting_outbox(self.operation_key())
+        self.assertEqual(job["status"], "pending")
+        self.assertEqual(job["sessionId"], "321")
+        self.assertEqual(job["direction"], "Турция")
+        cached_context.assert_called_once_with(self.deal_id, self.version)
+        prepare_greeting.assert_not_called()
+        resolve_target.assert_not_called()
+        send_greeting.assert_not_called()
+
+    def test_worker_sends_once_through_exact_crm_bound_path(self):
+        self.seed_greeting_outbox()
+
+        def fake_bitrix(method, params=None, timeout=None):
+            if method == "crm.deal.get":
+                return self.claimed_deal()
+            if method == "imopenlines.session.history.get":
+                return self.official_history()
+            if method == "imopenlines.crm.chat.get":
+                return [{"CHAT_ID": "1763", "CONNECTOR_ID": "instagram"}]
+            if method == "imopenlines.crm.chat.getLastId":
+                return 1763
+            if method == "imopenlines.crm.chat.user.add":
+                return 1763
+            if method == "imopenlines.crm.message.add":
+                return 85851
+            raise AssertionError(f"unsafe or unexpected method: {method}")
+
+        with (
+            patch.multiple(
+                app,
+                DRY_RUN=False,
+                GREETING_AUTO_SEND=True,
+                GREETING_AUTO_SEND_SUPPORTED=True,
+            ),
+            patch.object(app, "get_greeting_manager_profile", return_value=self.active_manager()),
+            patch.object(app, "bitrix_call", side_effect=fake_bitrix) as bitrix_call,
+        ):
+            result = app.process_greeting_outbox_once(worker_token="worker-1", limit=1)
+
+        self.assertEqual(result, {"leased": 1, "processed": 1})
+        job = self.store.get_greeting_outbox(self.operation_key())
+        self.assertEqual(job["status"], "sent")
+        self.assertEqual(job["messageId"], "85851")
+        self.assertEqual(job["attemptCount"], 1)
+        methods = [item.args[0] for item in bitrix_call.call_args_list]
+        self.assertNotIn("im.message.add", methods)
+        self.assertNotIn("imopenlines.operator.answer", methods)
+        self.assertEqual(methods.count("imopenlines.crm.message.add"), 1)
+        self.assertIn(
+            call(
+                "imopenlines.crm.message.add",
+                {
+                    "CRM_ENTITY_TYPE": "deal",
+                    "CRM_ENTITY": self.deal_id,
+                    "USER_ID": self.manager_id,
+                    "CHAT_ID": "1763",
+                    "MESSAGE": (
+                        "Здравствуйте! Меня зовут Manager. "
+                        "Я эксперт по направлению Турция. "
+                        "Сейчас посмотрю варианты и посчитаю для вас стоимость тура."
+                    ),
+                },
+            ),
+            bitrix_call.call_args_list,
+        )
+        audit = self.store.latest_greeting_by_operation(self.operation_key())
+        self.assertEqual(audit["status"], "sent")
+        self.assertTrue(audit["autoSent"])
+
+    def test_worker_binding_mismatch_becomes_manual_without_send(self):
+        self.seed_greeting_outbox()
+
+        def fake_bitrix(method, params=None, timeout=None):
+            if method == "crm.deal.get":
+                return self.claimed_deal()
+            if method == "imopenlines.session.history.get":
+                return self.official_history(deal_id="999")
+            raise AssertionError(f"unexpected write after binding mismatch: {method}")
+
+        with (
+            patch.multiple(
+                app,
+                DRY_RUN=False,
+                GREETING_AUTO_SEND=True,
+                GREETING_AUTO_SEND_SUPPORTED=True,
+            ),
+            patch.object(app, "get_greeting_manager_profile", return_value=self.active_manager()),
+            patch.object(app, "bitrix_call", side_effect=fake_bitrix) as bitrix_call,
+            patch.object(app, "send_greeting_message") as send_greeting,
+        ):
+            result = app.process_greeting_outbox_once(worker_token="worker-1", limit=1)
+
+        self.assertEqual(result, {"leased": 1, "processed": 1})
+        job = self.store.get_greeting_outbox(self.operation_key())
+        self.assertEqual(job["status"], "manual")
+        self.assertEqual(job["errorCode"], "chat_entity_mismatch")
+        send_greeting.assert_not_called()
+        self.assertNotIn(
+            "imopenlines.crm.message.add",
+            [item.args[0] for item in bitrix_call.call_args_list],
+        )
+        audit = self.store.latest_greeting_by_operation(self.operation_key())
+        self.assertEqual(audit["status"], "manual")
+        self.assertFalse(audit["autoSent"])
+
+    def test_send_exception_is_uncertain_and_never_automatically_retried(self):
+        self.seed_greeting_outbox()
+        with (
+            patch.multiple(
+                app,
+                DRY_RUN=False,
+                GREETING_AUTO_SEND=True,
+                GREETING_AUTO_SEND_SUPPORTED=True,
+            ),
+            patch.object(app, "get_greeting_manager_profile", return_value=self.active_manager()),
+            patch.object(app, "bitrix_call", return_value=self.claimed_deal()),
+            patch.object(
+                app,
+                "resolve_greeting_target",
+                return_value={"chatId": "1763", "sessionId": "321"},
+            ),
+            patch.object(
+                app,
+                "send_greeting_message",
+                side_effect=TimeoutError("response lost after dispatch"),
+            ) as send_greeting,
+        ):
+            first = app.process_greeting_outbox_once(worker_token="worker-1", limit=1)
+            second = app.process_greeting_outbox_once(worker_token="worker-2", limit=1)
+
+        self.assertEqual(first, {"leased": 1, "processed": 1})
+        self.assertEqual(second, {"leased": 0, "processed": 0})
+        send_greeting.assert_called_once()
+        job = self.store.get_greeting_outbox(self.operation_key())
+        self.assertEqual(job["status"], "uncertain")
+        self.assertEqual(job["errorCode"], "send_result_uncertain")
+        self.assertEqual(job["attemptCount"], 1)
+        audit = self.store.latest_greeting_by_operation(
+            self.operation_key(),
+            statuses=None,
+        )
+        self.assertEqual(audit["status"], "uncertain")
+        self.assertFalse(audit["autoSent"])
+
+    def test_attach_pending_job_returns_queued_without_network(self):
+        self.seed_greeting_outbox()
+        original = {
+            "ok": True,
+            "auditRecorded": True,
+            "dealId": self.deal_id,
+        }
+        with (
+            patch.multiple(
+                app,
+                GREETING_AUTO_SEND=True,
+                GREETING_AUTO_SEND_SUPPORTED=True,
+            ),
+            patch.object(app, "GREETING_WAKE_EVENT") as wake_event,
+            patch.object(app, "prepare_greeting") as prepare_greeting,
+            patch.object(app, "resolve_greeting_target") as resolve_target,
+            patch.object(app, "send_greeting_message") as send_greeting,
+            patch.object(app, "bitrix_call") as bitrix_call,
+        ):
+            response = app.attach_greeting_to_claim(
+                original,
+                self.manager_id,
+                self.deal_id,
+                {"AUTH_ID": "must-not-be-used"},
+                self.operation_key(),
+            )
+
+        self.assertIsNot(response, original)
+        self.assertEqual(response["greeting"]["status"], "queued")
+        self.assertEqual(response["greeting"]["text"], "")
+        wake_event.set.assert_called_once_with()
+        prepare_greeting.assert_not_called()
+        resolve_target.assert_not_called()
+        send_greeting.assert_not_called()
+        bitrix_call.assert_not_called()
+
+    def test_dry_run_pauses_an_existing_greeting_outbox_without_network(self):
+        self.seed_greeting_outbox()
+        with (
+            patch.multiple(
+                app,
+                DRY_RUN=True,
+                GREETING_AUTO_SEND=True,
+                GREETING_AUTO_SEND_SUPPORTED=True,
+            ),
+            patch.object(
+                app,
+                "process_greeting_outbox_job",
+                side_effect=AssertionError("dry run must not process greeting jobs"),
+            ) as process_job,
+        ):
+            result = app.process_greeting_outbox_once(
+                worker_token="worker-dry-run",
+                limit=1,
+            )
+
+        self.assertEqual(result, {"leased": 0, "processed": 0})
+        self.assertEqual(
+            self.store.get_greeting_outbox(self.operation_key())["status"],
+            "pending",
+        )
+        process_job.assert_not_called()
 
 
 class TestSafeConfigurationAndMinimization(TemporaryStateTestCase):
@@ -3730,6 +4552,252 @@ class TestBazaExtraClaimIntegration(TemporaryStateTestCase):
         outbox = self.store.list_outbox()[0]
         self.assertIsNotNone(outbox["deliveredAt"])
         self.assertIsNone(outbox["deadLetterAt"])
+
+    def test_outage_then_old_409_reconciles_claim_before_creating_next_request(self):
+        old_request = self.store.create_extra_claim_request(
+            "42",
+            "2026-08-17",
+            "Нужна первая дополнительная заявка",
+            taken_today_snapshot=1,
+            daily_limit_snapshot=1,
+        )
+        self.store.apply_extra_claim_request_response(
+            old_request["requestKey"],
+            {"id": "remote-old", "status": "pending"},
+        )
+        for item in self.store.list_outbox(delivered=False):
+            if item["kind"] == "extra_claim_request":
+                self.store.mark_outbox_delivered(item["id"], {"ok": True})
+        self.store.import_extra_claim_state(
+            "42",
+            "2026-08-17",
+            {
+                "request": {
+                    "requestKey": old_request["requestKey"],
+                    "id": "remote-old",
+                    "status": "approved",
+                },
+                "grants": [
+                    {
+                        "id": "remote-old",
+                        "requestId": "remote-old",
+                        "status": "approved",
+                        "bitrixUserId": "42",
+                        "businessDate": "2026-08-17",
+                    }
+                ],
+            },
+        )
+        self.store.begin_claim_operation(
+            "deal-old",
+            "42",
+            operation_key="claim:old-extra",
+            require_extra_grant=True,
+            business_date="2026-08-17",
+        )
+        self.store.finalize_claim_operation(
+            "claim:old-extra",
+            claim={"timestamp": "2026-08-17T12:00:00+06:00"},
+        )
+        next_request = self.store.create_extra_claim_request(
+            "42",
+            "2026-08-17",
+            "Нужна следующая заявка после использованной",
+            taken_today_snapshot=2,
+            daily_limit_snapshot=1,
+        )
+
+        outage_calls = []
+
+        def outage(path, _payload, timeout=None):
+            outage_calls.append(path)
+            if path.endswith("claim-events"):
+                raise TimeoutError("Baza is unavailable")
+            raise app.BazaIntegrationHttpError(
+                409,
+                {
+                    "code": "active_request_exists",
+                    "request": {
+                        "requestKey": old_request["requestKey"],
+                        "id": "remote-old",
+                        "status": "approved",
+                        "bitrixUserId": "42",
+                        "businessDate": "2026-08-17",
+                    },
+                },
+            )
+
+        with (
+            patch.multiple(
+                app,
+                EXTRA_CLAIM_REQUESTS_ENABLED=True,
+                BAZA_API_BASE_URL="https://baza.example.test",
+                BAZA_HMAC_KEY_ID="picker-v1",
+                BAZA_HMAC_SECRET="s" * 32,
+            ),
+            patch.object(app, "baza_post", side_effect=outage),
+        ):
+            outage_summary = app.flush_integration_outbox(limit=10)
+
+        self.assertEqual(outage_summary["retried"], 2)
+        self.assertEqual(
+            outage_calls,
+            [
+                "/integrations/deal-picker/v1/claim-events",
+                "/integrations/deal-picker/v1/extra-claim-requests",
+            ],
+        )
+        with sqlite3.connect(self.store.db_path) as connection:
+            statuses = dict(
+                connection.execute(
+                    "SELECT request_key, status FROM extra_claim_requests"
+                ).fetchall()
+            )
+        self.assertEqual(statuses[old_request["requestKey"]], "consumed")
+        self.assertEqual(statuses[next_request["requestKey"]], "queued")
+
+        # Simulate the stale grant snapshot seen before Baza receives the
+        # durable claim event.  It must not revive the consumed local record.
+        self.store.import_extra_claim_state(
+            "42",
+            "2026-08-17",
+            {
+                "request": {
+                    "requestKey": old_request["requestKey"],
+                    "id": "remote-old",
+                    "status": "approved",
+                },
+                "grants": [
+                    {
+                        "id": "remote-old",
+                        "requestId": "remote-old",
+                        "status": "approved",
+                        "businessDate": "2026-08-17",
+                    }
+                ],
+            },
+        )
+        with sqlite3.connect(self.store.db_path) as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT status FROM extra_claim_requests "
+                    "WHERE request_key=?",
+                    (old_request["requestKey"],),
+                ).fetchone()[0],
+                "consumed",
+            )
+            connection.execute(
+                "UPDATE integration_outbox SET next_attempt_at='2000-01-01T00:00:00+00:00' "
+                "WHERE delivered_at IS NULL AND dead_letter_at IS NULL"
+            )
+
+        restored_calls = []
+        old_remote_consumed = False
+
+        def restored(path, _payload, timeout=None):
+            nonlocal old_remote_consumed
+            restored_calls.append(path)
+            if path.endswith("claim-events"):
+                old_remote_consumed = True
+                return {"ok": True, "created": True}
+            self.assertTrue(old_remote_consumed)
+            return {
+                "ok": True,
+                "request": {
+                    "requestKey": next_request["requestKey"],
+                    "id": "remote-next",
+                    "status": "pending",
+                    "bitrixUserId": "42",
+                    "businessDate": "2026-08-17",
+                },
+            }
+
+        with (
+            patch.multiple(
+                app,
+                EXTRA_CLAIM_REQUESTS_ENABLED=True,
+                BAZA_API_BASE_URL="https://baza.example.test",
+                BAZA_HMAC_KEY_ID="picker-v1",
+                BAZA_HMAC_SECRET="s" * 32,
+            ),
+            patch.object(app, "baza_post", side_effect=restored),
+        ):
+            restored_summary = app.flush_integration_outbox(limit=10)
+
+        self.assertEqual(restored_summary["sent"], 2)
+        self.assertEqual(restored_summary["retried"], 0)
+        self.assertEqual(
+            restored_calls,
+            [
+                "/integrations/deal-picker/v1/claim-events",
+                "/integrations/deal-picker/v1/extra-claim-requests",
+            ],
+        )
+        self.assertEqual(self.store.list_outbox(delivered=False), [])
+        state = self.store.get_extra_claim_state("42", "2026-08-17")
+        self.assertEqual(state["request"]["requestKey"], next_request["requestKey"])
+        self.assertEqual(state["request"]["id"], "remote-next")
+        self.assertEqual(state["request"]["status"], "pending")
+
+    def test_claim_event_integrity_409_is_dead_letter_not_false_duplicate(self):
+        claim = self.store.append_claim(
+            {
+                "timestamp": "2026-08-17T12:00:00+06:00",
+                "managerId": "42",
+                "dealId": "integrity-conflict",
+            }
+        )
+        conflict = app.BazaIntegrationHttpError(
+            409,
+            {
+                "code": "idempotency_conflict",
+                "eventUuid": claim["eventUuid"],
+            },
+        )
+        with (
+            patch.multiple(
+                app,
+                EXTRA_CLAIM_REQUESTS_ENABLED=True,
+                BAZA_API_BASE_URL="https://baza.example.test",
+                BAZA_HMAC_KEY_ID="picker-v1",
+                BAZA_HMAC_SECRET="s" * 32,
+            ),
+            patch.object(app, "baza_post", side_effect=conflict),
+        ):
+            summary = app.flush_integration_outbox(limit=1, kinds={"claim_event"})
+
+        self.assertEqual(summary["sent"], 0)
+        self.assertEqual(summary["dead"], 1)
+        outbox = self.store.list_outbox()[0]
+        self.assertIsNone(outbox["deliveredAt"])
+        self.assertIsNotNone(outbox["deadLetterAt"])
+
+    def test_hmac_replay_409_retries_exact_durable_payload(self):
+        self.store.append_claim(
+            {
+                "timestamp": "2026-08-17T12:00:00+06:00",
+                "managerId": "42",
+                "dealId": "replay",
+            }
+        )
+        replay = app.BazaIntegrationHttpError(409, {"code": "replay_detected"})
+        with (
+            patch.multiple(
+                app,
+                EXTRA_CLAIM_REQUESTS_ENABLED=True,
+                BAZA_API_BASE_URL="https://baza.example.test",
+                BAZA_HMAC_KEY_ID="picker-v1",
+                BAZA_HMAC_SECRET="s" * 32,
+            ),
+            patch.object(app, "baza_post", side_effect=replay),
+        ):
+            summary = app.flush_integration_outbox(limit=1, kinds={"claim_event"})
+
+        self.assertEqual(summary["retried"], 1)
+        outbox = self.store.list_outbox()[0]
+        self.assertIsNone(outbox["deliveredAt"])
+        self.assertIsNone(outbox["deadLetterAt"])
+        self.assertEqual(outbox["attemptCount"], 1)
 
 
 if __name__ == "__main__":
