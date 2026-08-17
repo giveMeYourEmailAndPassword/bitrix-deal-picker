@@ -13,13 +13,14 @@ import json
 import os
 import re
 import sqlite3
+import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, Mapping, Optional
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DEFAULT_DB_FILENAME = "state.sqlite3"
 MIGRATION_MARKER = "legacy_json_migration_v1"
 
@@ -47,6 +48,14 @@ class LegacyMigrationError(StateStoreError):
 
 class IdempotencyConflictError(StateStoreError):
     """Raised when an operation key is reused for another deal or manager."""
+
+
+class ExtraClaimGrantUnavailableError(StateStoreError):
+    """Raised when an over-limit operation cannot reserve a one-use grant."""
+
+
+class ExtraClaimGrantReconciliationRequiredError(StateStoreError):
+    """Raised when an uncertainty-held grant prevents safe reassignment."""
 
 
 def _json_default(value: Any) -> Any:
@@ -179,9 +188,10 @@ class StateStore:
             schema_row = connection.execute(
                 "SELECT value FROM meta WHERE key = 'schema_version'"
             ).fetchone()
-            if schema_row and schema_row["value"] != str(SCHEMA_VERSION):
+            if schema_row and schema_row["value"] not in {"1", str(SCHEMA_VERSION)}:
                 raise StateStoreError(
-                    f"unsupported state schema version {schema_row['value']}; expected {SCHEMA_VERSION}"
+                    f"unsupported state schema version {schema_row['value']}; "
+                    f"expected 1 or {SCHEMA_VERSION}"
                 )
 
             schema_sql = (
@@ -196,6 +206,7 @@ class StateStore:
 
                 CREATE TABLE IF NOT EXISTS claim_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_uuid TEXT UNIQUE,
                     timestamp TEXT NOT NULL,
                     event_date TEXT NOT NULL,
                     manager_id TEXT NOT NULL,
@@ -255,9 +266,60 @@ class StateStore:
                     error TEXT,
                     attempt_history_json TEXT NOT NULL DEFAULT '[]',
                     claim_event_id INTEGER REFERENCES claim_events(id),
+                    extra_claim_grant_id TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     finalized_at TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS extra_claim_requests (
+                    request_key TEXT PRIMARY KEY,
+                    external_id TEXT UNIQUE,
+                    manager_id TEXT NOT NULL,
+                    business_date TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK (
+                        status IN ('queued', 'pending', 'approved', 'rejected', 'consumed', 'expired')
+                    ),
+                    taken_today_snapshot INTEGER NOT NULL CHECK (taken_today_snapshot >= 0),
+                    daily_limit_snapshot INTEGER NOT NULL CHECK (daily_limit_snapshot >= 0),
+                    rejection_reason TEXT NOT NULL DEFAULT '',
+                    remote_json TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS extra_claim_grants (
+                    grant_id TEXT PRIMARY KEY,
+                    request_id TEXT NOT NULL,
+                    request_key TEXT,
+                    manager_id TEXT NOT NULL,
+                    business_date TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK (
+                        status IN ('approved', 'reserved', 'consumed', 'expired')
+                    ),
+                    reserved_operation_key TEXT UNIQUE,
+                    expires_at TEXT,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    consumed_at TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS integration_outbox (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    dedupe_key TEXT NOT NULL UNIQUE,
+                    kind TEXT NOT NULL CHECK (kind IN ('extra_claim_request', 'claim_event')),
+                    path TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+                    next_attempt_at TEXT NOT NULL,
+                    last_error TEXT NOT NULL DEFAULT '',
+                    response_json TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    delivered_at TEXT,
+                    dead_letter_at TEXT
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_claim_events_manager_date
@@ -272,6 +334,15 @@ class StateStore:
                     ON claim_operations(manager_id, status);
                 CREATE INDEX IF NOT EXISTS idx_claim_operations_status_deal
                     ON claim_operations(status, deal_id);
+                CREATE INDEX IF NOT EXISTS idx_extra_claim_requests_manager_date
+                    ON extra_claim_requests(manager_id, business_date, created_at DESC);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_extra_claim_requests_one_active
+                    ON extra_claim_requests(manager_id, business_date)
+                    WHERE status IN ('queued', 'pending', 'approved');
+                CREATE INDEX IF NOT EXISTS idx_extra_claim_grants_available
+                    ON extra_claim_grants(manager_id, business_date, status, created_at);
+                CREATE INDEX IF NOT EXISTS idx_integration_outbox_due
+                    ON integration_outbox(delivered_at, next_attempt_at, id);
                 """
             )
             for statement in schema_sql.split(";"):
@@ -285,6 +356,19 @@ class StateStore:
                     "ALTER TABLE claim_operations "
                     "ADD COLUMN attempt_history_json TEXT NOT NULL DEFAULT '[]'"
                 )
+            if "extra_claim_grant_id" not in operation_columns:
+                connection.execute(
+                    "ALTER TABLE claim_operations ADD COLUMN extra_claim_grant_id TEXT"
+                )
+            claim_columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(claim_events)")
+            }
+            if "event_uuid" not in claim_columns:
+                connection.execute("ALTER TABLE claim_events ADD COLUMN event_uuid TEXT")
+            connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_claim_events_event_uuid "
+                "ON claim_events(event_uuid) WHERE event_uuid IS NOT NULL"
+            )
             reject_columns = {
                 row["name"] for row in connection.execute("PRAGMA table_info(reject_events)")
             }
@@ -305,6 +389,13 @@ class StateStore:
                 connection.execute(
                     "ALTER TABLE greeting_events "
                     "ADD COLUMN operation_key TEXT NOT NULL DEFAULT ''"
+                )
+            outbox_columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(integration_outbox)")
+            }
+            if "dead_letter_at" not in outbox_columns:
+                connection.execute(
+                    "ALTER TABLE integration_outbox ADD COLUMN dead_letter_at TEXT"
                 )
             # Older development builds keyed the uncertain auto-send
             # reservation only by dealId, which incorrectly crossed claim
@@ -328,9 +419,66 @@ class StateStore:
                 "ON reject_events(semantic_key) WHERE semantic_key <> ''"
             )
             now = self._now_iso()
+            # Schema v2 gives every historical claim a durable cross-system
+            # identity and queues it exactly once for the Baza dashboard.  The
+            # backfill and version marker share this transaction, so a crash
+            # can neither lose nor duplicate an event.
+            historical_rows = connection.execute(
+                "SELECT * FROM claim_events WHERE event_uuid IS NULL OR event_uuid = '' ORDER BY id"
+            ).fetchall()
+            for historical_row in historical_rows:
+                event_uuid = str(uuid.uuid4())
+                historical_payload = self._payload_from_row(historical_row)
+                connection.execute(
+                    "UPDATE claim_events SET event_uuid = ? WHERE id = ?",
+                    (event_uuid, historical_row["id"]),
+                )
+                self._enqueue_claim_export_in_connection(
+                    connection,
+                    event_uuid=event_uuid,
+                    operation_key=historical_row["operation_key"] or f"legacy:{event_uuid}",
+                    deal_id=historical_row["deal_id"],
+                    manager_id=historical_row["manager_id"],
+                    occurred_at=historical_row["timestamp"],
+                    business_date=historical_row["event_date"],
+                    extra_claim_request_id=(
+                        historical_payload.get("extraClaimRequestId")
+                        or historical_payload.get("extra_claim_request_id")
+                    ),
+                    app_version=historical_payload.get("appVersion") or "legacy-v1",
+                    recovered=True,
+                    now=now,
+                )
+            # A v2 database can contain rows created before an integration was
+            # configured.  Ensure those rows also have one durable outbox item.
+            for claim_row in connection.execute(
+                "SELECT * FROM claim_events WHERE event_uuid IS NOT NULL AND event_uuid <> ''"
+            ).fetchall():
+                claim_payload = self._payload_from_row(claim_row)
+                self._enqueue_claim_export_in_connection(
+                    connection,
+                    event_uuid=claim_row["event_uuid"],
+                    operation_key=claim_row["operation_key"] or f"legacy:{claim_row['event_uuid']}",
+                    deal_id=claim_row["deal_id"],
+                    manager_id=claim_row["manager_id"],
+                    occurred_at=claim_row["timestamp"],
+                    business_date=claim_row["event_date"],
+                    extra_claim_request_id=(
+                        claim_payload.get("extraClaimRequestId")
+                        or claim_payload.get("extra_claim_request_id")
+                    ),
+                    app_version=claim_payload.get("appVersion") or "legacy-v1",
+                    recovered=bool(claim_payload.get("recovered", True)),
+                    now=now,
+                )
             if not schema_row:
                 connection.execute(
                     "INSERT INTO meta(key, value, updated_at) VALUES('schema_version', ?, ?)",
+                    (str(SCHEMA_VERSION), now),
+                )
+            elif schema_row["value"] == "1":
+                connection.execute(
+                    "UPDATE meta SET value = ?, updated_at = ? WHERE key = 'schema_version'",
                     (str(SCHEMA_VERSION), now),
                 )
             connection.commit()
@@ -440,6 +588,9 @@ class StateStore:
                         "reject_events",
                         "greeting_events",
                         "claim_operations",
+                        "extra_claim_requests",
+                        "extra_claim_grants",
+                        "integration_outbox",
                     )
                 )
             if quick_check != "ok":
@@ -599,6 +750,9 @@ class StateStore:
                     "reject_events",
                     "greeting_events",
                     "claim_operations",
+                    "extra_claim_requests",
+                    "extra_claim_grants",
+                    "integration_outbox",
                 )
             }
             if any(state_counts.values()):
@@ -668,6 +822,21 @@ class StateStore:
         normalized = parsed.isoformat(timespec="microseconds")
         event_date = parsed.astimezone(self.local_timezone).date().isoformat()
         return normalized, event_date
+
+    @staticmethod
+    def _claim_export_timestamp(value: Any) -> str:
+        """Canonical cross-service timestamp with millisecond precision."""
+
+        raw = str(value or "").strip()
+        try:
+            parsed = datetime.fromisoformat(
+                raw[:-1] + "+00:00" if raw.endswith("Z") else raw
+            )
+        except ValueError as exc:
+            raise ValueError("claim export timestamp must be an ISO-8601 datetime") from exc
+        if parsed.tzinfo is None:
+            raise ValueError("claim export timestamp must include an offset")
+        return parsed.isoformat(timespec="milliseconds")
 
     @staticmethod
     def _normalize_date_filter(value: Optional[str], name: str) -> Optional[str]:
@@ -804,6 +973,64 @@ class StateStore:
     # Event inserts
     # ------------------------------------------------------------------
 
+    def _enqueue_outbox_in_connection(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        dedupe_key: str,
+        kind: str,
+        path: str,
+        payload: Mapping[str, Any],
+        now: Optional[str] = None,
+    ) -> None:
+        now = now or self._now_iso()
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO integration_outbox(
+                dedupe_key, kind, path, payload_json, next_attempt_at,
+                created_at, updated_at
+            ) VALUES(?, ?, ?, ?, ?, ?, ?)
+            """,
+            (dedupe_key, kind, path, _json_dumps(dict(payload)), now, now, now),
+        )
+
+    def _enqueue_claim_export_in_connection(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        event_uuid: str,
+        operation_key: str,
+        deal_id: str,
+        manager_id: str,
+        occurred_at: str,
+        business_date: str,
+        extra_claim_request_id: Optional[str],
+        app_version: str,
+        recovered: bool,
+        now: Optional[str] = None,
+    ) -> None:
+        payload: Dict[str, Any] = {
+            "schemaVersion": 1,
+            "eventUuid": str(event_uuid),
+            "operationKey": str(operation_key),
+            "bitrixDealId": str(deal_id),
+            "bitrixUserId": str(manager_id),
+            "occurredAt": self._claim_export_timestamp(occurred_at),
+            "businessDate": str(business_date),
+            "appVersion": str(app_version or "unknown"),
+            "recovered": bool(recovered),
+        }
+        if extra_claim_request_id:
+            payload["extraClaimRequestId"] = str(extra_claim_request_id)
+        self._enqueue_outbox_in_connection(
+            connection,
+            dedupe_key=f"claim-event:{event_uuid}",
+            kind="claim_event",
+            path="/integrations/deal-picker/v1/claim-events",
+            payload=payload,
+            now=now,
+        )
+
     def _insert_claim(
         self,
         connection: sqlite3.Connection,
@@ -812,6 +1039,9 @@ class StateStore:
         source: str,
         migration: bool = False,
         operation_key: Optional[str] = None,
+        extra_claim_request_id: Optional[str] = None,
+        app_version: str = "unknown",
+        recovered: bool = False,
     ) -> int:
         payload = dict(entry)
         timestamp, event_date = self._normalize_timestamp(payload.get("timestamp"), migration=migration)
@@ -821,24 +1051,45 @@ class StateStore:
             operation_key or payload.get("operationKey") or payload.get("operation_key")
         )
         operation_key = str(raw_operation_key) if raw_operation_key else None
+        event_uuid = str(
+            payload.get("eventUuid")
+            or payload.get("event_uuid")
+            or uuid.uuid4()
+        )
+        try:
+            event_uuid = str(uuid.UUID(event_uuid))
+        except (ValueError, AttributeError, TypeError) as exc:
+            raise ValueError("eventUuid must be a UUID") from exc
         if not migration and (not manager_id or not deal_id):
             raise ValueError("claim event requires managerId and dealId")
+        extra_claim_request_id = (
+            extra_claim_request_id
+            or payload.get("extraClaimRequestId")
+            or payload.get("extra_claim_request_id")
+        )
+        recovered = bool(recovered or migration or source != "app")
         payload.update(
             {
+                "eventUuid": event_uuid,
                 "timestamp": timestamp,
                 "managerId": manager_id,
                 "dealId": deal_id,
                 "operationKey": operation_key or "",
+                "appVersion": str(app_version or "unknown"),
+                "recovered": recovered,
             }
         )
+        if extra_claim_request_id:
+            payload["extraClaimRequestId"] = str(extra_claim_request_id)
         cursor = connection.execute(
             """
             INSERT INTO claim_events(
-                timestamp, event_date, manager_id, manager_name, deal_id, deal_title,
+                event_uuid, timestamp, event_date, manager_id, manager_name, deal_id, deal_title,
                 payload_json, source, operation_key, created_at
-            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
+                event_uuid,
                 timestamp,
                 event_date,
                 manager_id,
@@ -850,6 +1101,19 @@ class StateStore:
                 operation_key,
                 self._now_iso(),
             ),
+        )
+        self._enqueue_claim_export_in_connection(
+            connection,
+            event_uuid=event_uuid,
+            operation_key=operation_key or f"legacy:{event_uuid}",
+            deal_id=deal_id,
+            manager_id=manager_id,
+            occurred_at=timestamp,
+            business_date=event_date,
+            extra_claim_request_id=extra_claim_request_id,
+            app_version=app_version,
+            recovered=recovered,
+            now=self._now_iso(),
         )
         return int(cursor.lastrowid)
 
@@ -1068,6 +1332,7 @@ class StateStore:
         payload = self._payload_from_row(row)
         payload.update(
             {
+                "eventUuid": row["event_uuid"],
                 "timestamp": row["timestamp"],
                 "managerId": row["manager_id"],
                 "managerName": row["manager_name"],
@@ -1322,6 +1587,740 @@ class StateStore:
         return sorted((row[0] for row in rows if row[0]), key=lambda value: (not value.isdigit(), value))
 
     # ------------------------------------------------------------------
+    # Baza integration: request state, one-use grants and durable outbox
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _extra_request_row(row: sqlite3.Row) -> Dict[str, Any]:
+        remote = None
+        if row["remote_json"]:
+            try:
+                remote = json.loads(row["remote_json"])
+            except (TypeError, json.JSONDecodeError):
+                remote = None
+        return {
+            "requestKey": row["request_key"],
+            "id": row["external_id"],
+            "managerId": row["manager_id"],
+            "businessDate": row["business_date"],
+            "reason": row["reason"],
+            "status": row["status"],
+            "takenTodaySnapshot": row["taken_today_snapshot"],
+            "dailyLimitSnapshot": row["daily_limit_snapshot"],
+            "rejectionReason": row["rejection_reason"],
+            "remote": remote,
+            "createdAt": row["created_at"],
+            "updatedAt": row["updated_at"],
+        }
+
+    @staticmethod
+    def _grant_row(row: sqlite3.Row) -> Dict[str, Any]:
+        try:
+            payload = json.loads(row["payload_json"])
+        except (TypeError, json.JSONDecodeError):
+            payload = {}
+        return {
+            "id": row["grant_id"],
+            "requestId": row["request_id"],
+            "requestKey": row["request_key"],
+            "managerId": row["manager_id"],
+            "businessDate": row["business_date"],
+            "status": row["status"],
+            "reservedOperationKey": row["reserved_operation_key"],
+            "expiresAt": row["expires_at"],
+            "payload": payload if isinstance(payload, dict) else {},
+            "createdAt": row["created_at"],
+            "updatedAt": row["updated_at"],
+            "consumedAt": row["consumed_at"],
+        }
+
+    @staticmethod
+    def _outbox_row(row: sqlite3.Row) -> Dict[str, Any]:
+        def decode(column: str) -> Any:
+            raw = row[column]
+            if raw is None:
+                return None
+            try:
+                return json.loads(raw)
+            except (TypeError, json.JSONDecodeError):
+                return None
+
+        return {
+            "id": row["id"],
+            "dedupeKey": row["dedupe_key"],
+            "kind": row["kind"],
+            "path": row["path"],
+            "payload": decode("payload_json") or {},
+            "attemptCount": row["attempt_count"],
+            "nextAttemptAt": row["next_attempt_at"],
+            "lastError": row["last_error"],
+            "response": decode("response_json"),
+            "createdAt": row["created_at"],
+            "updatedAt": row["updated_at"],
+            "deliveredAt": row["delivered_at"],
+            "deadLetterAt": row["dead_letter_at"],
+        }
+
+    def create_extra_claim_request(
+        self,
+        manager_id: Any,
+        business_date: str,
+        reason: str,
+        *,
+        taken_today_snapshot: int,
+        daily_limit_snapshot: int,
+        request_key: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Create one active request or return the current active request.
+
+        The UUID is generated once and persisted before any network attempt.
+        This makes double-clicks and process restarts idempotent without
+        preventing a later request after rejection or consumption.
+        """
+
+        self._ensure_ready()
+        manager_id = str(manager_id or "")
+        business_date = self._normalize_date_filter(business_date, "business_date") or ""
+        reason = str(reason or "").strip()
+        if not manager_id or not business_date:
+            raise ValueError("manager_id and business_date are required")
+        if not 10 <= len(reason) <= 500:
+            raise ValueError("reason must contain 10 to 500 characters")
+        request_key = str(request_key or uuid.uuid4())
+        try:
+            request_key = str(uuid.UUID(request_key))
+        except (ValueError, AttributeError, TypeError) as exc:
+            raise ValueError("request_key must be a UUID") from exc
+        taken_today_snapshot = max(0, int(taken_today_snapshot))
+        daily_limit_snapshot = max(0, int(daily_limit_snapshot))
+        now = self._now_iso()
+        with self._transaction(immediate=True) as connection:
+            active = connection.execute(
+                """
+                SELECT * FROM extra_claim_requests
+                WHERE manager_id = ? AND business_date = ?
+                  AND status IN ('queued', 'pending', 'approved')
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (manager_id, business_date),
+            ).fetchone()
+            if active:
+                result = self._extra_request_row(active)
+                result["created"] = False
+                return result
+            connection.execute(
+                """
+                INSERT INTO extra_claim_requests(
+                    request_key, manager_id, business_date, reason, status,
+                    taken_today_snapshot, daily_limit_snapshot, created_at, updated_at
+                ) VALUES(?, ?, ?, ?, 'queued', ?, ?, ?, ?)
+                """,
+                (
+                    request_key,
+                    manager_id,
+                    business_date,
+                    reason,
+                    taken_today_snapshot,
+                    daily_limit_snapshot,
+                    now,
+                    now,
+                ),
+            )
+            self._enqueue_outbox_in_connection(
+                connection,
+                dedupe_key=f"extra-claim-request:{request_key}",
+                kind="extra_claim_request",
+                path="/integrations/deal-picker/v1/extra-claim-requests",
+                payload={
+                    "requestKey": request_key,
+                    "bitrixUserId": manager_id,
+                    "businessDate": business_date,
+                    "requestedQuantity": 1,
+                    "takenTodaySnapshot": taken_today_snapshot,
+                    "dailyLimitSnapshot": daily_limit_snapshot,
+                    "reason": reason,
+                },
+                now=now,
+            )
+            row = connection.execute(
+                "SELECT * FROM extra_claim_requests WHERE request_key = ?",
+                (request_key,),
+            ).fetchone()
+            result = self._extra_request_row(row)
+            result["created"] = True
+            return result
+
+    def _find_request_for_remote_in_connection(
+        self,
+        connection: sqlite3.Connection,
+        remote: Mapping[str, Any],
+        manager_id: str,
+        business_date: str,
+    ) -> Optional[sqlite3.Row]:
+        request_key = str(remote.get("requestKey") or "")
+        external_id = str(remote.get("id") or remote.get("requestId") or "")
+        if request_key:
+            row = connection.execute(
+                "SELECT * FROM extra_claim_requests WHERE request_key = ?",
+                (request_key,),
+            ).fetchone()
+            if row:
+                return row
+        if external_id:
+            row = connection.execute(
+                "SELECT * FROM extra_claim_requests WHERE external_id = ?",
+                (external_id,),
+            ).fetchone()
+            if row:
+                return row
+        return connection.execute(
+            """
+            SELECT * FROM extra_claim_requests
+            WHERE manager_id = ? AND business_date = ?
+              AND status IN ('queued', 'pending', 'approved')
+            ORDER BY created_at DESC LIMIT 1
+            """,
+            (manager_id, business_date),
+        ).fetchone()
+
+    @staticmethod
+    def _normalize_remote_request_status(value: Any) -> str:
+        status = str(value or "pending").strip().lower()
+        aliases = {"declined": "rejected", "used": "consumed", "cancelled": "expired"}
+        status = aliases.get(status, status)
+        return status if status in {"pending", "approved", "rejected", "consumed", "expired"} else "pending"
+
+    def import_extra_claim_state(
+        self,
+        manager_id: Any,
+        business_date: str,
+        response: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        """Merge a signed Baza status response without reviving used grants."""
+
+        self._ensure_ready()
+        manager_id = str(manager_id or "")
+        business_date = self._normalize_date_filter(business_date, "business_date") or ""
+        response = dict(response or {})
+        container = response.get("data") if isinstance(response.get("data"), dict) else response
+        request_payload = container.get("request") if isinstance(container.get("request"), dict) else None
+        grants = container.get("grants")
+        if grants is None and isinstance(container.get("grant"), dict):
+            grants = [container["grant"]]
+        grants = grants if isinstance(grants, list) else []
+        authoritative_grant_ids = {
+            str(raw_grant.get("id") or raw_grant.get("requestId") or "")
+            for raw_grant in grants
+            if isinstance(raw_grant, dict)
+            and str(raw_grant.get("status") or "approved").lower() == "approved"
+            and str(raw_grant.get("bitrixUserId") or manager_id) == manager_id
+            and str(raw_grant.get("businessDate") or business_date) == business_date
+            and str(raw_grant.get("id") or raw_grant.get("requestId") or "")
+        }
+        now = self._now_iso()
+        with self._transaction(immediate=True) as connection:
+            # grants/query is authoritative for grants that have not yet been
+            # used.  Keeping an omitted approved row would let a revoked grant
+            # change Bitrix before the later claim-event export is rejected.
+            # Reserved rows are deliberately retained: they belong to an
+            # in-flight or uncertainty-held CRM operation and must be resolved
+            # through the claim reconciliation path.
+            for local_grant in connection.execute(
+                """
+                SELECT grant_id FROM extra_claim_grants
+                WHERE manager_id=? AND business_date=? AND status='approved'
+                """,
+                (manager_id, business_date),
+            ).fetchall():
+                if local_grant["grant_id"] not in authoritative_grant_ids:
+                    connection.execute(
+                        "UPDATE extra_claim_grants SET status='expired', updated_at=? "
+                        "WHERE grant_id=? AND status='approved'",
+                        (now, local_grant["grant_id"]),
+                    )
+            if request_payload:
+                row = self._find_request_for_remote_in_connection(
+                    connection, request_payload, manager_id, business_date
+                )
+                external_id = str(
+                    request_payload.get("id") or request_payload.get("requestId") or ""
+                ) or None
+                status = self._normalize_remote_request_status(request_payload.get("status"))
+                rejection_reason = str(
+                    request_payload.get("decisionNote")
+                    or request_payload.get("rejectionReason")
+                    or request_payload.get("reviewerComment")
+                    or ""
+                )
+                if row:
+                    connection.execute(
+                        """
+                        UPDATE extra_claim_requests SET
+                            external_id=COALESCE(?, external_id), status=?,
+                            rejection_reason=?, remote_json=?, updated_at=?
+                        WHERE request_key=?
+                        """,
+                        (
+                            external_id,
+                            status,
+                            rejection_reason,
+                            _json_dumps(request_payload),
+                            now,
+                            row["request_key"],
+                        ),
+                    )
+                elif external_id:
+                    synthetic_key = str(request_payload.get("requestKey") or uuid.uuid4())
+                    try:
+                        synthetic_key = str(uuid.UUID(synthetic_key))
+                    except (ValueError, AttributeError, TypeError):
+                        synthetic_key = str(uuid.uuid4())
+                    connection.execute(
+                        """
+                        INSERT OR IGNORE INTO extra_claim_requests(
+                            request_key, external_id, manager_id, business_date, reason,
+                            status, taken_today_snapshot, daily_limit_snapshot,
+                            rejection_reason, remote_json, created_at, updated_at
+                        ) VALUES(?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?)
+                        """,
+                        (
+                            synthetic_key,
+                            external_id,
+                            manager_id,
+                            business_date,
+                            str(request_payload.get("reason") or "Запрос восстановлен из Базы"),
+                            status,
+                            rejection_reason,
+                            _json_dumps(request_payload),
+                            now,
+                            now,
+                        ),
+                    )
+            for raw_grant in grants:
+                if not isinstance(raw_grant, dict):
+                    continue
+                grant_id = str(raw_grant.get("id") or raw_grant.get("requestId") or "")
+                request_id = str(raw_grant.get("requestId") or raw_grant.get("id") or "")
+                grant_manager = str(raw_grant.get("bitrixUserId") or manager_id)
+                grant_date = str(raw_grant.get("businessDate") or business_date)
+                if not grant_id or not request_id or grant_manager != manager_id or grant_date != business_date:
+                    continue
+                remote_status = str(raw_grant.get("status") or "approved").lower()
+                if remote_status != "approved":
+                    continue
+                existing = connection.execute(
+                    "SELECT * FROM extra_claim_grants WHERE grant_id = ?",
+                    (grant_id,),
+                ).fetchone()
+                request_row = connection.execute(
+                    "SELECT * FROM extra_claim_requests WHERE external_id = ? LIMIT 1",
+                    (request_id,),
+                ).fetchone()
+                if not request_row:
+                    request_row = connection.execute(
+                        """
+                        SELECT * FROM extra_claim_requests
+                        WHERE manager_id=? AND business_date=?
+                          AND status IN ('queued', 'pending', 'approved')
+                        ORDER BY created_at DESC LIMIT 1
+                        """,
+                        (manager_id, business_date),
+                    ).fetchone()
+                request_key = request_row["request_key"] if request_row else None
+                if existing:
+                    if existing["status"] in {"reserved", "consumed"}:
+                        continue
+                    connection.execute(
+                        """
+                        UPDATE extra_claim_grants SET request_id=?, request_key=?,
+                            status='approved', reserved_operation_key=NULL,
+                            expires_at=?, payload_json=?, updated_at=?, consumed_at=NULL
+                        WHERE grant_id=?
+                        """,
+                        (
+                            request_id,
+                            request_key,
+                            raw_grant.get("expiresAt"),
+                            _json_dumps(raw_grant),
+                            now,
+                            grant_id,
+                        ),
+                    )
+                else:
+                    connection.execute(
+                        """
+                        INSERT INTO extra_claim_grants(
+                            grant_id, request_id, request_key, manager_id,
+                            business_date, status, expires_at, payload_json,
+                            created_at, updated_at
+                        ) VALUES(?, ?, ?, ?, ?, 'approved', ?, ?, ?, ?)
+                        """,
+                        (
+                            grant_id,
+                            request_id,
+                            request_key,
+                            manager_id,
+                            business_date,
+                            raw_grant.get("expiresAt"),
+                            _json_dumps(raw_grant),
+                            now,
+                            now,
+                        ),
+                    )
+                if request_row and request_row["status"] in {"queued", "pending"}:
+                    connection.execute(
+                        """
+                        UPDATE extra_claim_requests SET external_id=COALESCE(external_id, ?),
+                            status='approved', updated_at=? WHERE request_key=?
+                        """,
+                        (request_id, now, request_row["request_key"]),
+                    )
+        return self.get_extra_claim_state(manager_id, business_date)
+
+    def apply_extra_claim_request_response(
+        self,
+        request_key: str,
+        response: Mapping[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        self._ensure_ready()
+        response = dict(response or {})
+        container = response.get("data") if isinstance(response.get("data"), dict) else response
+        remote = container.get("request") if isinstance(container.get("request"), dict) else container
+        now = self._now_iso()
+        with self._transaction(immediate=True) as connection:
+            row = connection.execute(
+                "SELECT * FROM extra_claim_requests WHERE request_key=?",
+                (str(request_key),),
+            ).fetchone()
+            if not row:
+                return None
+            external_id = str(remote.get("id") or remote.get("requestId") or "") or None
+            status = self._normalize_remote_request_status(remote.get("status"))
+            connection.execute(
+                """
+                UPDATE extra_claim_requests SET external_id=COALESCE(?, external_id),
+                    status=?, rejection_reason=?, remote_json=?, updated_at=?
+                WHERE request_key=?
+                """,
+                (
+                    external_id,
+                    status,
+                    str(
+                        remote.get("decisionNote")
+                        or remote.get("rejectionReason")
+                        or remote.get("reviewerComment")
+                        or ""
+                    ),
+                    _json_dumps(remote),
+                    now,
+                    str(request_key),
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM extra_claim_requests WHERE request_key=?",
+                (str(request_key),),
+            ).fetchone()
+        return self._extra_request_row(row) if row else None
+
+    def get_extra_claim_state(
+        self,
+        manager_id: Any,
+        business_date: str,
+        *,
+        operation_key: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        self._ensure_ready()
+        manager_id = str(manager_id or "")
+        business_date = self._normalize_date_filter(business_date, "business_date") or ""
+        now = self._now_iso()
+        with self._transaction(immediate=True) as connection:
+            for candidate in connection.execute(
+                """
+                SELECT * FROM extra_claim_grants
+                WHERE manager_id=? AND business_date=? AND status='approved'
+                """,
+                (manager_id, business_date),
+            ).fetchall():
+                if candidate["expires_at"] and self._iso_is_expired(
+                    candidate["expires_at"], now
+                ):
+                    connection.execute(
+                        "UPDATE extra_claim_grants SET status='expired', updated_at=? WHERE grant_id=?",
+                        (now, candidate["grant_id"]),
+                    )
+                    if candidate["request_key"]:
+                        connection.execute(
+                            "UPDATE extra_claim_requests SET status='expired', updated_at=? "
+                            "WHERE request_key=? AND status='approved'",
+                            (now, candidate["request_key"]),
+                        )
+            request = connection.execute(
+                """
+                SELECT * FROM extra_claim_requests
+                WHERE manager_id=? AND business_date=?
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (manager_id, business_date),
+            ).fetchone()
+            params: list[Any] = [manager_id, business_date]
+            clause = "status='approved'"
+            if operation_key:
+                clause = "(status='approved' OR (status='reserved' AND reserved_operation_key=?))"
+                params.append(str(operation_key))
+            grant = connection.execute(
+                f"""
+                SELECT * FROM extra_claim_grants
+                WHERE manager_id=? AND business_date=? AND {clause}
+                ORDER BY CASE status WHEN 'reserved' THEN 0 ELSE 1 END, created_at
+                LIMIT 1
+                """,
+                params,
+            ).fetchone()
+        return {
+            "request": self._extra_request_row(request) if request else None,
+            "grant": self._grant_row(grant) if grant else None,
+            "grantAvailable": bool(grant),
+        }
+
+    def _iso_is_expired(self, expires_at: Any, now: Any) -> bool:
+        try:
+            expiry = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
+            current = datetime.fromisoformat(str(now).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return True
+        if expiry.tzinfo is None:
+            expiry = expiry.replace(tzinfo=self.local_timezone)
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=self.local_timezone)
+        return expiry.astimezone(timezone.utc) <= current.astimezone(timezone.utc)
+
+    def _reserve_extra_claim_grant_in_connection(
+        self,
+        connection: sqlite3.Connection,
+        manager_id: str,
+        business_date: str,
+        operation_key: str,
+        now: str,
+    ) -> sqlite3.Row:
+        grant = connection.execute(
+            """
+            SELECT * FROM extra_claim_grants
+            WHERE manager_id=? AND business_date=?
+              AND status='reserved' AND reserved_operation_key=?
+            LIMIT 1
+            """,
+            (manager_id, business_date, operation_key),
+        ).fetchone()
+        if grant:
+            return grant
+        candidates = connection.execute(
+            """
+            SELECT * FROM extra_claim_grants
+            WHERE manager_id=? AND business_date=? AND status='approved'
+            ORDER BY created_at, grant_id
+            """,
+            (manager_id, business_date),
+        ).fetchall()
+        for candidate in candidates:
+            expires_at = str(candidate["expires_at"] or "")
+            if expires_at:
+                expired = self._iso_is_expired(expires_at, now)
+                if expired:
+                    connection.execute(
+                        "UPDATE extra_claim_grants SET status='expired', updated_at=? WHERE grant_id=?",
+                        (now, candidate["grant_id"]),
+                    )
+                    if candidate["request_key"]:
+                        connection.execute(
+                            "UPDATE extra_claim_requests SET status='expired', updated_at=? "
+                            "WHERE request_key=? AND status='approved'",
+                            (now, candidate["request_key"]),
+                        )
+                    continue
+            changed = connection.execute(
+                """
+                UPDATE extra_claim_grants SET status='reserved', reserved_operation_key=?, updated_at=?
+                WHERE grant_id=? AND status='approved'
+                """,
+                (operation_key, now, candidate["grant_id"]),
+            ).rowcount
+            if changed:
+                return connection.execute(
+                    "SELECT * FROM extra_claim_grants WHERE grant_id=?",
+                    (candidate["grant_id"],),
+                ).fetchone()
+        raise ExtraClaimGrantUnavailableError("no approved extra-claim grant is available")
+
+    def list_due_outbox(
+        self,
+        *,
+        now: Optional[str] = None,
+        limit: int = 20,
+        kinds: Optional[Iterable[str]] = None,
+        dedupe_key: Optional[str] = None,
+    ) -> list[Dict[str, Any]]:
+        self._ensure_ready()
+        now = now or self._now_iso()
+        clauses = [
+            "delivered_at IS NULL",
+            "dead_letter_at IS NULL",
+            "next_attempt_at <= ?",
+        ]
+        params: list[Any] = [now]
+        if kinds is not None:
+            normalized_kinds = tuple(
+                kind for kind in (str(item) for item in kinds) if kind in {"extra_claim_request", "claim_event"}
+            )
+            if not normalized_kinds:
+                return []
+            clauses.append("kind IN (" + ",".join("?" for _ in normalized_kinds) + ")")
+            params.extend(normalized_kinds)
+        if dedupe_key is not None:
+            clauses.append("dedupe_key = ?")
+            params.append(str(dedupe_key))
+        params.append(max(0, min(1000, int(limit))))
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM integration_outbox WHERE "
+                + " AND ".join(clauses)
+                + " ORDER BY CASE kind WHEN 'extra_claim_request' THEN 0 ELSE 1 END, id LIMIT ?",
+                params,
+            ).fetchall()
+        return [self._outbox_row(row) for row in rows]
+
+    def mark_outbox_delivered(
+        self,
+        outbox_id: int,
+        response: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        self._ensure_ready()
+        now = self._now_iso()
+        with self._transaction(immediate=True) as connection:
+            connection.execute(
+                """
+                UPDATE integration_outbox SET delivered_at=?, updated_at=?,
+                    last_error='', response_json=?
+                WHERE id=? AND delivered_at IS NULL
+                """,
+                (
+                    now,
+                    now,
+                    _json_dumps(dict(response)) if response is not None else None,
+                    int(outbox_id),
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM integration_outbox WHERE id=?", (int(outbox_id),)
+            ).fetchone()
+        if not row:
+            raise StateStoreError(f"outbox item {outbox_id} not found")
+        return self._outbox_row(row)
+
+    def mark_outbox_failed(
+        self,
+        outbox_id: int,
+        error: Any,
+        *,
+        base_delay_seconds: int = 5,
+        maximum_delay_seconds: int = 3600,
+    ) -> Dict[str, Any]:
+        self._ensure_ready()
+        now_dt = datetime.now(self.local_timezone)
+        now = now_dt.isoformat(timespec="microseconds")
+        with self._transaction(immediate=True) as connection:
+            row = connection.execute(
+                "SELECT * FROM integration_outbox WHERE id=?", (int(outbox_id),)
+            ).fetchone()
+            if not row:
+                raise StateStoreError(f"outbox item {outbox_id} not found")
+            if row["delivered_at"]:
+                return self._outbox_row(row)
+            attempt_count = int(row["attempt_count"]) + 1
+            delay = min(
+                max(1, int(maximum_delay_seconds)),
+                max(1, int(base_delay_seconds)) * (2 ** min(attempt_count - 1, 16)),
+            )
+            next_attempt = (now_dt + timedelta(seconds=delay)).isoformat(timespec="microseconds")
+            connection.execute(
+                """
+                UPDATE integration_outbox SET attempt_count=?, next_attempt_at=?,
+                    last_error=?, updated_at=? WHERE id=? AND delivered_at IS NULL
+                """,
+                (attempt_count, next_attempt, str(error)[:1000], now, int(outbox_id)),
+            )
+            row = connection.execute(
+                "SELECT * FROM integration_outbox WHERE id=?", (int(outbox_id),)
+            ).fetchone()
+        return self._outbox_row(row)
+
+    def mark_outbox_dead_letter(
+        self,
+        outbox_id: int,
+        error: Any,
+        response: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Stop permanent 4xx failures without deleting audit evidence."""
+
+        self._ensure_ready()
+        now = self._now_iso()
+        with self._transaction(immediate=True) as connection:
+            connection.execute(
+                """
+                UPDATE integration_outbox SET dead_letter_at=?, updated_at=?,
+                    last_error=?, response_json=?
+                WHERE id=? AND delivered_at IS NULL AND dead_letter_at IS NULL
+                """,
+                (
+                    now,
+                    now,
+                    str(error)[:1000],
+                    _json_dumps(dict(response)) if response is not None else None,
+                    int(outbox_id),
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM integration_outbox WHERE id=?", (int(outbox_id),)
+            ).fetchone()
+        if not row:
+            raise StateStoreError(f"outbox item {outbox_id} not found")
+        return self._outbox_row(row)
+
+    def reject_extra_claim_request_locally(
+        self,
+        request_key: str,
+        reason: str,
+    ) -> Optional[Dict[str, Any]]:
+        self._ensure_ready()
+        now = self._now_iso()
+        with self._transaction(immediate=True) as connection:
+            connection.execute(
+                """
+                UPDATE extra_claim_requests SET status='rejected',
+                    rejection_reason=?, updated_at=?
+                WHERE request_key=? AND status IN ('queued','pending')
+                """,
+                (str(reason)[:500], now, str(request_key)),
+            )
+            row = connection.execute(
+                "SELECT * FROM extra_claim_requests WHERE request_key=?",
+                (str(request_key),),
+            ).fetchone()
+        return self._extra_request_row(row) if row else None
+
+    def list_outbox(self, *, delivered: Optional[bool] = None) -> list[Dict[str, Any]]:
+        self._ensure_ready()
+        sql = "SELECT * FROM integration_outbox"
+        params: tuple[Any, ...] = ()
+        if delivered is True:
+            sql += " WHERE delivered_at IS NOT NULL"
+        elif delivered is False:
+            sql += " WHERE delivered_at IS NULL AND dead_letter_at IS NULL"
+        sql += " ORDER BY id"
+        with self._connect() as connection:
+            rows = connection.execute(sql, params).fetchall()
+        return [self._outbox_row(row) for row in rows]
+
+    # ------------------------------------------------------------------
     # Idempotent claim operations
     # ------------------------------------------------------------------
 
@@ -1346,6 +2345,7 @@ class StateStore:
             "error": row["error"],
             "attemptHistory": decode("attempt_history_json") or [],
             "claimEventId": row["claim_event_id"],
+            "extraClaimGrantId": row["extra_claim_grant_id"],
             "createdAt": row["created_at"],
             "updatedAt": row["updated_at"],
             "finalizedAt": row["finalized_at"],
@@ -1362,6 +2362,8 @@ class StateStore:
         operation_key: Optional[str] = None,
         request: Optional[Mapping[str, Any]] = None,
         retry_failed: bool = False,
+        require_extra_grant: bool = False,
+        business_date: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Create an idempotent claim operation or safely retry a failed one.
 
@@ -1377,6 +2379,10 @@ class StateStore:
         if not deal_id or not manager_id or not operation_key:
             raise ValueError("deal_id, manager_id and operation_key are required")
         now = self._now_iso()
+        if require_extra_grant:
+            business_date = self._normalize_date_filter(business_date, "business_date")
+            if not business_date:
+                raise ValueError("business_date is required for an extra-claim grant")
         with self._transaction(immediate=True) as connection:
             row = connection.execute(
                 "SELECT * FROM claim_operations WHERE operation_key = ?", (operation_key,)
@@ -1387,6 +2393,11 @@ class StateStore:
                         f"operation key {operation_key!r} belongs to another deal or manager"
                     )
                 if retry_failed and row["status"] == "failed":
+                    extra_grant = None
+                    if require_extra_grant:
+                        extra_grant = self._reserve_extra_claim_grant_in_connection(
+                            connection, manager_id, business_date, operation_key, now
+                        )
                     request_json = (
                         _json_dumps(dict(request)) if request is not None else row["request_json"]
                     )
@@ -1415,10 +2426,17 @@ class StateStore:
                         UPDATE claim_operations SET
                             status='pending', request_json=?, result_json=NULL, error=NULL,
                             attempt_history_json=?, claim_event_id=NULL,
+                            extra_claim_grant_id=?,
                             updated_at=?, finalized_at=NULL
                         WHERE operation_key = ? AND status = 'failed'
                         """,
-                        (request_json, _json_dumps(attempt_history), now, operation_key),
+                        (
+                            request_json,
+                            _json_dumps(attempt_history),
+                            extra_grant["grant_id"] if extra_grant else row["extra_claim_grant_id"],
+                            now,
+                            operation_key,
+                        ),
                     )
                     row = connection.execute(
                         "SELECT * FROM claim_operations WHERE operation_key = ?", (operation_key,)
@@ -1445,6 +2463,14 @@ class StateStore:
                     now,
                 ),
             )
+            if require_extra_grant:
+                extra_grant = self._reserve_extra_claim_grant_in_connection(
+                    connection, manager_id, business_date, operation_key, now
+                )
+                connection.execute(
+                    "UPDATE claim_operations SET extra_claim_grant_id=? WHERE operation_key=?",
+                    (extra_grant["grant_id"], operation_key),
+                )
             row = connection.execute(
                 "SELECT * FROM claim_operations WHERE operation_key = ?", (operation_key,)
             ).fetchone()
@@ -1459,6 +2485,8 @@ class StateStore:
         *,
         operation_key: Optional[str] = None,
         request: Optional[Mapping[str, Any]] = None,
+        require_extra_grant: bool = False,
+        business_date: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Explicit convenience wrapper for a safe failed-operation retry."""
 
@@ -1468,6 +2496,8 @@ class StateStore:
             operation_key=operation_key,
             request=request,
             retry_failed=True,
+            require_extra_grant=require_extra_grant,
+            business_date=business_date,
         )
 
     def reassign_failed_claim_operation(
@@ -1477,6 +2507,8 @@ class StateStore:
         *,
         operation_key: Optional[str] = None,
         request: Optional[Mapping[str, Any]] = None,
+        require_extra_grant: bool = False,
+        business_date: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Atomically reuse a failed deal lock for a different manager.
 
@@ -1494,6 +2526,10 @@ class StateStore:
         if not deal_id or not manager_id or not operation_key:
             raise ValueError("deal_id, manager_id and operation_key are required")
         now = self._now_iso()
+        if require_extra_grant:
+            business_date = self._normalize_date_filter(business_date, "business_date")
+            if not business_date:
+                raise ValueError("business_date is required for an extra-claim grant")
         with self._transaction(immediate=True) as connection:
             row = connection.execute(
                 "SELECT * FROM claim_operations WHERE operation_key = ?", (operation_key,)
@@ -1508,6 +2544,23 @@ class StateStore:
                 operation = self._operation_row(row, created=False)
                 operation["reassigned"] = False
                 return operation
+            if row["extra_claim_grant_id"]:
+                held_grant = connection.execute(
+                    "SELECT * FROM extra_claim_grants WHERE grant_id=?",
+                    (row["extra_claim_grant_id"],),
+                ).fetchone()
+                if (
+                    held_grant
+                    and held_grant["status"] == "reserved"
+                    and held_grant["reserved_operation_key"] == operation_key
+                ):
+                    # A failed operation retains its grant only when the remote
+                    # CRM write may already have happened.  Moving that same
+                    # operation key to another manager would detach the audit
+                    # evidence and either leak or double-spend the grant.
+                    raise ExtraClaimGrantReconciliationRequiredError(
+                        "uncertainty-held extra-claim grant requires reconciliation"
+                    )
             try:
                 attempt_history = json.loads(row["attempt_history_json"])
             except (TypeError, json.JSONDecodeError):
@@ -1529,11 +2582,17 @@ class StateStore:
                     "finalizedAt": row["finalized_at"],
                 }
             )
+            extra_grant = None
+            if require_extra_grant:
+                extra_grant = self._reserve_extra_claim_grant_in_connection(
+                    connection, manager_id, business_date, operation_key, now
+                )
             connection.execute(
                 """
                 UPDATE claim_operations SET
                     manager_id=?, status='pending', request_json=?, result_json=NULL,
                     error=NULL, attempt_history_json=?, claim_event_id=NULL,
+                    extra_claim_grant_id=?,
                     updated_at=?, finalized_at=NULL
                 WHERE operation_key = ? AND status = 'failed'
                 """,
@@ -1541,6 +2600,7 @@ class StateStore:
                     manager_id,
                     _json_dumps(dict(request)) if request is not None else None,
                     _json_dumps(attempt_history),
+                    extra_grant["grant_id"] if extra_grant else None,
                     now,
                     operation_key,
                 ),
@@ -1601,6 +2661,8 @@ class StateStore:
         claim: Optional[Mapping[str, Any]] = None,
         result: Optional[Mapping[str, Any]] = None,
         expected_claim_marker: Optional[str] = None,
+        app_version: str = "unknown",
+        recovered: bool = False,
     ) -> Dict[str, Any]:
         """Atomically persist a claim event and mark an operation succeeded.
 
@@ -1652,13 +2714,48 @@ class StateStore:
                 )
             claim_payload["managerId"] = row["manager_id"]
             claim_payload["dealId"] = row["deal_id"]
+            extra_request_id = None
+            grant = None
+            if row["extra_claim_grant_id"]:
+                grant = connection.execute(
+                    "SELECT * FROM extra_claim_grants WHERE grant_id=?",
+                    (row["extra_claim_grant_id"],),
+                ).fetchone()
+                if (
+                    not grant
+                    or grant["status"] != "reserved"
+                    or grant["reserved_operation_key"] != operation_key
+                ):
+                    raise StateStoreError(
+                        f"extra-claim grant for operation {operation_key!r} is not reserved"
+                    )
+                extra_request_id = str(grant["request_id"])
+                claim_payload["extraClaimRequestId"] = extra_request_id
             claim_event_id = self._insert_claim(
                 connection,
                 claim_payload,
                 source="app",
                 operation_key=operation_key,
+                extra_claim_request_id=extra_request_id,
+                app_version=app_version,
+                recovered=recovered,
             )
             now = self._now_iso()
+            if grant:
+                connection.execute(
+                    """
+                    UPDATE extra_claim_grants SET status='consumed', consumed_at=?,
+                        updated_at=? WHERE grant_id=? AND status='reserved'
+                          AND reserved_operation_key=?
+                    """,
+                    (now, now, grant["grant_id"], operation_key),
+                )
+                if grant["request_key"]:
+                    connection.execute(
+                        "UPDATE extra_claim_requests SET status='consumed', updated_at=? "
+                        "WHERE request_key=?",
+                        (now, grant["request_key"]),
+                    )
             connection.execute(
                 """
                 UPDATE claim_operations SET
@@ -1703,15 +2800,47 @@ class StateStore:
                 operation["transitioned"] = False
                 return operation
             now = self._now_iso()
+            result_payload = dict(result) if result is not None else {}
+            uncertainty_holds_grant = bool(
+                result_payload.get("remoteUpdated") is True
+                or result_payload.get("remoteUpdateUncertain")
+                or (
+                    result_payload.get("recoveryRequired")
+                    and result_payload.get("remoteUpdated") is not False
+                )
+            )
+            extra_claim_grant_id = row["extra_claim_grant_id"]
+            if extra_claim_grant_id and not uncertainty_holds_grant:
+                grant = connection.execute(
+                    "SELECT * FROM extra_claim_grants WHERE grant_id=?",
+                    (extra_claim_grant_id,),
+                ).fetchone()
+                connection.execute(
+                    """
+                    UPDATE extra_claim_grants SET status='approved',
+                        reserved_operation_key=NULL, updated_at=?
+                    WHERE grant_id=? AND status='reserved'
+                      AND reserved_operation_key=?
+                    """,
+                    (now, extra_claim_grant_id, operation_key),
+                )
+                if grant and grant["request_key"]:
+                    connection.execute(
+                        "UPDATE extra_claim_requests SET status='approved', updated_at=? "
+                        "WHERE request_key=? AND status NOT IN ('consumed','expired')",
+                        (now, grant["request_key"]),
+                    )
             connection.execute(
                 """
                 UPDATE claim_operations SET
-                    status='failed', result_json=?, error=?, updated_at=?, finalized_at=?
+                    status='failed', result_json=?, error=?, extra_claim_grant_id=?,
+                    updated_at=?, finalized_at=?
                 WHERE operation_key = ?
                 """,
                 (
-                    _json_dumps(dict(result)) if result is not None else None,
+                    _json_dumps(result_payload) if result is not None else None,
                     str(error),
+                    extra_claim_grant_id if uncertainty_holds_grant else None,
                     now,
                     now,
                     operation_key,
@@ -1844,6 +2973,7 @@ def create_state_store() -> StateStore:
 
 __all__ = [
     "DEFAULT_DB_FILENAME",
+    "ExtraClaimGrantUnavailableError",
     "IdempotencyConflictError",
     "LegacyMigrationError",
     "MIGRATION_MARKER",

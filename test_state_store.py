@@ -9,6 +9,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from state_store import (
+    ExtraClaimGrantReconciliationRequiredError,
+    ExtraClaimGrantUnavailableError,
     IdempotencyConflictError,
     MIGRATION_MARKER,
     StateStore,
@@ -72,7 +74,7 @@ class TestInitialization(StateStoreTestCase):
                 "SELECT value FROM meta WHERE key = ?", (MIGRATION_MARKER,)
             ).fetchone()
         self.assertEqual(journal_mode.lower(), "wal")
-        self.assertEqual(schema_version, "1")
+        self.assertEqual(schema_version, "2")
         self.assertIsNone(marker)
         with store._connect() as connection:
             self.assertEqual(connection.execute("PRAGMA synchronous").fetchone()[0], 2)
@@ -1019,6 +1021,429 @@ class TestClaimOperations(StateStoreTestCase):
             store.finalize_claim_operation("missing")
         with self.assertRaisesRegex(Exception, "not found"):
             store.fail_claim_operation("missing", "error")
+
+
+class TestSchemaV2IntegrationMigration(StateStoreTestCase):
+    def create_v1_database(self):
+        db_path = self.data_dir / "state.sqlite3"
+        with sqlite3.connect(db_path) as connection:
+            connection.executescript(
+                """
+                CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL);
+                INSERT INTO meta(key, value, updated_at) VALUES('schema_version', '1', 'old');
+                CREATE TABLE claim_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT NOT NULL,
+                    event_date TEXT NOT NULL,
+                    manager_id TEXT NOT NULL,
+                    manager_name TEXT NOT NULL DEFAULT '',
+                    deal_id TEXT NOT NULL,
+                    deal_title TEXT NOT NULL DEFAULT '',
+                    payload_json TEXT NOT NULL,
+                    source TEXT NOT NULL DEFAULT 'app',
+                    operation_key TEXT UNIQUE,
+                    created_at TEXT NOT NULL
+                );
+                INSERT INTO claim_events(
+                    timestamp,event_date,manager_id,manager_name,deal_id,deal_title,
+                    payload_json,source,operation_key,created_at
+                ) VALUES(
+                    '2026-08-16T23:59:00+06:00','2026-08-16','42','Manager','900','Deal',
+                    '{"extraClaimRequestId":"req-historical"}',
+                    'app','claim:900','2026-08-16T23:59:00+06:00'
+                );
+                """
+            )
+        return db_path
+
+    def test_v1_claims_get_stable_uuid_and_exactly_one_backfill_outbox_item(self):
+        self.create_v1_database()
+        first = self.make_store()
+        claim = first.list_claims()[0]
+        outbox = [item for item in first.list_outbox() if item["kind"] == "claim_event"]
+
+        self.assertEqual(first.readiness_check()["schemaVersion"], 2)
+        self.assertRegex(
+            claim["eventUuid"],
+            r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+        )
+        self.assertEqual(len(outbox), 1)
+        self.assertEqual(outbox[0]["payload"]["eventUuid"], claim["eventUuid"])
+        self.assertEqual(
+            outbox[0]["payload"]["extraClaimRequestId"], "req-historical"
+        )
+        self.assertTrue(outbox[0]["payload"]["recovered"])
+
+        reopened = self.make_store()
+        self.assertEqual(reopened.list_claims()[0]["eventUuid"], claim["eventUuid"])
+        self.assertEqual(
+            len([item for item in reopened.list_outbox() if item["kind"] == "claim_event"]),
+            1,
+        )
+
+    def test_interrupted_v1_backfill_rolls_back_version_and_retries_cleanly(self):
+        db_path = self.create_v1_database()
+        with patch.object(
+            StateStore,
+            "_enqueue_claim_export_in_connection",
+            side_effect=RuntimeError("simulated interruption"),
+        ):
+            broken = self.make_store()
+        self.assertFalse(broken.readiness_check()["ok"])
+        with sqlite3.connect(db_path) as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT value FROM meta WHERE key='schema_version'"
+                ).fetchone()[0],
+                "1",
+            )
+
+        recovered = self.make_store()
+        self.assertTrue(recovered.readiness_check()["ok"])
+        self.assertEqual(recovered.readiness_check()["schemaVersion"], 2)
+        self.assertEqual(len(recovered.list_outbox()), 1)
+
+
+class TestExtraClaimRequestsAndGrants(StateStoreTestCase):
+    def approve_one(self, store, *, manager="42", date="2026-08-17", request_id="req-1"):
+        request = store.create_extra_claim_request(
+            manager,
+            date,
+            "Нужна ещё одна срочная заявка",
+            taken_today_snapshot=4,
+            daily_limit_snapshot=4,
+        )
+        store.apply_extra_claim_request_response(
+            request["requestKey"],
+            {"id": request_id, "status": "pending"},
+        )
+        return store.import_extra_claim_state(
+            manager,
+            date,
+            {
+                "request": {"id": request_id, "status": "approved"},
+                "grants": [
+                    {
+                        "id": request_id,
+                        "requestId": request_id,
+                        "status": "approved",
+                        "businessDate": date,
+                    }
+                ],
+            },
+        )
+
+    def test_double_click_returns_one_request_but_rejection_allows_a_new_uuid(self):
+        store = self.make_store()
+        first = store.create_extra_claim_request(
+            "42",
+            "2026-08-17",
+            "Клиент ждёт срочное предложение",
+            taken_today_snapshot=4,
+            daily_limit_snapshot=4,
+        )
+        repeated = store.create_extra_claim_request(
+            "42",
+            "2026-08-17",
+            "Другой текст повторного клика",
+            taken_today_snapshot=4,
+            daily_limit_snapshot=4,
+        )
+        self.assertTrue(first["created"])
+        self.assertFalse(repeated["created"])
+        self.assertEqual(first["requestKey"], repeated["requestKey"])
+        self.assertEqual(len([i for i in store.list_outbox() if i["kind"] == "extra_claim_request"]), 1)
+
+        store.reject_extra_claim_request_locally(first["requestKey"], "Не подтверждено")
+        later = store.create_extra_claim_request(
+            "42",
+            "2026-08-17",
+            "Появилась новая подтверждённая причина",
+            taken_today_snapshot=4,
+            daily_limit_snapshot=4,
+        )
+        self.assertNotEqual(first["requestKey"], later["requestKey"])
+
+    def test_decision_note_is_preserved_for_rejected_status(self):
+        store = self.make_store()
+        request = store.create_extra_claim_request(
+            "42",
+            "2026-08-17",
+            "Нужна дополнительная заявка сегодня",
+            taken_today_snapshot=3,
+            daily_limit_snapshot=3,
+        )
+        state = store.import_extra_claim_state(
+            "42",
+            "2026-08-17",
+            {
+                "request": {
+                    "requestKey": request["requestKey"],
+                    "id": "req-rejected",
+                    "status": "rejected",
+                    "decisionNote": "Сначала обработайте текущие заявки",
+                },
+                "grants": [],
+            },
+        )
+        self.assertEqual(state["request"]["status"], "rejected")
+        self.assertEqual(
+            state["request"]["rejectionReason"],
+            "Сначала обработайте текущие заявки",
+        )
+
+    def test_one_grant_cannot_be_reserved_by_two_claims(self):
+        store = self.make_store()
+        self.approve_one(store)
+        first = store.begin_claim_operation(
+            "100",
+            "42",
+            operation_key="claim:first",
+            require_extra_grant=True,
+            business_date="2026-08-17",
+        )
+        self.assertEqual(first["extraClaimGrantId"], "req-1")
+        with self.assertRaises(ExtraClaimGrantUnavailableError):
+            store.begin_claim_operation(
+                "101",
+                "42",
+                operation_key="claim:second",
+                require_extra_grant=True,
+                business_date="2026-08-17",
+            )
+        self.assertIsNone(store.get_claim_operation("claim:second"))
+
+    def test_grant_is_scoped_to_its_bishkek_business_date_at_midnight(self):
+        store = self.make_store()
+        self.approve_one(store, date="2026-08-17")
+        self.assertTrue(store.get_extra_claim_state("42", "2026-08-17")["grantAvailable"])
+        self.assertFalse(store.get_extra_claim_state("42", "2026-08-18")["grantAvailable"])
+        with self.assertRaises(ExtraClaimGrantUnavailableError):
+            store.begin_claim_operation(
+                "100",
+                "42",
+                operation_key="claim:after-midnight",
+                require_extra_grant=True,
+                business_date="2026-08-18",
+            )
+
+    def test_expired_grant_is_not_claimable_and_allows_a_new_request(self):
+        store = self.make_store()
+        request = store.create_extra_claim_request(
+            "42",
+            "2026-08-17",
+            "Нужна ещё одна срочная заявка",
+            taken_today_snapshot=4,
+            daily_limit_snapshot=4,
+        )
+        expired = store.import_extra_claim_state(
+            "42",
+            "2026-08-17",
+            {
+                "request": {"id": "req-expired", "status": "approved"},
+                "grants": [
+                    {
+                        "id": "req-expired",
+                        "requestId": "req-expired",
+                        "status": "approved",
+                        "businessDate": "2026-08-17",
+                        "expiresAt": "2000-01-01T00:00:00Z",
+                    }
+                ],
+            },
+        )
+        self.assertFalse(expired["grantAvailable"])
+        self.assertEqual(expired["request"]["status"], "expired")
+
+        replacement = store.create_extra_claim_request(
+            "42",
+            "2026-08-17",
+            "Причина повторного запроса после истечения",
+            taken_today_snapshot=4,
+            daily_limit_snapshot=4,
+        )
+        self.assertTrue(replacement["created"])
+        self.assertNotEqual(request["requestKey"], replacement["requestKey"])
+
+    def test_authoritative_empty_grants_revokes_approved_but_not_reserved_grant(self):
+        store = self.make_store()
+        self.approve_one(store)
+        revoked = store.import_extra_claim_state(
+            "42",
+            "2026-08-17",
+            {
+                "request": {"id": "req-1", "status": "expired"},
+                "grants": [],
+            },
+        )
+        self.assertEqual(revoked["request"]["status"], "expired")
+        self.assertFalse(revoked["grantAvailable"])
+        with self.assertRaises(ExtraClaimGrantUnavailableError):
+            store.begin_claim_operation(
+                "100",
+                "42",
+                operation_key="claim:revoked",
+                require_extra_grant=True,
+                business_date="2026-08-17",
+            )
+
+        self.approve_one(store, request_id="req-held")
+        store.begin_claim_operation(
+            "101",
+            "42",
+            operation_key="claim:held-authoritative",
+            require_extra_grant=True,
+            business_date="2026-08-17",
+        )
+        held = store.import_extra_claim_state(
+            "42",
+            "2026-08-17",
+            {
+                "request": {"id": "req-held", "status": "expired"},
+                "grants": [],
+            },
+        )
+        self.assertFalse(held["grantAvailable"])
+        self.assertTrue(
+            store.get_extra_claim_state(
+                "42", "2026-08-17", operation_key="claim:held-authoritative"
+            )["grantAvailable"]
+        )
+
+    def test_definite_failure_releases_but_uncertainty_holds_the_grant(self):
+        store = self.make_store()
+        self.approve_one(store)
+        store.begin_claim_operation(
+            "100", "42", operation_key="claim:definite",
+            require_extra_grant=True, business_date="2026-08-17",
+        )
+        store.fail_claim_operation(
+            "claim:definite", "stage changed", result={"remoteUpdated": False}
+        )
+        self.assertTrue(store.get_extra_claim_state("42", "2026-08-17")["grantAvailable"])
+
+        store.begin_claim_operation(
+            "101", "42", operation_key="claim:uncertain",
+            require_extra_grant=True, business_date="2026-08-17",
+        )
+        store.fail_claim_operation(
+            "claim:uncertain", "timeout", result={"remoteUpdateUncertain": True}
+        )
+        self.assertFalse(store.get_extra_claim_state("42", "2026-08-17")["grantAvailable"])
+        self.assertTrue(
+            store.get_extra_claim_state(
+                "42", "2026-08-17", operation_key="claim:uncertain"
+            )["grantAvailable"]
+        )
+
+    def test_uncertainty_held_grant_blocks_reassignment_without_orphaning_it(self):
+        store = self.make_store()
+        self.approve_one(store)
+        store.begin_claim_operation(
+            "100",
+            "42",
+            operation_key="claim:held",
+            require_extra_grant=True,
+            business_date="2026-08-17",
+        )
+        store.fail_claim_operation(
+            "claim:held", "timeout", result={"remoteUpdateUncertain": True}
+        )
+
+        with self.assertRaises(ExtraClaimGrantReconciliationRequiredError):
+            store.reassign_failed_claim_operation(
+                "100", "43", operation_key="claim:held"
+            )
+
+        operation = store.get_claim_operation("claim:held")
+        self.assertEqual(operation["status"], "failed")
+        self.assertEqual(operation["managerId"], "42")
+        self.assertEqual(operation["extraClaimGrantId"], "req-1")
+        self.assertTrue(
+            store.get_extra_claim_state(
+                "42", "2026-08-17", operation_key="claim:held"
+            )["grantAvailable"]
+        )
+
+    def test_finalize_consumes_grant_and_claim_export_contains_request_id(self):
+        store = self.make_store()
+        self.approve_one(store, request_id="req-final")
+        store.begin_claim_operation(
+            "100", "42", operation_key="claim:final",
+            require_extra_grant=True, business_date="2026-08-17",
+        )
+        finalized = store.finalize_claim_operation(
+            "claim:final",
+            claim={"timestamp": "2026-08-17T23:59:59+06:00"},
+            app_version="test-version",
+        )
+        self.assertEqual(finalized["status"], "succeeded")
+        self.assertFalse(store.get_extra_claim_state("42", "2026-08-17")["grantAvailable"])
+        claim = store.list_claims()[0]
+        self.assertEqual(claim["extraClaimRequestId"], "req-final")
+        event = [item for item in store.list_outbox() if item["kind"] == "claim_event"][0]
+        self.assertEqual(event["payload"]["extraClaimRequestId"], "req-final")
+        self.assertEqual(event["payload"]["businessDate"], "2026-08-17")
+
+    def test_claim_export_uses_canonical_milliseconds_without_losing_local_precision(self):
+        store = self.make_store()
+        store.append_claim(
+            {
+                "timestamp": "2026-08-17T23:59:59.123456+06:00",
+                "managerId": "42",
+                "dealId": "100",
+            }
+        )
+
+        claim = store.list_claims()[0]
+        event = [
+            item for item in store.list_outbox() if item["kind"] == "claim_event"
+        ][0]
+        self.assertEqual(
+            claim["timestamp"], "2026-08-17T23:59:59.123456+06:00"
+        )
+        self.assertEqual(
+            event["payload"]["occurredAt"],
+            "2026-08-17T23:59:59.123+06:00",
+        )
+
+    def test_outbox_failure_backoff_is_persistent_and_delivery_is_idempotent(self):
+        store = self.make_store()
+        request = store.create_extra_claim_request(
+            "42", "2026-08-17", "Нужна ещё одна заявка срочно",
+            taken_today_snapshot=4, daily_limit_snapshot=4,
+        )
+        item = store.list_due_outbox(limit=1)[0]
+        failed = store.mark_outbox_failed(item["id"], "timeout", base_delay_seconds=7)
+        self.assertEqual(failed["attemptCount"], 1)
+        self.assertGreater(failed["nextAttemptAt"], failed["updatedAt"])
+        self.assertEqual(store.list_due_outbox(limit=1), [])
+        delivered = store.mark_outbox_delivered(item["id"], {"ok": True})
+        repeated = store.mark_outbox_delivered(item["id"], {"ok": False})
+        self.assertIsNotNone(delivered["deliveredAt"])
+        self.assertEqual(repeated["response"], {"ok": True})
+        self.assertEqual(request["requestKey"], item["payload"]["requestKey"])
+
+    def test_new_request_is_delivered_before_older_claim_backlog(self):
+        store = self.make_store()
+        for index in range(5):
+            store.append_claim(
+                {
+                    "timestamp": "2026-08-17T09:00:00+06:00",
+                    "managerId": "42",
+                    "dealId": str(100 + index),
+                }
+            )
+        request = store.create_extra_claim_request(
+            "42",
+            "2026-08-17",
+            "Клиент ждёт срочный ответ по туру",
+            taken_today_snapshot=5,
+            daily_limit_snapshot=5,
+        )
+        due = store.list_due_outbox(limit=1)
+        self.assertEqual(due[0]["kind"], "extra_claim_request")
+        self.assertEqual(due[0]["payload"]["requestKey"], request["requestKey"])
 
 
 if __name__ == "__main__":
