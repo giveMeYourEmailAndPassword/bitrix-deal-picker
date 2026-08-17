@@ -1,13 +1,42 @@
+# Keep Railway's uploaded source context aligned with .dockerignore while
+# retaining Dockerfile, entrypoint.sh, app.py, state_store.py and managers.json.
 .git
 .github
-__pycache__
-*.pyc
-.venv
-venv/
+.vscode
+.idea
 .DS_Store
 
-# Локальные секреты — не пушим в Railway
+README.md
+test*.py
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
 .env
-.env.bitrix
-.env.vibecode
+.env.*
 !.env.example
+
+*.sqlite3
+*.sqlite3-journal
+*.sqlite3-shm
+*.sqlite3-wal
+*.sqlite
+*.sqlite-journal
+*.sqlite-shm
+*.sqlite-wal
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+access_rules.json
+claim_log.json
+reject_log.json
+greeting_log.json
+
+*.bak
+*.backup
+*.tar
+*.tar.gz
+work/

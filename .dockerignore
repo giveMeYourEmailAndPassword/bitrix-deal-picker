@@ -1,35 +1,47 @@
-# Docker
-Dockerfile
-.dockerignore
-railway.json
-README.md
-LICENSE
-
-# VCS
+# VCS, CI and editor metadata
 .git
-.gitignore
 .github
+.gitignore
+.railwayignore
+.vscode
+.idea
+.DS_Store
 
-# Локальные секреты — никогда в образ
+# Documentation and local tests are not needed in the runtime image
+README.md
+test*.py
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Secrets: allow only the documented, non-secret template
 .env
 .env.*
 !.env.example
 
-# Python
-__pycache__
-*.pyc
-*.pyo
-.pytest_cache
-.venv
-venv/
-
-# Runtime-логи живут в Volume, не в образе.
-# seed-managers.json нужен в образе как стартовый набор.
+# Persistent state belongs on APP_DATA_DIR, never in an image layer
+*.sqlite3
+*.sqlite3-journal
+*.sqlite3-shm
+*.sqlite3-wal
+*.sqlite
+*.sqlite-journal
+*.sqlite-shm
+*.sqlite-wal
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
 access_rules.json
 claim_log.json
 reject_log.json
 greeting_log.json
 
-# OS
-.DS_Store
-Thumbs.db
+# Local reports and backups
+*.bak
+*.backup
+*.tar
+*.tar.gz
+work/

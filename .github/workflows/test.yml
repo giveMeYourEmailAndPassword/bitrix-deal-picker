@@ -1,0 +1,118 @@
+name: Test
+
+on:
+  pull_request:
+  push:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12.13"
+
+      - name: Run unit tests
+        run: python -m unittest discover -s . -p 'test*.py' -v
+
+      - name: Compile runtime modules
+        run: python -m py_compile app.py state_store.py
+
+      - name: Validate committed JSON
+        run: |
+          python -m json.tool railway.json >/dev/null
+          python -m json.tool managers.json >/dev/null
+
+      - name: Keep manager seed anonymized
+        run: >-
+          python -c 'import json, pathlib;
+          data=json.loads(pathlib.Path("managers.json").read_text());
+          expected=[{"id":"REPLACE_WITH_BITRIX_USER_ID","name":"Example manager","competencies":["Example destination"],"active":False}];
+          assert data == expected, "managers.json must remain the disabled placeholder; configure production skills only in Bitrix UF_SKILLS"'
+
+      - name: Validate POSIX shell entrypoint
+        run: |
+          sh -n entrypoint.sh
+          sh -n .env.example
+
+      - name: Build image and smoke-test Railway Volume bootstrap
+        run: |
+          set -euo pipefail
+          volume="bitrix-picker-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          container=""
+          cleanup() {
+            if [ -n "$container" ]; then
+              docker rm -f "$container" >/dev/null 2>&1 || true
+            fi
+            docker volume rm -f "$volume" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          runtime_env=(
+            --env BITRIX_WEBHOOK_BASE=https://test-fake.bitrix24.test/rest/1/not-a-secret/
+            --env BITRIX_ALLOWED_DOMAINS=test-fake.bitrix24.test
+            --env PUBLIC_APP_URL=https://picker.example.test
+            --env APP_ALLOWED_ORIGINS=https://test-fake.bitrix24.test
+            --env ADMIN_USER_IDS=1
+            --env REQUIRE_LEGACY_MIGRATION=0
+            --env REQUIRE_EXPLICIT_ACCESS_RULE=1
+            --env DRY_RUN=1
+            --env GREETING_AUTO_SEND=0
+            --env RAILWAY_PROJECT_ID=ci-project
+            --env RAILWAY_VOLUME_NAME=ci-volume
+            --env RAILWAY_VOLUME_MOUNT_PATH=/data
+          )
+
+          docker volume create "$volume" >/dev/null
+          docker build --tag bitrix-picker:test .
+          docker run --rm --user 0 --volume "$volume:/data" \
+            --entrypoint /bin/sh bitrix-picker:test \
+            -c 'cp /app/seed-managers.json /data/managers.json && chown root:root /data /data/managers.json && chmod 0700 /data && chmod 0600 /data/managers.json'
+          container="$(docker run --detach --user 0 --volume "$volume:/data" \
+            --publish 127.0.0.1::3000 "${runtime_env[@]}" bitrix-picker:test)"
+          published="$(docker port "$container" 3000/tcp)"
+          host_port="${published##*:}"
+
+          ready=0
+          for _ in {1..30}; do
+            if curl --fail --silent "http://127.0.0.1:${host_port}/api/ready" >/dev/null; then
+              ready=1
+              break
+            fi
+            if [ "$(docker inspect --format '{{.State.Running}}' "$container")" != "true" ]; then
+              docker logs "$container"
+              exit 1
+            fi
+            sleep 1
+          done
+          if [ "$ready" -ne 1 ]; then
+            docker logs "$container"
+            exit 1
+          fi
+
+          curl --fail --silent --show-error "http://127.0.0.1:${host_port}/api/ready" \
+            | python -c 'import json, sys; state=json.load(sys.stdin); assert state["ok"], state'
+          docker exec "$container" python -c 'status=dict(line.split(":", 1) for line in open("/proc/1/status") if line.startswith(("Uid:", "Gid:"))); ids=(status["Uid"].split()[0], status["Gid"].split()[0]); assert ids == ("10001", "10001"), ids'
+          docker exec "$container" python -c 'import pathlib, stat; paths=[pathlib.Path("/data/managers.json"), pathlib.Path("/data/state.sqlite3")]; assert all(p.is_file() and not p.is_symlink() and p.stat().st_uid == 10001 and p.stat().st_gid == 10001 and stat.S_IMODE(p.stat().st_mode) == 0o640 for p in paths), [(str(p), oct(stat.S_IMODE(p.stat().st_mode)), p.stat().st_uid, p.stat().st_gid) for p in paths]'
+
+          docker stop --time 5 "$container" >/dev/null
+          docker rm "$container" >/dev/null
+          container=""
+          docker run --rm --volume "$volume:/data" "${runtime_env[@]}" \
+            bitrix-picker:test \
+            python -c 'import os, app; assert os.getuid() == 10001; state=app.readiness_state(force=True); assert state["ok"], state'

@@ -1,14 +1,8 @@
 [
   {
-    "id": "41",
-    "name": "Икрам Керимбердыев",
-    "competencies": ["Турция", "Анталья", "Египет", "ОАЭ", "Визы", "семейный отдых"],
-    "active": true
-  },
-  {
-    "id": "PASTE_MANAGER_ID",
-    "name": "Менеджер 2",
-    "competencies": ["Египет", "ОАЭ", "премиум"],
-    "active": true
+    "id": "REPLACE_WITH_BITRIX_USER_ID",
+    "name": "Example manager",
+    "competencies": ["Example destination"],
+    "active": false
   }
 ]

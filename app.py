@@ -1,32 +1,151 @@
 #!/usr/bin/env python3
 import concurrent.futures
+import base64
+import hashlib
+import hmac
 import html
+import ipaddress
 import json
+import math
 import os
 import re
+import secrets
 import sys
 import threading
 import time
 import urllib.parse
 import urllib.error
 import urllib.request
+from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from state_store import IdempotencyConflictError, StateStore
+
+
+INVALID_ENV_VALUES = set()
+
+
+def env_bool(name, default=False):
+    raw = os.environ.get(name)
+    if raw is None:
+        return bool(default)
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    INVALID_ENV_VALUES.add(name)
+    return bool(default)
+
+
+def env_int(name, default, minimum=None, maximum=None):
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        INVALID_ENV_VALUES.add(name)
+        value = int(default)
+    if minimum is not None:
+        if value < minimum:
+            INVALID_ENV_VALUES.add(name)
+            value = minimum
+    if maximum is not None:
+        if value > maximum:
+            INVALID_ENV_VALUES.add(name)
+            value = maximum
+    return value
+
+
+def env_float(name, default, minimum=None, maximum=None):
+    try:
+        value = float(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        INVALID_ENV_VALUES.add(name)
+        value = float(default)
+    if not math.isfinite(value):
+        INVALID_ENV_VALUES.add(name)
+        value = float(default)
+    if minimum is not None:
+        if value < minimum:
+            INVALID_ENV_VALUES.add(name)
+            value = minimum
+    if maximum is not None:
+        if value > maximum:
+            INVALID_ENV_VALUES.add(name)
+            value = maximum
+    return value
+
+
+def safe_urlparse(value):
+    """Parse an untrusted URL without letting malformed IPv6 crash callers."""
+
+    try:
+        parsed = urllib.parse.urlparse(str(value or "").strip())
+        # These properties are lazily validated by urllib.  Touching them here
+        # keeps every caller on the same fail-closed parsing boundary.
+        parsed.hostname
+        parsed.port
+        parsed.username
+        parsed.password
+        return parsed
+    except (TypeError, ValueError):
+        return None
+
+
+def url_origin(value):
+    parsed = safe_urlparse(value)
+    try:
+        if (
+            parsed is None
+            or parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username
+            or parsed.password
+            or parsed.query
+            or parsed.fragment
+        ):
+            return ""
+        return f"{parsed.scheme}://{parsed.netloc}".rstrip("/")
+    except (TypeError, ValueError):
+        return ""
+
+
+def is_loopback_http_url(value):
+    parsed = safe_urlparse(value)
+    try:
+        return bool(
+            parsed is not None
+            and parsed.scheme == "http"
+            and parsed.hostname in {"127.0.0.1", "localhost", "::1"}
+            and is_local_runtime()
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+def normalize_allowed_hostname(value):
+    value = str(value or "").strip().lower().rstrip(".")
+    if not value or "*" in value or len(value) > 253:
+        return ""
+    if not re.fullmatch(r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", value):
+        return ""
+    return value
+
 
 APP_DIR = Path(os.environ.get("APP_DATA_DIR") or Path(__file__).resolve().parent)
-ROOT = Path(__file__).resolve().parents[1]
-ENV_FILE = ROOT / ".env.bitrix"
 MANAGERS_FILE = APP_DIR / "managers.json"
-ACCESS_RULES_FILE = APP_DIR / "access_rules.json"
-CLAIM_LOG_FILE = APP_DIR / "claim_log.json"
-REJECT_LOG_FILE = APP_DIR / "reject_log.json"
-GREETING_LOG_FILE = APP_DIR / "greeting_log.json"
 DATA_LOCK = threading.Lock()
+GREETING_LOCK = threading.Lock()
 DEAL_ANALYSIS_CACHE_LOCK = threading.Lock()
-LOCAL_TZ = timezone(timedelta(hours=int(os.environ.get("APP_TZ_OFFSET_HOURS", "6"))))
-APP_VERSION = "2026-07-23-batched-deal-search"
+DEAL_HEADERS_CACHE_LOCK = threading.Lock()
+LOCAL_TZ = timezone(timedelta(hours=env_int("APP_TZ_OFFSET_HOURS", 6, -12, 14)))
+STATE_STORE = StateStore(APP_DIR, local_timezone=LOCAL_TZ, auto_initialize=False)
+APP_VERSION = "2026-08-17-security-reliability-hardening"
+# Bump whenever classifier, eligibility, source-completeness or oldest-first
+# routing semantics change. Pre-deploy tokens must not authorize post-deploy
+# decisions under a different routing policy.
+ROUTING_POLICY_VERSION = "2026-08-17-routing-v2"
 
 SOURCE_STAGES = {
     "UC_ZJ55BR": "Необработанные ЛИДЫ",
@@ -34,29 +153,88 @@ SOURCE_STAGES = {
 }
 TARGET_STAGE = "NEW"
 TARGET_STAGE_NAME = "В РАБОТЕ"
-OPENLINE_HISTORY_CACHE = {}
 DEAL_ANALYSIS_CACHE = {}
+DEAL_HEADERS_CACHE = {}
 PORTAL_USERS_CACHE = {}
-CRM_CLAIM_COUNTS_CACHE = {}
-CRM_CLAIM_COUNTS_CACHE_LOCK = threading.Lock()
-PORTAL_USERS_CACHE_TTL_SECONDS = float(os.environ.get("PORTAL_USERS_CACHE_TTL_SECONDS", "300"))
-DRY_RUN = os.environ.get("DRY_RUN", "1").lower() not in {"0", "false", "no"}
-PUBLIC_APP_URL = os.environ.get("PUBLIC_APP_URL", "https://app-7ecf09c67021.vibecode.bitrix24.tech").rstrip("/")
+PORTAL_USERS_CACHE_TTL_SECONDS = env_float("PORTAL_USERS_CACHE_TTL_SECONDS", 300, 5, 3600)
+CACHE_MAX_ENTRIES = env_int("CACHE_MAX_ENTRIES", 500, 50, 5000)
+DRY_RUN = env_bool("DRY_RUN", True)
+PUBLIC_APP_URL = os.environ.get("PUBLIC_APP_URL", "").strip().rstrip("/")
 ADMIN_USER_IDS = {
     item.strip()
-    for item in os.environ.get("ADMIN_USER_IDS", "41").split(",")
+    for item in os.environ.get("ADMIN_USER_IDS", "").split(",")
     if item.strip()
 }
-ALLOW_UNVERIFIED_USERS = os.environ.get("ALLOW_UNVERIFIED_USERS", "0").lower() in {"1", "true", "yes"}
-GREETING_AUTO_SEND = os.environ.get("GREETING_AUTO_SEND", "0").lower() in {"1", "true", "yes"}
-NEXT_DEAL_SCAN_LIMIT = int(os.environ.get("NEXT_DEAL_SCAN_LIMIT", "8"))
-NEXT_DEAL_SCAN_WORKERS = int(os.environ.get("NEXT_DEAL_SCAN_WORKERS", str(NEXT_DEAL_SCAN_LIMIT)))
-NEXT_DEAL_BATCH_TIMEOUT_SECONDS = float(os.environ.get("NEXT_DEAL_BATCH_TIMEOUT_SECONDS", "12"))
-DEAL_ANALYSIS_CACHE_TTL_SECONDS = float(os.environ.get("DEAL_ANALYSIS_CACHE_TTL_SECONDS", "300"))
-BITRIX_TIMEOUT_SECONDS = float(os.environ.get("BITRIX_TIMEOUT_SECONDS", "12"))
-BITRIX_FAST_TIMEOUT_SECONDS = float(os.environ.get("BITRIX_FAST_TIMEOUT_SECONDS", "5"))
+ALLOW_UNVERIFIED_USERS = env_bool("ALLOW_UNVERIFIED_USERS", False)
+GREETING_AUTO_SEND = env_bool("GREETING_AUTO_SEND", False)
+# Automatic OpenLine delivery stays deliberately unavailable until Bitrix can
+# prove that the selected chat is still bound to this exact deal. Preparing a
+# text for manual review remains supported.
+GREETING_AUTO_SEND_SUPPORTED = False
+NEXT_DEAL_SCAN_LIMIT = env_int("NEXT_DEAL_SCAN_LIMIT", 12, 1, 50)
+NEXT_DEAL_SCAN_WORKERS = env_int("NEXT_DEAL_SCAN_WORKERS", NEXT_DEAL_SCAN_LIMIT, 1, 32)
+NEXT_DEAL_BATCH_TIMEOUT_SECONDS = env_float("NEXT_DEAL_BATCH_TIMEOUT_SECONDS", 12, 1, 60)
+DEAL_ANALYSIS_CACHE_TTL_SECONDS = env_float("DEAL_ANALYSIS_CACHE_TTL_SECONDS", 300, 5, 3600)
+DEAL_HEADERS_CACHE_TTL_SECONDS = env_float("DEAL_HEADERS_CACHE_TTL_SECONDS", 10, 1, 60)
+BITRIX_TIMEOUT_SECONDS = env_float("BITRIX_TIMEOUT_SECONDS", 12, 1, 60)
+BITRIX_FAST_TIMEOUT_SECONDS = env_float("BITRIX_FAST_TIMEOUT_SECONDS", 5, 1, 30)
+MAX_BITRIX_RESPONSE_BYTES = env_int(
+    "MAX_BITRIX_RESPONSE_BYTES", 5 * 1024 * 1024, 64 * 1024, 20 * 1024 * 1024
+)
 LIMIT_FREE_WINDOW_START = os.environ.get("LIMIT_FREE_WINDOW_START", "18:00")
 LIMIT_FREE_WINDOW_END = os.environ.get("LIMIT_FREE_WINDOW_END", "21:30")
+MAX_DEALS_PER_STAGE = env_int("MAX_DEALS_PER_STAGE", 1000, 50, 5000)
+# Both Bitrix list methods used to assemble one deal's routing context return
+# at most 50 rows per page.  Read enough pages to prove that a source is empty,
+# but fail closed instead of silently truncating an unusually large history.
+MAX_SOURCE_RECORDS_PER_DEAL = 500
+MAX_OPENLINE_MESSAGES_PER_SESSION = 500
+MAX_REQUEST_BODY_BYTES = env_int("MAX_REQUEST_BODY_BYTES", 262144, 4096, 1048576)
+RATE_LIMIT_REQUESTS = env_int("RATE_LIMIT_REQUESTS", 120, 10, 1000)
+RATE_LIMIT_WINDOW_SECONDS = env_int("RATE_LIMIT_WINDOW_SECONDS", 60, 10, 3600)
+MAX_CONCURRENT_REQUESTS = env_int("MAX_CONCURRENT_REQUESTS", 64, 4, 512)
+MAX_CONCURRENT_SEARCHES = env_int("MAX_CONCURRENT_SEARCHES", 4, 1, 16)
+SOCKET_TIMEOUT_SECONDS = env_float("SOCKET_TIMEOUT_SECONDS", 15, 3, 60)
+READINESS_CACHE_TTL_SECONDS = env_float("READINESS_CACHE_TTL_SECONDS", 5, 1, 60)
+RAW_BITRIX_ALLOWED_DOMAINS = {
+    item.strip()
+    for item in os.environ.get("BITRIX_ALLOWED_DOMAINS", "").split(",")
+    if item.strip()
+}
+ALLOWED_BITRIX_DOMAINS = {
+    normalize_allowed_hostname(item)
+    for item in RAW_BITRIX_ALLOWED_DOMAINS
+    if normalize_allowed_hostname(item)
+}
+RAW_APP_ALLOWED_ORIGINS = {
+    item.strip().rstrip("/")
+    for item in os.environ.get("APP_ALLOWED_ORIGINS", "").split(",")
+    if item.strip()
+}
+APP_ALLOWED_ORIGINS = {url_origin(item) for item in RAW_APP_ALLOWED_ORIGINS if url_origin(item)}
+if url_origin(PUBLIC_APP_URL):
+    APP_ALLOWED_ORIGINS.add(url_origin(PUBLIC_APP_URL))
+CLAIM_STATS_SOURCE = os.environ.get("CLAIM_STATS_SOURCE", "app_events").strip().lower()
+REQUIRE_LEGACY_MIGRATION = env_bool("REQUIRE_LEGACY_MIGRATION", True)
+REQUIRE_EXPLICIT_ACCESS_RULE = env_bool("REQUIRE_EXPLICIT_ACCESS_RULE", True)
+RATE_LIMIT_LOCK = threading.Lock()
+RATE_LIMIT_BUCKETS = defaultdict(deque)
+USER_VERIFY_CACHE = {}
+USER_VERIFY_CACHE_LOCK = threading.Lock()
+SEARCH_SEMAPHORE = threading.BoundedSemaphore(MAX_CONCURRENT_SEARCHES)
+READINESS_CACHE_LOCK = threading.Lock()
+READINESS_CACHE = {"checkedAt": 0.0, "state": None}
+USER_VERIFY_CACHE_TTL_SECONDS = env_float("USER_VERIFY_CACHE_TTL_SECONDS", 60, 5, 300)
+SELECTION_TOKEN_TTL_SECONDS = env_int("SELECTION_TOKEN_TTL_SECONDS", 1800, 60, 86400)
+SEARCH_CURSOR_TTL_SECONDS = env_int("SEARCH_CURSOR_TTL_SECONDS", 120, 30, 900)
+BITRIX_CLAIM_MARKER_FIELD = os.environ.get("BITRIX_CLAIM_MARKER_FIELD", "").strip().upper()
+CLAIM_OPERATION_PENDING_TTL_SECONDS = env_int(
+    "CLAIM_OPERATION_PENDING_TTL_SECONDS", 300, 180, 3600
+)
+CLAIM_RECONCILE_INTERVAL_SECONDS = env_float(
+    "CLAIM_RECONCILE_INTERVAL_SECONDS", 60, 30, 3600
+)
+CLAIM_RECONCILE_BATCH_SIZE = env_int("CLAIM_RECONCILE_BATCH_SIZE", 100, 1, 1000)
 
 REJECT_REASONS = {
     "not_my_country": "Не моя страна",
@@ -144,42 +322,406 @@ DESTINATION_KEYWORDS = {
 
 
 def load_env():
-    if ENV_FILE.exists():
-        for line in ENV_FILE.read_text(encoding="utf-8").splitlines():
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, value = line.split("=", 1)
-            os.environ.setdefault(key.strip(), value.strip())
     base = os.environ.get("BITRIX_WEBHOOK_BASE")
     if not base:
-        raise RuntimeError("Не найден BITRIX_WEBHOOK_BASE в work/.env.bitrix")
+        raise RuntimeError("Не задан BITRIX_WEBHOOK_BASE")
+    parsed = safe_urlparse(base)
+    try:
+        valid = bool(
+            parsed is not None
+            and parsed.scheme == "https"
+            and normalize_allowed_hostname(parsed.hostname)
+            and not parsed.username
+            and not parsed.password
+            and re.fullmatch(r"/rest/[^/]+/[^/]+/?", parsed.path or "")
+            and not parsed.query
+            and not parsed.fragment
+        )
+    except (TypeError, ValueError):
+        valid = False
+    if not valid:
+        raise RuntimeError("BITRIX_WEBHOOK_BASE должен быть корректным HTTPS URL Bitrix24")
     return base.rstrip("/") + "/"
 
 
+def configured_bitrix_domains():
+    domains = set(ALLOWED_BITRIX_DOMAINS)
+    try:
+        base = load_env()
+    except RuntimeError:
+        base = ""
+    parsed = safe_urlparse(base)
+    try:
+        hostname = parsed.hostname if parsed is not None else ""
+    except (TypeError, ValueError):
+        hostname = ""
+    normalized = normalize_allowed_hostname(hostname)
+    if normalized:
+        domains.add(normalized)
+    return domains
+
+
+def webhook_bitrix_domain():
+    try:
+        base = load_env()
+    except RuntimeError:
+        return ""
+    parsed = safe_urlparse(base)
+    try:
+        return normalize_allowed_hostname(parsed.hostname if parsed is not None else "")
+    except (TypeError, ValueError):
+        return ""
+
+
+def normalize_bitrix_domain(value):
+    raw = str(value or "").strip()
+    if not raw:
+        raise PermissionError("Не указан домен Bitrix24")
+    parsed = safe_urlparse(raw if "://" in raw else f"https://{raw}")
+    try:
+        hostname = normalize_allowed_hostname(parsed.hostname if parsed is not None else "")
+        valid = bool(
+            parsed is not None
+            and parsed.scheme == "https"
+            and hostname
+            and not parsed.username
+            and not parsed.password
+            and parsed.path in {"", "/"}
+            and not parsed.query
+            and not parsed.fragment
+        )
+    except (TypeError, ValueError):
+        hostname = ""
+        valid = False
+    if not valid:
+        raise PermissionError("Некорректный домен Bitrix24")
+    if not webhook_bitrix_domain() or hostname != webhook_bitrix_domain():
+        raise PermissionError("OAuth относится не к тому порталу Bitrix24")
+    return hostname
+
+
+def is_local_runtime():
+    host = os.environ.get("HOST", "127.0.0.1").strip().lower()
+    return host in {"127.0.0.1", "localhost", "::1"}
+
+
+def is_railway_runtime():
+    # Use only documented Railway-provided identifiers.  Relying on an
+    # unofficial variable would collapse every proxied user into one rate-limit
+    # bucket and would also weaken the persistent-Volume readiness gate.
+    return bool(
+        os.environ.get("RAILWAY_PROJECT_ID")
+        or os.environ.get("RAILWAY_DEPLOYMENT_ID")
+        or os.environ.get("RAILWAY_ENVIRONMENT_ID")
+    )
+
+
+def is_unverified_dev_mode():
+    return ALLOW_UNVERIFIED_USERS and DRY_RUN and is_local_runtime()
+
+
+def json_for_script(value):
+    return (
+        json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        .replace("&", "\\u0026")
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+    )
+
+
+def bounded_cache_put(cache, key, value, maximum=CACHE_MAX_ENTRIES):
+    cache[key] = value
+    while len(cache) > maximum:
+        oldest_key = next(iter(cache))
+        cache.pop(oldest_key, None)
+
+
+def rate_limit_allowed(key):
+    now = time.monotonic()
+    cutoff = now - RATE_LIMIT_WINDOW_SECONDS
+    with RATE_LIMIT_LOCK:
+        bucket = RATE_LIMIT_BUCKETS[str(key)]
+        while bucket and bucket[0] <= cutoff:
+            bucket.popleft()
+        if len(bucket) >= RATE_LIMIT_REQUESTS:
+            return False
+        bucket.append(now)
+        if len(RATE_LIMIT_BUCKETS) > CACHE_MAX_ENTRIES:
+            excess = len(RATE_LIMIT_BUCKETS) - CACHE_MAX_ENTRIES
+            for old_key in [item for item in RATE_LIMIT_BUCKETS if item != str(key)][:excess]:
+                RATE_LIMIT_BUCKETS.pop(old_key, None)
+        return True
+
+
+def normalize_entity_id(value):
+    value = str(value or "").strip()
+    if not re.fullmatch(r"[1-9]\d{0,19}", value):
+        return ""
+    return value
+
+
+def claim_marker_field_valid():
+    return bool(
+        re.fullmatch(r"UF_CRM_[A-Z0-9_]{3,64}", BITRIX_CLAIM_MARKER_FIELD)
+        and "REPLACE" not in BITRIX_CLAIM_MARKER_FIELD
+    )
+
+
+def selection_signing_key():
+    # The inbound webhook URL already contains a high-entropy secret.  Deriving
+    # a purpose-specific key avoids another deployment secret and never exposes
+    # the webhook itself to the browser.
+    return hashlib.sha256(
+        (
+            "deal-picker-selection\0"
+            + ROUTING_POLICY_VERSION
+            + "\0"
+            + load_env()
+        ).encode("utf-8")
+    ).digest()
+
+
+def deal_version(deal):
+    deal = deal or {}
+    modified = str(
+        deal.get("DATE_MODIFY")
+        or deal.get("dateModify")
+        or deal.get("DATE_CREATE")
+        or deal.get("dateCreate")
+        or ""
+    ).strip()
+    last_activity = str(
+        deal.get("LAST_ACTIVITY_TIME")
+        or deal.get("lastActivityTime")
+        or ""
+    ).strip()
+    if not last_activity:
+        return modified
+    # A new timeline/chat activity can change routing without changing the
+    # ordinary deal fields.  Keep that activity in the signed lifecycle while
+    # returning a fixed-size, token-safe version string.
+    material = json.dumps(
+        {"modified": modified, "lastActivity": last_activity},
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return "v2:" + hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def _issue_signed_token(payload):
+    encoded = base64.urlsafe_b64encode(
+        json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    ).decode("ascii").rstrip("=")
+    signature = hmac.new(selection_signing_key(), encoded.encode("ascii"), hashlib.sha256).hexdigest()
+    return f"{encoded}.{signature}"
+
+
+def _decode_signed_token(token):
+    token = str(token or "")
+    if not token or len(token) > 2048 or token.count(".") != 1:
+        return None
+    encoded, signature = token.split(".", 1)
+    try:
+        encoded_bytes = encoded.encode("ascii")
+    except UnicodeEncodeError:
+        return None
+    expected = hmac.new(selection_signing_key(), encoded_bytes, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(signature, expected):
+        return None
+    try:
+        padding = "=" * (-len(encoded) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(encoded + padding).decode("utf-8"))
+    except (ValueError, TypeError, UnicodeError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def issue_selection_token(deal_id, manager_id, version, policy_hash, now=None):
+    deal_id = normalize_entity_id(deal_id)
+    manager_id = normalize_entity_id(manager_id)
+    version = str(version or "").strip()
+    policy_hash = str(policy_hash or "")
+    if (
+        not deal_id
+        or not manager_id
+        or not version
+        or len(version) > 256
+        or not re.fullmatch(r"[0-9a-f]{64}", policy_hash)
+    ):
+        raise ValueError("Некорректный ID сделки, менеджера, версия или политика доступа")
+    expires_at = int(now if now is not None else time.time()) + SELECTION_TOKEN_TTL_SECONDS
+    return _issue_signed_token(
+        {
+            "kind": "selection",
+            "deal": deal_id,
+            "manager": manager_id,
+            "version": version,
+            "policy": policy_hash,
+            "routing": ROUTING_POLICY_VERSION,
+            "expires": expires_at,
+        }
+    )
+
+
+def decode_selection_token(token, deal_id, manager_id, now=None):
+    payload = _decode_signed_token(token)
+    try:
+        expires_at = int((payload or {}).get("expires"))
+    except (ValueError, TypeError):
+        return None
+    current_time = int(now if now is not None else time.time())
+    valid = (
+        payload.get("kind") == "selection"
+        and normalize_entity_id(payload.get("deal")) == normalize_entity_id(deal_id)
+        and normalize_entity_id(payload.get("manager")) == normalize_entity_id(manager_id)
+        and bool(str(payload.get("version") or "").strip())
+        and len(str(payload.get("version") or "")) <= 256
+        and bool(re.fullmatch(r"[0-9a-f]{64}", str(payload.get("policy") or "")))
+        and payload.get("routing") == ROUTING_POLICY_VERSION
+        and current_time <= expires_at <= current_time + SELECTION_TOKEN_TTL_SECONDS
+    )
+    return payload if valid else None
+
+
+def verify_selection_token(token, deal_id, manager_id, now=None):
+    return decode_selection_token(token, deal_id, manager_id, now=now) is not None
+
+
+def claim_operation_key(deal_id, version):
+    digest = hashlib.sha256(f"{normalize_entity_id(deal_id)}\0{version}".encode("utf-8")).hexdigest()[:24]
+    return f"claim:{normalize_entity_id(deal_id)}:{digest}"
+
+
+def claim_attempt_marker(operation_key, manager_id, nonce=None):
+    nonce = str(nonce or secrets.token_hex(12))
+    return f"{operation_key}:{normalize_entity_id(manager_id)}:{nonce}"
+
+
+def rejection_semantic_key(manager_id, deal_id, version):
+    return hashlib.sha256(
+        f"reject\0{normalize_entity_id(manager_id)}\0{normalize_entity_id(deal_id)}\0{version}".encode("utf-8")
+    ).hexdigest()
+
+
+def manager_policy_hash(manager=None, rule=None):
+    policy = {
+        "competencies": sorted(
+            {str(item or "").strip().casefold() for item in (manager or {}).get("competencies", []) if str(item or "").strip()}
+        ),
+        "active": (manager or {}).get("active") is True,
+        "intranet": (manager or {}).get("intranet") is True,
+        "rule": {
+            "enabled": (rule or {}).get("enabled") is not False,
+            "dailyLimit": (rule or {}).get("dailyLimit"),
+        },
+    }
+    material = json.dumps(policy, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def search_snapshot(headers, manager=None, rule=None):
+    material = ROUTING_POLICY_VERSION + "\n" + manager_policy_hash(manager, rule) + "\n"
+    material += "\n".join(
+        f"{normalize_entity_id(item.get('ID'))}:{deal_version(item)}" for item in headers
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def issue_search_cursor(manager_id, offset, snapshot, now=None):
+    manager_id = normalize_entity_id(manager_id)
+    offset = int(offset)
+    if not manager_id or offset < 0 or not re.fullmatch(r"[0-9a-f]{64}", str(snapshot or "")):
+        raise ValueError("Некорректное продолжение поиска")
+    current_time = int(now if now is not None else time.time())
+    return _issue_signed_token(
+        {
+            "kind": "search",
+            "manager": manager_id,
+            "offset": offset,
+            "snapshot": snapshot,
+            "routing": ROUTING_POLICY_VERSION,
+            "expires": current_time + SEARCH_CURSOR_TTL_SECONDS,
+        }
+    )
+
+
+def decode_search_cursor(token, manager_id, snapshot, now=None):
+    if not token:
+        return 0
+    payload = _decode_signed_token(token)
+    try:
+        expires_at = int((payload or {}).get("expires"))
+        offset = int((payload or {}).get("offset"))
+    except (TypeError, ValueError):
+        return None
+    current_time = int(now if now is not None else time.time())
+    if (
+        payload.get("kind") != "search"
+        or normalize_entity_id(payload.get("manager")) != normalize_entity_id(manager_id)
+        or payload.get("snapshot") != snapshot
+        or payload.get("routing") != ROUTING_POLICY_VERSION
+        or offset < 0
+        or not (current_time <= expires_at <= current_time + SEARCH_CURSOR_TTL_SECONDS)
+    ):
+        return None
+    return offset
+
+
 def portal_base_url():
-    parsed = urllib.parse.urlparse(load_env())
+    parsed = safe_urlparse(load_env())
+    if parsed is None:
+        raise RuntimeError("BITRIX_WEBHOOK_BASE должен быть корректным HTTPS URL Bitrix24")
     return f"{parsed.scheme}://{parsed.netloc}"
 
 
 def load_managers():
     if not MANAGERS_FILE.exists():
         return []
-    return json.loads(MANAGERS_FILE.read_text(encoding="utf-8"))
-
-
-def read_json_file(path, default):
-    if not path.exists():
-        return default
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return default
-
-
-def write_json_file(path, payload):
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp_path.replace(path)
+    payload = json.loads(MANAGERS_FILE.read_text(encoding="utf-8"))
+    if not isinstance(payload, list) or len(payload) > 5000:
+        raise ValueError("managers.json должен содержать ограниченный список")
+    validated = []
+    for item in payload:
+        if not isinstance(item, dict):
+            raise ValueError("Каждый элемент managers.json должен быть объектом")
+        manager_id = str(item.get("id") or "").strip()
+        name = item.get("name")
+        competencies = item.get("competencies", [])
+        active = item.get("active", False)
+        if not manager_id or len(manager_id) > 100:
+            raise ValueError("В managers.json указан некорректный id")
+        if not isinstance(name, str) or not name.strip() or len(name) > 200:
+            raise ValueError("В managers.json указано некорректное имя")
+        if (
+            not isinstance(competencies, list)
+            or len(competencies) > 100
+            or any(
+                not isinstance(value, str)
+                or not value.strip()
+                or len(value) > 100
+                for value in competencies
+            )
+        ):
+            raise ValueError("В managers.json указан некорректный список компетенций")
+        if not isinstance(active, bool):
+            raise ValueError("В managers.json поле active должно быть boolean")
+        # The committed disabled placeholder is intentionally non-numeric;
+        # any enabled local development manager must use a real Bitrix ID.
+        if active and not normalize_entity_id(manager_id):
+            raise ValueError("Активный manager id должен быть числовым Bitrix ID")
+        validated.append(
+            {
+                **item,
+                "id": manager_id,
+                "name": name.strip(),
+                "competencies": [value.strip() for value in competencies],
+                "active": active,
+            }
+        )
+    return validated
 
 
 def local_now():
@@ -221,8 +763,8 @@ def entry_date(entry):
     raw = str(entry.get("timestamp") or "")
     try:
         parsed = datetime.fromisoformat(raw)
-    except ValueError:
-        return raw[:10]
+    except (TypeError, ValueError):
+        return ""
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(LOCAL_TZ).date().isoformat()
@@ -230,90 +772,119 @@ def entry_date(entry):
 
 def normalize_date(value, fallback):
     value = str(value or "").strip()
-    if re.match(r"^\d{4}-\d{2}-\d{2}$", value):
-        return value
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").date().isoformat()
+    except (TypeError, ValueError):
+        pass
     return fallback
 
 
 def load_access_rules():
-    data = read_json_file(ACCESS_RULES_FILE, {"managers": {}})
-    data.setdefault("managers", {})
-    return data
-
-
-def save_access_rules(data):
-    data.setdefault("managers", {})
-    write_json_file(ACCESS_RULES_FILE, data)
+    return {"managers": STATE_STORE.list_rules()}
 
 
 def get_manager_rule(manager_id):
-    rules = load_access_rules().get("managers", {})
-    rule = rules.get(str(manager_id), {})
-    return {
-        "enabled": rule.get("enabled", True) is not False,
-        "dailyLimit": rule.get("dailyLimit"),
-        "note": str(rule.get("note") or ""),
-    }
+    return STATE_STORE.get_rule(manager_id)
 
 
 def set_manager_rule(manager_id, enabled=True, daily_limit=None, note=""):
-    data = load_access_rules()
-    if daily_limit in ("", None):
-        daily_limit = None
-    else:
-        try:
-            daily_limit = max(0, int(daily_limit))
-        except (TypeError, ValueError):
-            daily_limit = None
-    data["managers"][str(manager_id)] = {
-        "enabled": bool(enabled),
-        "dailyLimit": daily_limit,
-        "note": str(note or ""),
-    }
-    save_access_rules(data)
-    return get_manager_rule(manager_id)
+    return STATE_STORE.set_rule(
+        manager_id,
+        enabled=enabled,
+        daily_limit=daily_limit,
+        note=note,
+    )
 
 
 def load_claim_log():
-    return read_json_file(CLAIM_LOG_FILE, [])
+    return STATE_STORE.list_claims()
 
 
-def append_claim_log(manager_id, deal):
-    log = load_claim_log()
-    manager = get_manager_profile(manager_id) or {"name": str(manager_id)}
-    entry = {
-        "timestamp": local_now().isoformat(),
+def claim_log_entry(manager_id, deal, timestamp=None):
+    if timestamp is None:
+        timestamp = local_now().isoformat()
+    elif isinstance(timestamp, datetime):
+        timestamp = timestamp.isoformat()
+    return {
+        "timestamp": str(timestamp),
         "managerId": str(manager_id),
-        "managerName": manager.get("name") or str(manager_id),
         "dealId": str(deal.get("ID") or deal.get("id") or ""),
-        "dealTitle": deal.get("TITLE") or deal.get("title") or "",
     }
-    log.append(entry)
-    write_json_file(CLAIM_LOG_FILE, log[-5000:])
-    return entry
+
+
+def claim_operation_attempt_timestamp(operation):
+    """Return the best pre-recovery time for an operation's current attempt.
+
+    New operations persist ``request.attemptStartedAt`` on every real
+    begin/retry/reassign.  Legacy rows need a conservative fallback:
+    ``updatedAt`` is the reservation time while pending; for the first failed
+    attempt ``createdAt`` is the original reservation; after older retries,
+    ``finalizedAt`` is the closest attempt-specific time still available.
+    """
+
+    operation = operation if isinstance(operation, dict) else {}
+    request = operation.get("request")
+    request = request if isinstance(request, dict) else {}
+    history = operation.get("attemptHistory")
+    history = history if isinstance(history, list) else []
+    status = str(operation.get("status") or "")
+    if status == "pending":
+        candidates = (
+            request.get("attemptStartedAt"),
+            operation.get("updatedAt"),
+            operation.get("createdAt"),
+        )
+    elif status == "failed" and not history:
+        candidates = (
+            request.get("attemptStartedAt"),
+            operation.get("createdAt"),
+            operation.get("finalizedAt"),
+            operation.get("updatedAt"),
+        )
+    else:
+        candidates = (
+            request.get("attemptStartedAt"),
+            operation.get("finalizedAt"),
+            operation.get("updatedAt"),
+            operation.get("createdAt"),
+        )
+    for candidate in candidates:
+        raw = str(candidate or "").strip()
+        if not raw:
+            continue
+        try:
+            datetime.fromisoformat(raw[:-1] + "+00:00" if raw.endswith("Z") else raw)
+        except ValueError:
+            continue
+        return raw
+    return None
+
+
+def append_claim_log(manager_id, deal, operation_key=None):
+    return STATE_STORE.append_claim(
+        claim_log_entry(manager_id, deal),
+        operation_key=operation_key,
+    )
 
 
 def load_reject_log():
-    return read_json_file(REJECT_LOG_FILE, [])
+    return STATE_STORE.list_rejections()
 
 
 def load_greeting_log():
-    return read_json_file(GREETING_LOG_FILE, [])
+    return STATE_STORE.list_greetings()
 
 
 def append_greeting_log(entry):
-    log = load_greeting_log()
-    log.append(entry)
-    write_json_file(GREETING_LOG_FILE, log[-5000:])
-    return entry
+    return STATE_STORE.append_greeting(entry)
 
 
 def latest_greeting_for_deal(deal_id):
-    deal_id = str(deal_id or "")
-    for entry in reversed(load_greeting_log()):
-        if str(entry.get("dealId")) == deal_id and entry.get("status") in {"manual", "sent"}:
-            return entry
-    return None
+    return STATE_STORE.latest_greeting_by_deal(deal_id)
+
+
+def latest_greeting_for_operation(operation_key):
+    return STATE_STORE.latest_greeting_by_operation(operation_key)
 
 
 def normalize_reject_reason(reason):
@@ -322,7 +893,6 @@ def normalize_reject_reason(reason):
 
 
 def append_reject_log(manager_id, deal, reason="other"):
-    log = load_reject_log()
     manager = get_manager_profile(manager_id) or {"name": str(manager_id)}
     reason = normalize_reject_reason(reason)
     entry = {
@@ -336,13 +906,11 @@ def append_reject_log(manager_id, deal, reason="other"):
         "reason": reason,
         "reasonLabel": REJECT_REASONS[reason],
     }
-    log.append(entry)
-    write_json_file(REJECT_LOG_FILE, log[-5000:])
-    return entry
+    return STATE_STORE.append_reject(entry)
 
 
 def count_claims(manager_id, date_from=None, date_to=None):
-    return count_claims_in_log(load_claim_log(), manager_id, date_from, date_to)
+    return STATE_STORE.count_claims(manager_id, date_from, date_to)
 
 
 def count_claims_in_log(log, manager_id, date_from=None, date_to=None):
@@ -356,46 +924,6 @@ def count_claims_in_log(log, manager_id, date_from=None, date_to=None):
         if date_from <= claim_date <= date_to:
             total += 1
     return total
-
-
-def crm_claim_counts(date_from, date_to):
-    """Количество сделок в стадии «В работе», изменённых за период,
-    сгруппированных по ответственному менеджеру. Источник — Битрикс24 CRM,
-    поэтому учитываются заявки, взятые как через приложение, так и напрямую в CRM."""
-    cache_key = f"{date_from}|{date_to}"
-    now = time.monotonic()
-    with CRM_CLAIM_COUNTS_CACHE_LOCK:
-        cached = CRM_CLAIM_COUNTS_CACHE.get(cache_key)
-        if cached and now - cached["ts"] < 30:
-            return cached["data"]
-    counts = {}
-    start = 0
-    while start <= 450:
-        try:
-            page = bitrix_call(
-                "crm.deal.list",
-                {
-                    "filter[STAGE_ID]": TARGET_STAGE,
-                    "filter[>=DATE_MODIFY]": f"{date_from} 00:00:00",
-                    "filter[<=DATE_MODIFY]": f"{date_to} 23:59:59",
-                    "select[]": ["ID", "ASSIGNED_BY_ID"],
-                    "start": start,
-                },
-                BITRIX_TIMEOUT_SECONDS,
-            ) or []
-        except Exception as exc:
-            sys.stderr.write(f"crm_claim_counts error: {exc}\n")
-            break
-        for deal in page:
-            mid = str(deal.get("ASSIGNED_BY_ID") or "")
-            if mid and mid != "0":
-                counts[mid] = counts.get(mid, 0) + 1
-        if len(page) < 50:
-            break
-        start += 50
-    with CRM_CLAIM_COUNTS_CACHE_LOCK:
-        CRM_CLAIM_COUNTS_CACHE[cache_key] = {"ts": now, "data": counts}
-    return counts
 
 
 def count_rejections_in_log(log, manager_id, date_from=None, date_to=None):
@@ -429,10 +957,38 @@ def rejection_reason_summary(log, manager_id, date_from=None, date_to=None):
     return f"{REJECT_REASONS[reason]} ({count})"
 
 
-def check_manager_access(manager_id):
+def check_manager_access(manager_id, allow_operation_key=None):
+    configured_rules = STATE_STORE.list_rules()
+    if (
+        REQUIRE_EXPLICIT_ACCESS_RULE
+        and not is_unverified_dev_mode()
+        and str(manager_id) not in configured_rules
+    ):
+        return {
+            "ok": False,
+            "rule": {"enabled": False, "dailyLimit": None, "note": ""},
+            "reason": "Администратор ещё не открыл вам доступ к выдаче заявок.",
+        }
     rule = get_manager_rule(manager_id)
     if not rule["enabled"]:
         return {"ok": False, "rule": rule, "reason": "Для вас временно закрыт доступ к получению заявок."}
+    unresolved_operations = STATE_STORE.list_unresolved_claim_operations(manager_id)
+    if allow_operation_key:
+        unresolved_operations = [
+            operation
+            for operation in unresolved_operations
+            if operation.get("operationKey") != str(allow_operation_key)
+        ]
+    if unresolved_operations:
+        return {
+            "ok": False,
+            "rule": rule,
+            "recoveryPending": True,
+            "reason": (
+                "Предыдущая выдача ещё сверяется с Bitrix24. "
+                "Новая заявка станет доступна после безопасной сверки."
+            ),
+        }
     if rule["dailyLimit"] is not None:
         if is_limit_bypassed_now():
             return {"ok": True, "rule": rule, "limitBypassed": True}
@@ -458,6 +1014,24 @@ def parse_competencies(value):
     return [item.strip() for item in items if item.strip()]
 
 
+def bitrix_boolean(value, default=False):
+    if isinstance(value, bool):
+        return value
+    normalized = str(value or "").strip().upper()
+    if normalized in {"Y", "YES", "TRUE", "1"}:
+        return True
+    if normalized in {"N", "NO", "FALSE", "0", ""}:
+        return False
+    return bool(default)
+
+
+def is_intranet_user(user):
+    departments = user.get("UF_DEPARTMENT") if isinstance(user, dict) else None
+    if isinstance(departments, (list, tuple, set)):
+        return any(str(item or "").strip() not in {"", "0"} for item in departments)
+    return str(departments or "").strip() not in {"", "0"}
+
+
 def get_manager_profile(manager_id):
     manager_id = str(manager_id or "").strip()
     if not manager_id:
@@ -474,26 +1048,76 @@ def get_manager_profile(manager_id):
             "id": manager_id,
             "name": local.get("name") or manager_id,
             "competencies": local.get("competencies") or [],
-            "active": True,
+            "active": local.get("active", False) is True,
+            "intranet": is_unverified_dev_mode(),
             "source": "local_fallback",
         }
-    return {"id": manager_id, "name": manager_id, "competencies": [], "active": True, "source": "unavailable"}
+    return {"id": manager_id, "name": manager_id, "competencies": [], "active": False, "source": "unavailable"}
 
 
 def manager_profile_from_user(user, manager_id=None):
     manager_id = str(user.get("ID") or manager_id or "")
     competencies = parse_competencies(user.get("UF_SKILLS"))
-    # Fallback to older local config while testing accounts whose profile field is empty.
+    # A production profile is authoritative: clearing UF_SKILLS must revoke
+    # routing immediately.  The legacy local fallback is available only in the
+    # explicitly isolated localhost + DRY_RUN development mode.
     local = next((item for item in load_managers() if str(item.get("id")) == manager_id), None)
-    if not competencies and local:
+    used_local_fallback = bool(
+        not competencies
+        and local
+        and local.get("active", False) is True
+        and is_unverified_dev_mode()
+    )
+    if used_local_fallback:
         competencies = local.get("competencies", [])
     return {
         "id": manager_id,
         "name": " ".join(part for part in [user.get("NAME"), user.get("LAST_NAME")] if part).strip() or manager_id,
         "competencies": competencies,
-        "active": user.get("ACTIVE", "Y") != "N",
-        "source": "UF_SKILLS" if competencies else "empty",
+        "active": bitrix_boolean(user.get("ACTIVE"), default=False),
+        "intranet": is_intranet_user(user),
+        "source": (
+            "local_dev_fallback"
+            if used_local_fallback
+            else "UF_SKILLS"
+            if competencies
+            else "empty"
+        ),
     }
+
+
+def read_limited_bitrix_json(response):
+    """Decode one bounded JSON object without echoing an upstream body."""
+
+    headers = getattr(response, "headers", None)
+    raw_length = headers.get("Content-Length") if headers is not None else None
+    if raw_length not in (None, ""):
+        try:
+            content_length = int(raw_length)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("Bitrix вернул некорректный размер ответа") from exc
+        if content_length < 0 or content_length > MAX_BITRIX_RESPONSE_BYTES:
+            raise RuntimeError("Ответ Bitrix превышает безопасный размер")
+    body = response.read(MAX_BITRIX_RESPONSE_BYTES + 1)
+    if len(body) > MAX_BITRIX_RESPONSE_BYTES:
+        raise RuntimeError("Ответ Bitrix превышает безопасный размер")
+    try:
+        payload = json.loads(body)
+    except (TypeError, ValueError, UnicodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("Bitrix вернул некорректный JSON") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("Bitrix вернул неожиданный формат ответа")
+    return payload
+
+
+def raise_bitrix_http_error(exc):
+    try:
+        payload = read_limited_bitrix_json(exc)
+    except RuntimeError:
+        raise RuntimeError(f"Bitrix HTTP {exc.code}") from exc
+    error_code = str(payload.get("error") or "").strip()
+    suffix = f": {error_code}" if error_code else ""
+    raise RuntimeError(f"Bitrix HTTP {exc.code}{suffix}") from exc
 
 
 def bitrix_call(method, params=None, timeout=None):
@@ -509,17 +1133,45 @@ def bitrix_call_full(method, params=None, timeout=None):
         data = urllib.parse.urlencode(params, doseq=True).encode("utf-8")
     try:
         with urllib.request.urlopen(url, data=data, timeout=timeout or BITRIX_TIMEOUT_SECONDS) as response:
-            payload = json.load(response)
+            payload = read_limited_bitrix_json(response)
     except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", "replace")
-        try:
-            payload = json.loads(body)
-        except Exception:
-            raise RuntimeError(f"HTTP {exc.code}: {body[:500]}") from exc
-        raise RuntimeError(f"{payload.get('error')}: {payload.get('error_description')}") from exc
+        raise_bitrix_http_error(exc)
     if "error" in payload:
-        raise RuntimeError(f"{payload.get('error')}: {payload.get('error_description')}")
+        raise RuntimeError(f"Bitrix API error: {payload.get('error') or 'unknown'}")
     return payload
+
+
+def bitrix_list_all(method, params=None, max_items=1000, timeout=None):
+    items = []
+    next_start = 0
+    seen_starts = set()
+    deadline = time.monotonic() + float(timeout) if timeout is not None else None
+    while len(items) < max(0, int(max_items)):
+        if next_start in seen_starts:
+            raise RuntimeError(f"Bitrix вернул повторяющийся курсор для {method}")
+        seen_starts.add(next_start)
+        page_params = dict(params or {})
+        page_params["start"] = next_start
+        page_timeout = None
+        if deadline is not None:
+            page_timeout = deadline - time.monotonic()
+            if page_timeout <= 0:
+                raise TimeoutError(f"Истёк общий таймаут списка Bitrix для {method}")
+        payload = bitrix_call_full(method, page_params, timeout=page_timeout)
+        if deadline is not None and time.monotonic() > deadline:
+            raise TimeoutError(f"Истёк общий таймаут списка Bitrix для {method}")
+        page = payload.get("result") or []
+        if not isinstance(page, list):
+            raise RuntimeError(f"Bitrix вернул неожиданный формат списка для {method}")
+        remaining = max_items - len(items)
+        items.extend(page[:remaining])
+        if len(items) >= max_items or payload.get("next") is None:
+            break
+        try:
+            next_start = int(payload.get("next"))
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(f"Bitrix вернул некорректный курсор для {method}") from exc
+    return items
 
 
 def bitrix_batch(commands):
@@ -550,60 +1202,67 @@ def get_manager_profiles_bulk(users):
 
 
 def bitrix_oauth_call(domain, token, method, params=None, timeout=None):
-    domain = str(domain or "").replace("https://", "").replace("http://", "").strip("/")
-    if not domain or not token:
+    if not token:
         raise RuntimeError("Нет авторизации Битрикса")
+    domain = normalize_bitrix_domain(domain)
     url = f"https://{domain}/rest/{method}.json"
     payload = dict(params or {})
     payload["auth"] = token
     data = urllib.parse.urlencode(payload, doseq=True).encode("utf-8")
     try:
         with urllib.request.urlopen(url, data=data, timeout=timeout or BITRIX_TIMEOUT_SECONDS) as response:
-            result = json.load(response)
+            result = read_limited_bitrix_json(response)
     except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", "replace")
-        try:
-            result = json.loads(body)
-        except Exception:
-            raise RuntimeError(f"HTTP {exc.code}: {body[:500]}") from exc
-        raise RuntimeError(f"{result.get('error')}: {result.get('error_description')}") from exc
+        raise_bitrix_http_error(exc)
     if "error" in result:
-        raise RuntimeError(f"{result.get('error')}: {result.get('error_description')}")
+        raise RuntimeError(f"Bitrix API error: {result.get('error') or 'unknown'}")
     return result.get("result")
 
 
 def bitrix_call_for_actor(auth, method, params=None):
-    if isinstance(auth, dict):
-        token = auth.get("access_token") or auth.get("AUTH_ID") or auth.get("auth")
-        domain = auth.get("domain") or auth.get("DOMAIN")
-        if not domain and auth.get("client_endpoint"):
-            domain = urllib.parse.urlparse(auth.get("client_endpoint")).netloc
-        if token and domain:
-            try:
-                return bitrix_oauth_call(domain, token, method, params)
-            except Exception:
-                return bitrix_call(method, params)
-    return bitrix_call(method, params)
+    token, domain = extract_auth_credentials(auth)
+    if not token or not domain:
+        raise PermissionError("Нет подтверждённой пользовательской авторизации Bitrix24")
+    return bitrix_oauth_call(domain, token, method, params)
+
+
+def extract_auth_credentials(auth):
+    if not isinstance(auth, dict):
+        return None, None
+    token = auth.get("access_token") or auth.get("AUTH_ID") or auth.get("auth")
+    domain = auth.get("domain") or auth.get("DOMAIN")
+    if not domain and auth.get("client_endpoint"):
+        parsed = safe_urlparse(auth.get("client_endpoint"))
+        try:
+            domain = parsed.hostname if parsed is not None else None
+        except (TypeError, ValueError):
+            domain = None
+    if not token or not domain:
+        return None, None
+    try:
+        domain = normalize_bitrix_domain(domain)
+    except PermissionError:
+        return None, None
+    return str(token), domain
 
 
 def has_bitrix_auth(payload):
     auth = payload.get("auth") if isinstance(payload, dict) else None
-    if not isinstance(auth, dict):
-        return False
-    token = auth.get("access_token") or auth.get("AUTH_ID") or auth.get("auth")
-    domain = auth.get("domain") or auth.get("DOMAIN") or auth.get("client_endpoint")
+    token, domain = extract_auth_credentials(auth)
     return bool(token and domain)
 
 
-def verify_bitrix_user(auth):
-    if not isinstance(auth, dict):
-        return None
-    token = auth.get("access_token") or auth.get("AUTH_ID") or auth.get("auth")
-    domain = auth.get("domain") or auth.get("DOMAIN")
-    if not domain and auth.get("client_endpoint"):
-        domain = urllib.parse.urlparse(auth.get("client_endpoint")).netloc
+def verify_bitrix_user(auth, allow_cached=True):
+    token, domain = extract_auth_credentials(auth)
     if not token or not domain:
         return None
+    cache_key = hashlib.sha256(f"{domain}\0{token}".encode("utf-8")).hexdigest()
+    now = time.monotonic()
+    if allow_cached:
+        with USER_VERIFY_CACHE_LOCK:
+            cached = USER_VERIFY_CACHE.get(cache_key)
+            if cached and now - cached["cachedAt"] < USER_VERIFY_CACHE_TTL_SECONDS:
+                return dict(cached["user"])
     try:
         user = bitrix_oauth_call(domain, token, "user.current", timeout=BITRIX_FAST_TIMEOUT_SECONDS)
     except Exception:
@@ -613,37 +1272,42 @@ def verify_bitrix_user(auth):
             return None
     if not user:
         return None
-    return {
+    verified = {
         "id": str(user.get("ID") or ""),
         "name": " ".join(part for part in [user.get("NAME"), user.get("LAST_NAME")] if part).strip(),
         "raw": user,
     }
+    if not verified["id"]:
+        return None
+    with USER_VERIFY_CACHE_LOCK:
+        bounded_cache_put(USER_VERIFY_CACHE, cache_key, {"cachedAt": now, "user": verified})
+    return dict(verified)
 
 
-def actor_id_from_payload(payload):
-    user = verify_bitrix_user(payload.get("auth"))
+def actor_id_from_payload(payload, allow_cached=True):
+    user = verify_bitrix_user(payload.get("auth"), allow_cached=allow_cached)
     if user and user.get("id"):
         return user["id"]
-    current_user_id = str(payload.get("currentUserId") or "").strip()
-    if current_user_id and has_bitrix_auth(payload):
-        return current_user_id
-    if ALLOW_UNVERIFIED_USERS:
+    if is_unverified_dev_mode():
         return str(payload.get("managerId") or "")
     return None
 
 
 def require_admin(payload):
-    user = verify_bitrix_user(payload.get("auth"))
-    if user and user.get("id") in ADMIN_USER_IDS:
+    user = verify_bitrix_user(payload.get("auth"), allow_cached=False)
+    raw = (user or {}).get("raw") or {}
+    if (
+        user
+        and user.get("id") in ADMIN_USER_IDS
+        and bitrix_boolean(raw.get("ACTIVE"), default=False)
+        and is_intranet_user(raw)
+    ):
         return user
-    current_user_id = str(payload.get("currentUserId") or "").strip()
-    if current_user_id in ADMIN_USER_IDS:
-        return {"id": current_user_id, "name": "Администратор"}
     return None
 
 
 def clean_text(value):
-    value = value or ""
+    value = str(value or "")
     value = re.sub(r"<[^>]+>", " ", value)
     value = re.sub(r"\[/?[A-Z0-9_=-]+\]", " ", value, flags=re.IGNORECASE)
     value = html.unescape(value)
@@ -655,7 +1319,7 @@ def clean_text(value):
 
 
 def is_service_text(text):
-    lowered = text.lower()
+    lowered = str(text or "").lower()
     return any(re.search(pattern, lowered) for pattern in SERVICE_PATTERNS)
 
 
@@ -687,34 +1351,113 @@ def useful_fragments(text):
     return fragments
 
 
-def get_openline_history_messages(session_id):
+def parse_source_message_time(value):
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw[:-1] + "+00:00" if raw.endswith("Z") else raw)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def source_message_sort_time(value):
+    return parse_source_message_time(value) or datetime.min.replace(tzinfo=timezone.utc)
+
+
+def source_numeric_id(value):
+    raw = str(value or "").strip()
+    if not re.fullmatch(r"\d{1,20}", raw):
+        return None
+    return int(raw)
+
+
+def get_openline_history_candidates(session_id, timeout=None):
     if not session_id:
         return []
-    if session_id in OPENLINE_HISTORY_CACHE:
-        return OPENLINE_HISTORY_CACHE[session_id]
-    try:
-        history = bitrix_call(
-            "imopenlines.session.history.get",
-            {"SESSION_ID": session_id},
-            timeout=BITRIX_FAST_TIMEOUT_SECONDS,
-        ) or {}
-    except Exception:
-        return []
-    messages = list((history.get("message") or {}).values())
-    messages.sort(key=lambda item: item.get("date", ""))
-    useful = []
-    for message in messages:
+    # Do not cache only by session ID: a new OpenLine activity can change the
+    # destination while the same session remains attached to the deal.  The
+    # outer DEAL_ANALYSIS_CACHE is already scoped to the full deal lifecycle.
+    effective_timeout = (
+        min(BITRIX_FAST_TIMEOUT_SECONDS, float(timeout))
+        if timeout is not None
+        else BITRIX_FAST_TIMEOUT_SECONDS
+    )
+    if effective_timeout <= 0:
+        raise TimeoutError("Истёк таймаут истории открытой линии")
+    deadline = time.monotonic() + effective_timeout
+    history = bitrix_call(
+        "imopenlines.session.history.get",
+        {"SESSION_ID": session_id},
+        timeout=effective_timeout,
+    ) or {}
+    if time.monotonic() > deadline:
+        raise TimeoutError("Истёк таймаут истории открытой линии")
+    raw_messages = history.get("message") or {}
+    if isinstance(raw_messages, dict):
+        message_entries = list(raw_messages.items())
+    elif isinstance(raw_messages, list):
+        message_entries = list(enumerate(raw_messages))
+    else:
+        raise RuntimeError("Bitrix вернул неожиданный формат истории открытой линии")
+    if len(message_entries) > MAX_OPENLINE_MESSAGES_PER_SESSION:
+        raise RuntimeError("История открытой линии превышает безопасный лимит")
+
+    sortable_candidates = []
+    for fallback_id, message in message_entries:
+        if not isinstance(message, dict):
+            raise RuntimeError("Bitrix вернул повреждённое сообщение открытой линии")
         if str(message.get("senderid", "0")) == "0":
             continue
         text = clean_text(message.get("text") or message.get("textlegacy"))
-        for fragment in useful_fragments(text):
-            if fragment not in useful:
-                useful.append(fragment)
-            if len(useful) >= 2:
-                OPENLINE_HISTORY_CACHE[session_id] = useful
-                return useful
-    OPENLINE_HISTORY_CACHE[session_id] = useful
-    return useful
+        fragments = useful_fragments(text)
+        if not fragments:
+            continue
+        timestamp = parse_source_message_time(message.get("date"))
+        message_id = source_numeric_id(
+            message.get("id") or message.get("ID") or fallback_id
+        )
+        if timestamp is None or message_id is None:
+            raise RuntimeError("Bitrix не дал надёжный порядок сообщений открытой линии")
+        for fragment in fragments:
+            sortable_candidates.append(
+                {
+                    "source": f"openline_session:{session_id}",
+                    "timestamp": message.get("date") or "",
+                    "recordId": message_id,
+                    "text": fragment,
+                    "_sortTime": timestamp,
+                }
+            )
+    sortable_candidates.sort(
+        key=lambda item: (item["_sortTime"], item["recordId"]),
+        reverse=True,
+    )
+    if time.monotonic() > deadline:
+        raise TimeoutError("Истёк таймаут истории открытой линии")
+
+    candidates = []
+    seen = set()
+    for candidate in sortable_candidates:
+        fragment = candidate["text"]
+        if fragment in seen:
+            continue
+        seen.add(fragment)
+        candidate.pop("_sortTime", None)
+        candidates.append(candidate)
+        if len(candidates) >= 2:
+            return candidates
+    return candidates
+
+
+def get_openline_history_messages(session_id, timeout=None):
+    return [
+        candidate["text"]
+        for candidate in get_openline_history_candidates(session_id, timeout=timeout)
+    ]
 
 
 def get_openline_chat_context(session_id):
@@ -743,21 +1486,56 @@ def get_openline_chat_context(session_id):
 
 
 def get_deal_messages(deal_id):
+    deadline = time.monotonic() + NEXT_DEAL_BATCH_TIMEOUT_SECONDS
+
+    def remaining_timeout(maximum=BITRIX_FAST_TIMEOUT_SECONDS):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Истёк общий таймаут анализа сделки")
+        return min(float(maximum), remaining)
+
+    def bounded_source_list(method, params):
+        items = bitrix_list_all(
+            method,
+            params,
+            max_items=MAX_SOURCE_RECORDS_PER_DEAL + 1,
+            timeout=remaining_timeout(),
+        )
+        if len(items) > MAX_SOURCE_RECORDS_PER_DEAL:
+            raise RuntimeError(f"Bitrix source {method} exceeds the safe history bound")
+        return items
+
     raw_messages = []
-    openline_session_ids = []
+    candidates = []
+    newest_openline_session_id = None
+    source_errors = []
     try:
-        comments = bitrix_call(
+        comments = bounded_source_list(
             "crm.timeline.comment.list",
-            {"filter[ENTITY_ID]": deal_id, "filter[ENTITY_TYPE]": "deal"},
-            timeout=BITRIX_FAST_TIMEOUT_SECONDS,
+            {
+                "filter[ENTITY_ID]": deal_id,
+                "filter[ENTITY_TYPE]": "deal",
+                "select[]": ["ID", "COMMENT", "CREATED"],
+                "order[CREATED]": "DESC",
+                "order[ID]": "DESC",
+            },
         ) or []
         for item in comments:
-            raw_messages.append(("timeline", clean_text(item.get("COMMENT"))))
-    except Exception as exc:
-        raw_messages.append(("timeline_error", str(exc)))
+            text = clean_text(item.get("COMMENT"))
+            raw_messages.append(("timeline", text))
+            for fragment in useful_fragments(text):
+                candidates.append(
+                    {
+                        "source": "timeline",
+                        "timestamp": item.get("CREATED") or "",
+                        "text": fragment,
+                    }
+                )
+    except Exception:
+        source_errors.append("timeline")
 
     try:
-        activities = bitrix_call(
+        activities = bounded_source_list(
             "crm.activity.list",
             {
                 "filter[OWNER_ID]": deal_id,
@@ -772,51 +1550,124 @@ def get_deal_messages(deal_id):
                     "ASSOCIATED_ENTITY_ID",
                     "PROVIDER_PARAMS",
                 ],
+                "order[CREATED]": "DESC",
+                "order[ID]": "DESC",
             },
-            timeout=BITRIX_FAST_TIMEOUT_SECONDS,
         ) or []
+        openline_activities = [
+            item
+            for item in activities
+            if item.get("PROVIDER_ID") == "IMOPENLINES_SESSION"
+        ]
+        for item in openline_activities:
+            if (
+                not item.get("ASSOCIATED_ENTITY_ID")
+                or parse_source_message_time(item.get("CREATED")) is None
+                or source_numeric_id(item.get("ID")) is None
+            ):
+                raise RuntimeError("Bitrix не дал надёжный порядок сессий открытой линии")
+        activities.sort(
+            key=lambda item: (
+                source_message_sort_time(item.get("CREATED")),
+                source_numeric_id(item.get("ID")) or -1,
+            ),
+            reverse=True,
+        )
+        if openline_activities:
+            openline_activities.sort(
+                key=lambda item: (
+                    source_message_sort_time(item.get("CREATED")),
+                    source_numeric_id(item.get("ID")),
+                ),
+                reverse=True,
+            )
+            newest_openline_session_id = str(
+                openline_activities[0]["ASSOCIATED_ENTITY_ID"]
+            )
         for item in activities:
-            raw_messages.append(("activity", clean_text(item.get("DESCRIPTION") or item.get("SUBJECT"))))
-            if item.get("PROVIDER_ID") == "IMOPENLINES_SESSION" and item.get("ASSOCIATED_ENTITY_ID"):
-                openline_session_ids.append(item.get("ASSOCIATED_ENTITY_ID"))
-    except Exception as exc:
-        raw_messages.append(("activity_error", str(exc)))
+            text = clean_text(item.get("DESCRIPTION") or item.get("SUBJECT"))
+            raw_messages.append(("activity", text))
+            for fragment in useful_fragments(text):
+                candidates.append(
+                    {
+                        "source": "activity",
+                        "timestamp": item.get("CREATED") or "",
+                        "text": fragment,
+                    }
+                )
+    except Exception:
+        source_errors.append("activity")
 
+    if source_errors:
+        raise RuntimeError("Не удалось полностью прочитать историю сделки из Bitrix.")
+
+    # The newest live OpenLine session is authoritative. Mixing even one new
+    # customer message with an older CRM comment can make stale destination
+    # keywords outscore the customer's latest choice.
+    openline_candidates = []
+    if newest_openline_session_id:
+        openline_candidates = get_openline_history_candidates(
+            newest_openline_session_id,
+            timeout=remaining_timeout(),
+        )
+        remaining_timeout()
+
+    source_priority = {"activity": 0, "timeline": 1}
+    candidates.sort(
+        key=lambda item: (
+            source_message_sort_time(item.get("timestamp")),
+            2
+            if str(item.get("source") or "").startswith("openline_session:")
+            else source_priority.get(str(item.get("source") or ""), 0),
+        ),
+        reverse=True,
+    )
+    if openline_candidates:
+        # If the latest message already names a destination, it supersedes an
+        # older contradictory message in the same session. Otherwise keep one
+        # preceding message because it can carry the destination for a short
+        # follow-up such as "двое взрослых".
+        candidates = openline_candidates[:2]
+        if classify([candidates[0].get("text") or ""])["direction"] != "Не определено":
+            candidates = candidates[:1]
     useful = []
-    for source, text in raw_messages:
-        if source.endswith("_error"):
-            continue
-        for fragment in useful_fragments(text):
-            if fragment not in useful:
-                useful.append(fragment)
-            if len(useful) >= 2:
-                break
+    for candidate in candidates:
+        fragment = candidate.get("text") or ""
+        if fragment and fragment not in useful:
+            useful.append(fragment)
         if len(useful) >= 2:
             break
 
-    if len(useful) < 2:
-        for session_id in openline_session_ids:
-            for fragment in get_openline_history_messages(session_id):
-                if fragment not in useful:
-                    useful.append(fragment)
-                if len(useful) >= 2:
-                    break
-            if len(useful) >= 2:
-                break
-
     return {
         "useful": useful[:2],
-        "rawCount": len([item for item in raw_messages if not item[0].endswith("_error")]),
-        "sources": [f"openline_session:{item}" for item in openline_session_ids] + [item[0] for item in raw_messages],
-        "openlineSessionIds": openline_session_ids,
+        "rawCount": len(raw_messages),
+        "sources": (
+            [f"openline_session:{newest_openline_session_id}"]
+            if newest_openline_session_id
+            else []
+        ) + [item[0] for item in raw_messages],
+        "openlineSessionIds": (
+            [newest_openline_session_id] if newest_openline_session_id else []
+        ),
     }
 
 
+def keyword_matches(keyword, text):
+    keyword = str(keyword or "").strip().casefold()
+    text = str(text or "").casefold()
+    if not keyword or not text:
+        return False
+    escaped = re.escape(keyword).replace(r"\ ", r"\s+")
+    has_cyrillic = bool(re.search(r"[а-яё]", keyword))
+    suffix = r"[\w-]*" if has_cyrillic else ""
+    return bool(re.search(rf"(?<![\w]){escaped}{suffix}(?![\w])", text, flags=re.IGNORECASE))
+
+
 def classify(messages):
-    joined = " ".join(messages).lower()
+    joined = " ".join(clean_text(message) for message in (messages or [])).casefold()
     scores = {}
     for destination, keywords in DESTINATION_KEYWORDS.items():
-        score = sum(1 for keyword in keywords if keyword in joined)
+        score = sum(1 for keyword in keywords if keyword_matches(keyword, joined))
         if score:
             scores[destination] = score
     if not scores:
@@ -831,16 +1682,12 @@ def classify(messages):
 
 
 def greeting_context_from_deal(deal_id, deal_payload=None):
-    deal_payload = deal_payload if isinstance(deal_payload, dict) else {}
-    classification = deal_payload.get("classification") if isinstance(deal_payload.get("classification"), dict) else None
-    messages = deal_payload.get("messages") if isinstance(deal_payload.get("messages"), list) else None
-    openline_session_ids = deal_payload.get("openlineSessionIds") if isinstance(deal_payload.get("openlineSessionIds"), list) else []
-
-    if not classification or not openline_session_ids:
-        message_data = get_deal_messages(deal_id)
-        messages = messages or message_data["useful"]
-        openline_session_ids = openline_session_ids or message_data.get("openlineSessionIds") or []
-        classification = classification or classify(messages)
+    # Security invariant: deal messages, classification and Open Line session IDs
+    # always come from Bitrix. Browser payload is presentation-only and untrusted.
+    message_data = get_deal_messages(deal_id)
+    messages = message_data["useful"]
+    openline_session_ids = message_data.get("openlineSessionIds") or []
+    classification = classify(messages)
 
     return {
         "classification": classification or {"direction": "Не определено", "confidence": "низкая", "matched": []},
@@ -865,12 +1712,23 @@ def build_greeting_text(manager, classification):
 
 
 def send_greeting_message(deal_id, manager_id, text, context, auth=None):
-    session_ids = context.get("openlineSessionIds") or []
+    # Only the newest live session derived from the deal itself is eligible.
+    # Falling through to older chats risks messaging the wrong conversation.
+    session_ids = list(dict.fromkeys(str(item) for item in (context.get("openlineSessionIds") or [])))[:1]
     errors = []
     for session_id in session_ids:
         chat_context = get_openline_chat_context(session_id)
         if not chat_context:
             errors.append({"sessionId": str(session_id), "error": "Не удалось получить chatId открытой линии."})
+            continue
+        if str(chat_context.get("textFieldEnabled")).lower() not in {"true", "1", "y"}:
+            errors.append(
+                {
+                    "sessionId": str(session_id),
+                    "chatId": chat_context["chatId"],
+                    "error": "Поле ввода в этой сессии закрыто; автоотправка запрещена.",
+                }
+            )
             continue
         try:
             answer_result = None
@@ -912,112 +1770,128 @@ def send_greeting_message(deal_id, manager_id, text, context, auth=None):
     }
 
 
-def prepare_greeting(manager_id, deal_id, deal_payload=None, auth=None):
-    existing = latest_greeting_for_deal(deal_id)
-    if existing:
-        if GREETING_AUTO_SEND and not existing.get("autoSent"):
-            context = greeting_context_from_deal(deal_id, deal_payload)
-            if not context.get("openlineSessionIds") and existing.get("openlineSessionIds"):
-                context["openlineSessionIds"] = existing.get("openlineSessionIds") or []
-            text = existing.get("text") or build_greeting_text(get_manager_profile(manager_id), context["classification"])
-            send_result = send_greeting_message(deal_id, manager_id, text, context, auth)
-            status = "sent" if send_result.get("ok") else "manual"
-            auto_sent = bool(send_result.get("ok"))
-            entry = dict(existing)
-            entry.update(
-                {
-                    "timestamp": local_now().isoformat(),
-                    "managerId": str(manager_id),
-                    "dealId": str(deal_id),
-                    "text": text,
-                    "status": status,
-                    "autoSent": auto_sent,
-                    "message": (
-                        "Приветствие автоматически отправлено клиенту."
-                        if auto_sent
-                        else "Автоотправка не прошла. Скопируйте текст и отправьте клиенту вручную."
-                    ),
-                    "sendResult": send_result,
-                }
-            )
-            append_greeting_log(entry)
-            return {
-                "ok": True,
-                "status": status,
-                "autoSent": auto_sent,
-                "text": text,
-                "direction": entry.get("direction") or "Не определено",
-                "message": entry["message"],
-                "sendResult": send_result,
-                "log": entry,
-            }
-        return {
-            "ok": True,
-            "status": "skipped_duplicate",
-            "autoSent": existing.get("status") == "sent",
-            "text": existing.get("text") or "",
-            "message": "Приветствие для этой сделки уже было подготовлено раньше.",
-            "log": existing,
-        }
-
-    manager = get_manager_profile(manager_id) or {"id": str(manager_id), "name": str(manager_id)}
-    context = greeting_context_from_deal(deal_id, deal_payload)
-    text = build_greeting_text(manager, context["classification"])
-    send_result = None
-    status = "manual"
-    auto_sent = False
-    message = "Текст подготовлен. Автоотправка будет включена после подтверждения канала отправки."
-    if GREETING_AUTO_SEND:
-        send_result = send_greeting_message(deal_id, manager_id, text, context, auth)
-        if send_result.get("ok"):
-            status = "sent"
-            auto_sent = True
-            message = "Приветствие автоматически отправлено клиенту."
-        else:
-            status = "manual"
-            message = "Автоотправка не прошла. Скопируйте текст и отправьте клиенту вручную."
-
-    entry = {
-        "timestamp": local_now().isoformat(),
-        "managerId": str(manager_id),
-        "managerName": manager.get("name") or str(manager_id),
-        "dealId": str(deal_id),
-        "direction": context["classification"].get("direction") or "Не определено",
-        "confidence": context["classification"].get("confidence") or "",
-        "openlineSessionIds": context.get("openlineSessionIds") or [],
-        "text": text,
-        "status": status,
-        "autoSent": auto_sent,
-        "message": message,
-        "sendResult": send_result,
-    }
-    append_greeting_log(entry)
+def greeting_response(entry, *, status=None, message=None, send_result=None):
     return {
         "ok": True,
-        "status": entry["status"],
-        "autoSent": auto_sent,
-        "text": text,
-        "direction": entry["direction"],
-        "message": entry["message"],
+        "status": status or entry.get("status") or "manual",
+        "autoSent": bool(entry.get("autoSent")),
+        "text": entry.get("text") or "",
+        "direction": entry.get("direction") or "Не определено",
+        "message": message or entry.get("message") or "Текст приветствия подготовлен.",
         "sendResult": send_result,
-        "log": entry,
     }
+
+
+def prepare_greeting(manager_id, deal_id, auth=None, operation_key=None):
+    operation_key = str(operation_key or "")
+    if not operation_key:
+        raise ValueError("Для приветствия требуется ключ конкретной операции взятия")
+    # Serialize the read/reserve/send sequence in the supported one-process
+    # deployment. SQLite also has a unique per-lifecycle "sending"
+    # reservation so an accidental second process cannot start another
+    # automatic attempt or reuse another manager's text.
+    with GREETING_LOCK:
+        existing = latest_greeting_for_operation(operation_key)
+        if existing and str(existing.get("managerId") or "") != str(manager_id):
+            existing = None
+        if existing and existing.get("status") == "sending":
+            return greeting_response(
+                existing,
+                status="manual_after_uncertain_send",
+                message=(
+                    "Автоотправка уже запускалась, но её итог не подтверждён. "
+                    "Проверьте чат и при необходимости отправьте текст вручную."
+                ),
+            )
+        if existing and (
+            not GREETING_AUTO_SEND
+            or existing.get("autoSent")
+            or existing.get("autoAttempted")
+        ):
+            return greeting_response(
+                existing,
+                status="skipped_duplicate",
+                message="Приветствие для этой сделки уже было подготовлено раньше.",
+            )
+
+        manager = get_manager_profile(manager_id) or {
+            "id": str(manager_id),
+            "name": str(manager_id),
+        }
+        # Security invariant: the live server-side deal history is the only
+        # source for classification and Open Line session IDs.
+        context = greeting_context_from_deal(deal_id)
+        text = (existing or {}).get("text") or build_greeting_text(
+            manager, context["classification"]
+        )
+        base_entry = {
+            "timestamp": local_now().isoformat(),
+            "managerId": str(manager_id),
+            "dealId": str(deal_id),
+            "operationKey": operation_key,
+            "direction": context["classification"].get("direction") or "Не определено",
+            "confidence": context["classification"].get("confidence") or "",
+            "text": text,
+        }
+
+        if not GREETING_AUTO_SEND or not GREETING_AUTO_SEND_SUPPORTED:
+            entry = {
+                **base_entry,
+                "status": "manual",
+                "autoSent": False,
+                "autoAttempted": False,
+                "message": (
+                    "Текст подготовлен. Автоотправка запрещена до безопасной привязки чата к сделке."
+                    if GREETING_AUTO_SEND
+                    else "Текст подготовлен. Автоотправка пока выключена."
+                ),
+                "sendResult": None,
+            }
+            append_greeting_log(entry)
+            return greeting_response(entry)
+
+        reservation = {
+            **base_entry,
+            "status": "sending",
+            "autoSent": False,
+            "autoAttempted": True,
+            "message": "Автоотправка зарезервирована.",
+            "sendResult": None,
+        }
+        append_greeting_log(reservation)
+        send_result = send_greeting_message(deal_id, manager_id, text, context, auth)
+        auto_sent = bool(send_result.get("ok"))
+        entry = {
+            **base_entry,
+            "timestamp": local_now().isoformat(),
+            "status": "sent" if auto_sent else "manual",
+            "autoSent": auto_sent,
+            "autoAttempted": True,
+            "message": (
+                "Приветствие автоматически отправлено клиенту."
+                if auto_sent
+                else "Автоотправка не подтверждена. Проверьте чат и отправьте текст вручную."
+            ),
+            "sendResult": send_result,
+        }
+        append_greeting_log(entry)
+        return greeting_response(entry, send_result=send_result)
 
 
 def deal_score_for_manager(deal, manager):
-    competencies = [item.lower() for item in manager.get("competencies", [])]
+    competencies = [str(item).strip() for item in manager.get("competencies", []) if str(item).strip()]
     direction_name = deal["classification"]["direction"]
-    if direction_name == "Не определено":
-        return 1
     if not competencies:
         return 0
-    direction = direction_name.lower()
-    text = " ".join(deal.get("messages", [])).lower()
+    if direction_name == "Не определено":
+        return 1
+    direction = direction_name
+    text = " ".join(deal.get("messages", []))
     score = 0
     for competency in competencies:
-        if competency and competency in direction:
+        if keyword_matches(competency, direction):
             score += 4
-        if competency and competency in text:
+        if keyword_matches(competency, text):
             score += 2
     if deal["classification"]["direction"] != "Не определено" and score:
         score += 1
@@ -1025,17 +1899,31 @@ def deal_score_for_manager(deal, manager):
 
 
 def list_allowed_deal_headers():
+    now = time.monotonic()
+    with DEAL_HEADERS_CACHE_LOCK:
+        cached = DEAL_HEADERS_CACHE.get("all")
+        if cached and now - cached.get("cachedAt", 0) < DEAL_HEADERS_CACHE_TTL_SECONDS:
+            return [dict(item) for item in cached.get("headers", [])]
     pending = []
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=len(SOURCE_STAGES))
     futures = {
         executor.submit(
-            bitrix_call,
+            bitrix_list_all,
             "crm.deal.list",
             {
                 "filter[STAGE_ID]": stage_id,
-                "select[]": ["ID", "TITLE", "STAGE_ID", "ASSIGNED_BY_ID", "DATE_CREATE", "DATE_MODIFY"],
+                "select[]": [
+                    "ID",
+                    "TITLE",
+                    "STAGE_ID",
+                    "ASSIGNED_BY_ID",
+                    "DATE_CREATE",
+                    "DATE_MODIFY",
+                    "LAST_ACTIVITY_TIME",
+                ],
                 "order[DATE_CREATE]": "ASC",
             },
+            MAX_DEALS_PER_STAGE,
             BITRIX_TIMEOUT_SECONDS,
         ): (stage_id, stage_name)
         for stage_id, stage_name in SOURCE_STAGES.items()
@@ -1055,15 +1943,28 @@ def list_allowed_deal_headers():
     finally:
         for future in futures:
             future.cancel()
-        executor.shutdown(wait=False, cancel_futures=True)
+        executor.shutdown(wait=True, cancel_futures=True)
 
     pending.sort(key=lambda item: (item.get("DATE_CREATE") or "", int(item.get("ID") or 0)))
-    return pending
+    with DEAL_HEADERS_CACHE_LOCK:
+        DEAL_HEADERS_CACHE["all"] = {
+            "cachedAt": time.monotonic(),
+            "headers": [dict(item) for item in pending],
+        }
+    return [dict(item) for item in pending]
+
+
+def invalidate_deal_caches(deal_id=None):
+    with DEAL_HEADERS_CACHE_LOCK:
+        DEAL_HEADERS_CACHE.clear()
+    if deal_id is not None:
+        with DEAL_ANALYSIS_CACHE_LOCK:
+            DEAL_ANALYSIS_CACHE.pop(str(deal_id), None)
 
 
 def analyze_deal_header(deal):
     deal_id = str(deal.get("ID") or "")
-    cache_version = str(deal.get("DATE_MODIFY") or deal.get("DATE_CREATE") or "")
+    cache_version = deal_version(deal)
     now = time.monotonic()
     with DEAL_ANALYSIS_CACHE_LOCK:
         cached = DEAL_ANALYSIS_CACHE.get(deal_id)
@@ -1082,19 +1983,22 @@ def analyze_deal_header(deal):
         "stageName": deal.get("_stageName") or SOURCE_STAGES.get(deal.get("STAGE_ID"), ""),
         "assignedById": deal.get("ASSIGNED_BY_ID"),
         "dateCreate": deal.get("DATE_CREATE"),
+        "dateModify": deal.get("DATE_MODIFY"),
+        "version": cache_version,
         "messages": messages["useful"],
-        "rawMessageCount": messages["rawCount"],
-        "messageSources": messages["sources"],
-        "openlineSessionIds": messages["openlineSessionIds"],
         "dealUrl": f"{portal_base_url()}/crm/deal/details/{deal_id}/",
         "classification": classify(messages["useful"]),
     }
     with DEAL_ANALYSIS_CACHE_LOCK:
-        DEAL_ANALYSIS_CACHE[deal_id] = {
-            "version": cache_version,
-            "cachedAt": now,
-            "deal": analyzed,
-        }
+        bounded_cache_put(
+            DEAL_ANALYSIS_CACHE,
+            deal_id,
+            {
+                "version": cache_version,
+                "cachedAt": now,
+                "deal": analyzed,
+            },
+        )
     return dict(analyzed)
 
 
@@ -1126,38 +2030,72 @@ def analyze_deal_headers(headers):
             if not future.done():
                 errors.setdefault(deal_id, "timeout")
                 future.cancel()
-        executor.shutdown(wait=False, cancel_futures=True)
+        executor.shutdown(wait=True, cancel_futures=True)
     return analyzed, errors
 
 
-def get_next_deal_for_manager(manager_id, skipped=None):
-    skipped = set(str(item) for item in (skipped or []))
+def _get_next_deal_for_manager(manager_id, continuation_token=None):
     manager = get_manager_profile(manager_id)
     if not manager:
         return {"deal": None, "reason": "Менеджер не найден в настройке компетенций."}
+    if manager.get("active") is not True:
+        return {"manager": manager, "deal": None, "reason": "Пользователь деактивирован в Bitrix24."}
+    if manager.get("intranet") is not True:
+        return {"manager": manager, "deal": None, "reason": "Выдача доступна только сотрудникам компании."}
     access = check_manager_access(manager_id)
-    manager["accessRule"] = access.get("rule")
     if not access["ok"]:
         return {"manager": manager, "deal": None, "reason": access["reason"]}
 
+    rejected_keys = STATE_STORE.list_rejection_semantic_keys(manager_id)
+    unresolved_deal_ids = STATE_STORE.list_unresolved_claim_deal_ids()
     headers = [
         header
         for header in list_allowed_deal_headers()
-        if str(header.get("ID") or "") not in skipped
+        if str(header.get("ID") or "") not in unresolved_deal_ids
+        if rejection_semantic_key(manager_id, header.get("ID"), deal_version(header))
+        not in rejected_keys
     ]
+    snapshot = search_snapshot(headers, manager, access.get("rule"))
+    offset = decode_search_cursor(continuation_token, manager_id, snapshot)
+    if offset is None or offset > len(headers):
+        return {
+            "manager": manager,
+            "deal": None,
+            "reason": "Продолжение поиска устарело. Начните поиск заново.",
+            "hasMore": False,
+            "_httpStatus": 409,
+        }
     batch_limit = max(1, NEXT_DEAL_SCAN_LIMIT)
-    batch_headers = headers[:batch_limit]
-    scanned_ids = [str(header.get("ID") or "") for header in batch_headers]
+    batch_headers = headers[offset : offset + batch_limit]
     analyzed, errors = analyze_deal_headers(batch_headers)
+    next_offset = offset + len(batch_headers)
+    has_more = next_offset < len(headers)
     response_meta = {
-        "scannedDealIds": scanned_ids,
-        "checkedCount": len(scanned_ids),
-        "hasMore": len(headers) > len(batch_headers),
+        "checkedCount": len(batch_headers),
+        "hasMore": has_more,
         "partialTimeouts": len(errors),
+        "continuationToken": (
+            issue_search_cursor(manager_id, next_offset, snapshot) if has_more else None
+        ),
     }
 
     for header in batch_headers:
-        deal = analyzed.get(str(header.get("ID") or ""))
+        header_id = str(header.get("ID") or "")
+        if header_id in errors or header_id not in analyzed:
+            return {
+                "manager": manager,
+                "deal": None,
+                "reason": (
+                    "Не удалось безопасно проверить самую старую заявку. "
+                    "Повторите поиск через минуту."
+                ),
+                "checkedCount": len(batch_headers),
+                "partialTimeouts": max(1, len(errors)),
+                "hasMore": False,
+                "continuationToken": None,
+                "_httpStatus": 503,
+            }
+        deal = analyzed.get(header_id)
         if not deal:
             continue
         score = deal_score_for_manager(deal, manager)
@@ -1170,7 +2108,19 @@ def get_next_deal_for_manager(manager_id, skipped=None):
             deal["matchReason"] = "Страна не определена, заявка доступна всем менеджерам."
         else:
             deal["matchReason"] = "Совпало с компетенциями менеджера."
-        return {"manager": manager, "deal": deal, **response_meta}
+        deal["selectionToken"] = issue_selection_token(
+            deal.get("id"),
+            manager_id,
+            deal.get("version"),
+            manager_policy_hash(manager, access.get("rule")),
+        )
+        return {
+            "manager": manager,
+            "deal": deal,
+            **response_meta,
+            "hasMore": False,
+            "continuationToken": None,
+        }
 
     if response_meta["hasMore"]:
         return {
@@ -1186,6 +2136,19 @@ def get_next_deal_for_manager(manager_id, skipped=None):
     else:
         reason = "Нет доступных сделок по навыкам менеджера или общих заявок без страны."
     return {"manager": manager, "deal": None, "reason": reason, **response_meta}
+
+
+def get_next_deal_for_manager(manager_id, continuation_token=None):
+    if not SEARCH_SEMAPHORE.acquire(blocking=False):
+        return {
+            "deal": None,
+            "reason": "Сейчас уже выполняется несколько поисков. Повторите через несколько секунд.",
+            "busy": True,
+        }
+    try:
+        return _get_next_deal_for_manager(manager_id, continuation_token)
+    finally:
+        SEARCH_SEMAPHORE.release()
 
 
 def iter_allowed_deals(limit=50):
@@ -1204,81 +2167,882 @@ def list_allowed_deals(limit=20):
     return deals
 
 
-def preview_claim(deal_id, manager_id, deal_payload=None, auth=None):
+def fail_claim_operation_safely(operation_key, error, result=None):
+    try:
+        STATE_STORE.fail_claim_operation(operation_key, error, result=result)
+    except Exception as state_error:
+        sys.stderr.write(f"Claim operation failure could not be persisted: {type(state_error).__name__}\n")
+
+
+def attach_greeting_to_claim(result, manager_id, deal_id, auth, operation_key):
+    response = dict(result or {})
+    try:
+        response["greeting"] = prepare_greeting(
+            manager_id,
+            deal_id,
+            auth=auth,
+            operation_key=operation_key,
+        )
+    except Exception as exc:
+        sys.stderr.write(f"Greeting preparation failed after claim: {type(exc).__name__}\n")
+        response.setdefault("warnings", []).append(
+            "Сделка взята, но приветствие не удалось подготовить. Откройте чат сделки и напишите клиенту вручную."
+        )
+    return response
+
+
+def claim_operation_is_stale(operation, now=None):
+    raw = str((operation or {}).get("updatedAt") or "")
+    try:
+        updated_at = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    if updated_at.tzinfo is None:
+        updated_at = updated_at.replace(tzinfo=timezone.utc)
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    return (current.astimezone(timezone.utc) - updated_at.astimezone(timezone.utc)).total_seconds() > CLAIM_OPERATION_PENDING_TTL_SECONDS
+
+
+def preview_claim(deal_id, manager_id, auth=None, selection_token=None):
+    deal_id = normalize_entity_id(deal_id)
+    manager_id = normalize_entity_id(manager_id)
+    if not deal_id or not manager_id:
+        return {"ok": False, "message": "Некорректный ID сделки или менеджера.", "_httpStatus": 400}
+    selection = decode_selection_token(selection_token, deal_id, manager_id)
+    if not selection:
+        return {
+            "ok": False,
+            "message": "Выбор сделки устарел или не принадлежит этому пользователю. Получите сделку заново.",
+            "_httpStatus": 403,
+        }
+
+    selection_version = str(selection.get("version") or "")
+    operation_key = claim_operation_key(deal_id, selection_version)
+    semantic_rejection = rejection_semantic_key(manager_id, deal_id, selection_version)
+    if STATE_STORE.get_rejection_by_semantic_key(semantic_rejection):
+        return {
+            "ok": False,
+            "message": "По этой версии сделки уже сохранён отказ. Получите другую заявку.",
+            "_httpStatus": 409,
+        }
+    if not DRY_RUN and not claim_marker_field_valid():
+        return {
+            "ok": False,
+            "message": "Запись в CRM заблокирована: администратор не настроил маркер операции.",
+            "_httpStatus": 503,
+        }
+    success_result = None
+    suppress_replay_greeting = False
     with DATA_LOCK:
-        access = check_manager_access(manager_id)
-        if not access["ok"]:
+        # Reject and claim are mutually exclusive for one offered lifecycle.
+        # Recheck after acquiring the same process-wide lock used by
+        # ``record_rejection``; a rejection may have committed between the
+        # fast-path check above and this critical section.
+        if STATE_STORE.get_rejection_by_semantic_key(semantic_rejection):
             return {
                 "ok": False,
-                "dryRun": DRY_RUN,
-                "message": access["reason"],
-                "rule": access.get("rule"),
+                "message": "По этой версии сделки уже сохранён отказ. Получите другую заявку.",
+                "_httpStatus": 409,
             }
-        deal = bitrix_call("crm.deal.get", {"id": deal_id})
-        if not deal:
-            raise RuntimeError("Сделка не найдена")
-        current_stage = deal.get("STAGE_ID")
-        if current_stage not in SOURCE_STAGES:
+        conflicting_deal_operations = [
+            operation
+            for operation in STATE_STORE.list_unresolved_claim_operations_for_deal(
+                deal_id
+            )
+            if str(operation.get("operationKey") or "") != operation_key
+        ]
+        if conflicting_deal_operations:
             return {
                 "ok": False,
-                "dryRun": True,
-                "message": "Сделка уже не в разрешенной стадии, выдавать ее нельзя.",
-                "currentStage": current_stage,
+                "message": (
+                    "Предыдущая операция по этой сделке ещё сверяется с Bitrix24. "
+                    "Ничего не изменено; сообщите администратору."
+                ),
+                "recoveryPending": True,
+                "_httpStatus": 409,
             }
-        if DRY_RUN:
+        existing_operation = STATE_STORE.get_claim_operation(operation_key)
+        existing_attempt_timestamp = claim_operation_attempt_timestamp(existing_operation)
+        if existing_operation:
+            if existing_operation.get("status") == "succeeded":
+                if existing_operation.get("managerId") != manager_id:
+                    return {
+                        "ok": False,
+                        "message": "Эту сделку уже взял другой менеджер.",
+                        "_httpStatus": 409,
+                    }
+                replay_deal = bitrix_call("crm.deal.get", {"id": deal_id}) or {}
+                expected_replay_marker = str(
+                    ((existing_operation.get("request") or {}).get("claimMarker")) or ""
+                )
+                replay_marker_matches = (
+                    claim_marker_field_valid()
+                    and expected_replay_marker
+                    and str(replay_deal.get(BITRIX_CLAIM_MARKER_FIELD) or "")
+                    == expected_replay_marker
+                )
+                if not replay_marker_matches:
+                    return {
+                        "ok": False,
+                        "message": "Сделка изменилась после прошлого взятия. Получите её заново.",
+                        "_httpStatus": 409,
+                    }
+                success_result = dict(existing_operation.get("result") or {})
+                success_result.update({"ok": True, "idempotentReplay": True})
+
+        if success_result is not None:
+            actor_manager = get_manager_profile(manager_id)
+            suppress_replay_greeting = (
+                not actor_manager
+                or actor_manager.get("active") is not True
+                or actor_manager.get("intranet") is not True
+                or get_manager_rule(manager_id).get("enabled") is False
+            )
+        else:
+            actor_manager = get_manager_profile(manager_id)
+            if (
+                not actor_manager
+                or actor_manager.get("active") is not True
+                or actor_manager.get("intranet") is not True
+            ):
+                return {
+                    "ok": False,
+                    "message": "Пользователь не является активным сотрудником компании.",
+                    "_httpStatus": 403,
+                }
+            access = check_manager_access(manager_id, allow_operation_key=operation_key)
+            if not access["ok"]:
+                return {
+                    "ok": False,
+                    "dryRun": DRY_RUN,
+                    "message": access["reason"],
+                    "_httpStatus": 403,
+                }
+            if str(selection.get("policy") or "") != manager_policy_hash(
+                actor_manager,
+                access.get("rule"),
+            ):
+                return {
+                    "ok": False,
+                    "message": (
+                        "Навыки или правила доступа изменились после выбора сделки. "
+                        "Получите заявку заново."
+                    ),
+                    "_httpStatus": 409,
+                }
+            if existing_operation and existing_operation.get("status") == "pending":
+                if not claim_operation_is_stale(existing_operation):
+                    return {
+                        "ok": False,
+                        "message": "Сделка уже обрабатывается. Подождите несколько секунд и обновите страницу.",
+                        "_httpStatus": 409,
+                    }
+                fail_claim_operation_safely(
+                    operation_key,
+                    "stale_pending_operation",
+                    {"recoveryRequired": True},
+                )
+                existing_operation = STATE_STORE.get_claim_operation(operation_key)
+
+        if success_result is None:
+            deal = bitrix_call("crm.deal.get", {"id": deal_id})
+            if not deal:
+                return {"ok": False, "message": "Сделка не найдена.", "_httpStatus": 404}
+            if (
+                str(deal.get("STAGE_ID") or "") in SOURCE_STAGES
+                and deal_version(deal) != selection_version
+            ):
+                return {
+                    "ok": False,
+                    "message": "Сделка изменилась после выбора. Получите её заново.",
+                    "_httpStatus": 409,
+                }
+            current_stage = str(deal.get("STAGE_ID") or "")
+            assigned_manager_id = str(deal.get("ASSIGNED_BY_ID") or "")
+            original_operation_manager = str((existing_operation or {}).get("managerId") or "")
+
+            expected_existing_marker = str(
+                (((existing_operation or {}).get("request") or {}).get("claimMarker")) or ""
+            )
+            marker_matches_original_operation = (
+                claim_marker_field_valid()
+                and expected_existing_marker
+                and str(deal.get(BITRIX_CLAIM_MARKER_FIELD) or "") == expected_existing_marker
+            )
+            live_claim_marker = str(deal.get(BITRIX_CLAIM_MARKER_FIELD) or "")
+            if (
+                existing_operation
+                and existing_operation.get("status") == "failed"
+                and original_operation_manager
+                and marker_matches_original_operation
+            ):
+                # Snapshot the attempt-specific time before the audit retry
+                # mutates operation transition timestamps.
+                recovery_claim_timestamp = (
+                    existing_attempt_timestamp
+                    or claim_operation_attempt_timestamp(existing_operation)
+                )
+                recovery_request = dict(existing_operation.get("request") or {})
+                recovery_request.update(
+                    {"recovery": True, "claimMarker": expected_existing_marker}
+                )
+                operation = STATE_STORE.retry_failed_claim_operation(
+                    deal_id,
+                    original_operation_manager,
+                    operation_key=operation_key,
+                    request=recovery_request,
+                )
+                if not operation.get("retried"):
+                    return {
+                        "ok": False,
+                        "message": "Сделка уже обрабатывается. Повторите через несколько секунд.",
+                        "_httpStatus": 409,
+                    }
+                invalidate_deal_caches(deal_id)
+                success_result = {
+                    "ok": True,
+                    "dryRun": False,
+                    "dealId": deal_id,
+                    "auditRecorded": True,
+                    "recoveredAfterRetry": True,
+                    "updated": {
+                        "ASSIGNED_BY_ID": original_operation_manager,
+                        "STAGE_ID": TARGET_STAGE,
+                        "STAGE_NAME": TARGET_STAGE_NAME,
+                    },
+                    "message": "Сделка уже была назначена менеджеру; журнал восстановлен.",
+                }
+                try:
+                    finalized_operation = STATE_STORE.finalize_claim_operation(
+                        operation_key,
+                        claim=claim_log_entry(
+                            original_operation_manager,
+                            deal,
+                            timestamp=recovery_claim_timestamp,
+                        ),
+                        result=success_result,
+                        expected_claim_marker=expected_existing_marker,
+                    )
+                    if (
+                        finalized_operation.get("status") != "succeeded"
+                        or not finalized_operation.get("claimEventId")
+                        or str(finalized_operation.get("managerId") or "") != original_operation_manager
+                        or str(finalized_operation.get("dealId") or "") != deal_id
+                    ):
+                        raise RuntimeError("claim audit recovery lost its operation lease")
+                except Exception as exc:
+                    fail_claim_operation_safely(
+                        operation_key,
+                        "audit_recovery_failed",
+                        {"remoteUpdated": True},
+                    )
+                    sys.stderr.write(f"Claim audit recovery failed: {type(exc).__name__}\n")
+                    return {
+                        "ok": False,
+                        "message": "Сделка уже назначена, но журнал не восстановился. Сообщите администратору.",
+                        "_httpStatus": 503,
+                    }
+                if original_operation_manager != manager_id:
+                    return {
+                        "ok": False,
+                        "message": "Эту сделку уже взял другой менеджер.",
+                        "_httpStatus": 409,
+                    }
+            elif (
+                existing_operation
+                and existing_operation.get("status") == "failed"
+                and current_stage in SOURCE_STAGES
+                and live_claim_marker
+            ):
+                # A non-empty marker belonging to another attempt is
+                # ambiguous evidence. Never overwrite it during retry. Ensure
+                # even a previously "safe" failed row becomes unresolved and
+                # requires an administrator to inspect Bitrix.
+                try:
+                    ambiguous = STATE_STORE.retry_failed_claim_operation(
+                        deal_id,
+                        original_operation_manager,
+                        operation_key=operation_key,
+                    )
+                    if ambiguous.get("retried"):
+                        STATE_STORE.fail_claim_operation(
+                            operation_key,
+                            "source_deal_has_foreign_claim_marker",
+                            result={
+                                "remoteUpdateUncertain": True,
+                                "recoveryRequired": True,
+                            },
+                        )
+                except Exception as exc:
+                    sys.stderr.write(
+                        f"Ambiguous claim marker could not be persisted: {type(exc).__name__}\n"
+                    )
+                return {
+                    "ok": False,
+                    "message": (
+                        "В сделке найден маркер другой операции. "
+                        "Ничего не изменено; сообщите администратору."
+                    ),
+                    "recoveryPending": True,
+                    "_httpStatus": 409,
+                }
+            elif (
+                current_stage in SOURCE_STAGES
+                and live_claim_marker
+                and not STATE_STORE.find_succeeded_claim_operation_by_marker(
+                    deal_id,
+                    live_claim_marker,
+                )
+            ):
+                # Never overwrite an unknown marker. It may be the only
+                # surviving evidence after a Volume restore or partial remote
+                # update. A marker from a succeeded older lifecycle is the
+                # only safe exception for an intentional requeue.
+                return {
+                    "ok": False,
+                    "message": (
+                        "В сделке найден неизвестный маркер предыдущей операции. "
+                        "Ничего не изменено; сообщите администратору."
+                    ),
+                    "recoveryPending": True,
+                    "_httpStatus": 409,
+                }
+            elif current_stage not in SOURCE_STAGES:
+                return {
+                    "ok": False,
+                    "dryRun": DRY_RUN,
+                    "message": "Сделка уже ушла из доступной стадии. Получите другую сделку.",
+                    "currentStage": current_stage,
+                    "_httpStatus": 409,
+                }
+
+        if success_result is None and DRY_RUN:
             return {
                 "ok": True,
                 "dryRun": True,
-                "dealId": str(deal_id),
+                "dealId": deal_id,
                 "wouldSet": {
-                    "ASSIGNED_BY_ID": str(manager_id),
+                    "ASSIGNED_BY_ID": manager_id,
                     "STAGE_ID": TARGET_STAGE,
                     "STAGE_NAME": TARGET_STAGE_NAME,
                 },
                 "message": "Проверка успешна. В безопасном режиме CRM не изменена.",
             }
-        bitrix_call(
-            "crm.deal.update",
-            {
-                "id": deal_id,
-                "fields[ASSIGNED_BY_ID]": manager_id,
-                "fields[STAGE_ID]": TARGET_STAGE,
-            },
-        )
-        updated_deal = dict(deal)
-        updated_deal["ID"] = deal_id
-        log_entry = append_claim_log(manager_id, updated_deal)
-        greeting = prepare_greeting(manager_id, deal_id, deal_payload, auth)
-        return {
-            "ok": True,
-            "dryRun": False,
-            "dealId": str(deal_id),
-            "log": log_entry,
-            "greeting": greeting,
-            "updated": {
-                "ASSIGNED_BY_ID": str(manager_id),
-                "STAGE_ID": TARGET_STAGE,
-                "STAGE_NAME": TARGET_STAGE_NAME,
-            },
-            "message": "Сделка назначена менеджеру и переведена в работу.",
-        }
+
+        if success_result is None:
+            attempt_marker = claim_attempt_marker(operation_key, manager_id)
+            request_context = {
+                "dealId": deal_id,
+                "managerId": manager_id,
+                "dealVersion": selection_version,
+                "claimMarker": attempt_marker,
+                "attemptStartedAt": local_now().isoformat(),
+            }
+            try:
+                if existing_operation and existing_operation.get("status") == "failed":
+                    if existing_operation.get("managerId") == manager_id:
+                        operation = STATE_STORE.retry_failed_claim_operation(
+                            deal_id,
+                            manager_id,
+                            operation_key=operation_key,
+                            request=request_context,
+                        )
+                    else:
+                        operation = STATE_STORE.reassign_failed_claim_operation(
+                            deal_id,
+                            manager_id,
+                            operation_key=operation_key,
+                            request=request_context,
+                        )
+                else:
+                    operation = STATE_STORE.begin_claim_operation(
+                        deal_id,
+                        manager_id,
+                        operation_key=operation_key,
+                        request=request_context,
+                    )
+            except IdempotencyConflictError:
+                return {
+                    "ok": False,
+                    "message": "Эту сделку уже обрабатывает другой менеджер.",
+                    "_httpStatus": 409,
+                }
+            if not (
+                operation.get("created")
+                or operation.get("retried")
+                or operation.get("reassigned")
+            ):
+                if operation.get("status") == "succeeded":
+                    if str(operation.get("managerId") or "") != manager_id:
+                        return {
+                            "ok": False,
+                            "message": "Эту сделку уже взял другой менеджер.",
+                            "_httpStatus": 409,
+                        }
+                    expected_race_marker = str(
+                        ((operation.get("request") or {}).get("claimMarker")) or ""
+                    )
+                    replay_deal = bitrix_call("crm.deal.get", {"id": deal_id}) or {}
+                    if (
+                        not expected_race_marker
+                        or str(replay_deal.get(BITRIX_CLAIM_MARKER_FIELD) or "")
+                        != expected_race_marker
+                    ):
+                        return {
+                            "ok": False,
+                            "message": "Сделка изменилась во время обработки. Получите её заново.",
+                            "_httpStatus": 409,
+                        }
+                    success_result = dict(operation.get("result") or {})
+                    success_result.update({"ok": True, "idempotentReplay": True})
+                else:
+                    return {
+                        "ok": False,
+                        "message": "Сделка уже обрабатывается. Повторите через несколько секунд.",
+                        "_httpStatus": 409,
+                    }
+
+        if success_result is None:
+            # Re-read only after a durable attempt-specific operation lease is
+            # reserved. DATA_LOCK serializes this single production process;
+            # SQLite and the CRM marker protect restart/race recovery.
+            live_deal = bitrix_call("crm.deal.get", {"id": deal_id})
+            if not live_deal or str(live_deal.get("STAGE_ID") or "") not in SOURCE_STAGES:
+                fail_claim_operation_safely(operation_key, "stage_changed_before_update")
+                return {
+                    "ok": False,
+                    "message": "Сделка изменилась до назначения. Получите другую сделку.",
+                    "_httpStatus": 409,
+                }
+            live_marker_before_update = str(
+                live_deal.get(BITRIX_CLAIM_MARKER_FIELD) or ""
+            )
+            if (
+                live_marker_before_update
+                and not STATE_STORE.find_succeeded_claim_operation_by_marker(
+                    deal_id,
+                    live_marker_before_update,
+                )
+            ):
+                fail_claim_operation_safely(
+                    operation_key,
+                    "unknown_claim_marker_before_update",
+                    {
+                        "remoteUpdated": False,
+                        "recoveryRequired": True,
+                    },
+                )
+                return {
+                    "ok": False,
+                    "message": (
+                        "Маркер сделки изменился во время обработки. "
+                        "Ничего не записано; сообщите администратору."
+                    ),
+                    "recoveryPending": True,
+                    "_httpStatus": 409,
+                }
+            if deal_version(live_deal) != selection_version:
+                fail_claim_operation_safely(
+                    operation_key,
+                    "deal_version_changed_before_update",
+                    {"remoteUpdated": False},
+                )
+                return {
+                    "ok": False,
+                    "message": "Сделка изменилась до назначения. Получите её заново.",
+                    "_httpStatus": 409,
+                }
+
+            update_warning = None
+            try:
+                update_fields = {
+                    "id": deal_id,
+                    "fields[ASSIGNED_BY_ID]": manager_id,
+                    "fields[STAGE_ID]": TARGET_STAGE,
+                    f"fields[{BITRIX_CLAIM_MARKER_FIELD}]": attempt_marker,
+                }
+                update_result = bitrix_call(
+                    "crm.deal.update",
+                    update_fields,
+                )
+                if not update_result:
+                    raise RuntimeError("Bitrix не подтвердил обновление")
+            except Exception as exc:
+                update_warning = "Ответ Bitrix на обновление был потерян; состояние проверено повторно."
+                sys.stderr.write(f"Claim update response error: {type(exc).__name__}\n")
+
+            try:
+                verified_deal = bitrix_call("crm.deal.get", {"id": deal_id}) or {}
+            except Exception as exc:
+                fail_claim_operation_safely(
+                    operation_key,
+                    "update_verification_failed",
+                    {"remoteUpdateUncertain": True},
+                )
+                return {
+                    "ok": False,
+                    "message": "Bitrix не подтвердил итог назначения. Проверьте карточку сделки перед повтором.",
+                    "remoteUpdateUncertain": True,
+                    "_httpStatus": 503,
+                }
+
+            claimed = (
+                str(verified_deal.get("STAGE_ID") or "") == TARGET_STAGE
+                and str(verified_deal.get("ASSIGNED_BY_ID") or "") == manager_id
+                and str(verified_deal.get(BITRIX_CLAIM_MARKER_FIELD) or "") == attempt_marker
+            )
+            if not claimed:
+                fail_claim_operation_safely(
+                    operation_key,
+                    "post_update_state_mismatch",
+                    {
+                        "stageId": str(verified_deal.get("STAGE_ID") or ""),
+                        "assignedById": str(verified_deal.get("ASSIGNED_BY_ID") or ""),
+                        "markerMatched": str(verified_deal.get(BITRIX_CLAIM_MARKER_FIELD) or "") == attempt_marker,
+                        "remoteUpdateUncertain": True,
+                    },
+                )
+                return {
+                    "ok": False,
+                    "message": "Итог обновления сделки не подтверждён. Проверьте карточку и сообщите администратору.",
+                    "remoteUpdateUncertain": True,
+                    "_httpStatus": 503,
+                }
+
+            invalidate_deal_caches(deal_id)
+            success_result = {
+                "ok": True,
+                "dryRun": False,
+                "dealId": deal_id,
+                "auditRecorded": True,
+                "updated": {
+                    "ASSIGNED_BY_ID": manager_id,
+                    "STAGE_ID": TARGET_STAGE,
+                    "STAGE_NAME": TARGET_STAGE_NAME,
+                },
+                "message": "Сделка назначена менеджеру и переведена в работу.",
+            }
+            if update_warning:
+                success_result["warnings"] = [update_warning]
+            try:
+                finalized_operation = STATE_STORE.finalize_claim_operation(
+                    operation_key,
+                    claim=claim_log_entry(manager_id, verified_deal),
+                    result=success_result,
+                    expected_claim_marker=attempt_marker,
+                )
+                if (
+                    finalized_operation.get("status") != "succeeded"
+                    or not finalized_operation.get("claimEventId")
+                    or str(finalized_operation.get("managerId") or "") != manager_id
+                    or str(finalized_operation.get("dealId") or "") != deal_id
+                ):
+                    raise RuntimeError("claim audit finalize lost its operation lease")
+            except Exception as exc:
+                sys.stderr.write(f"Claim audit finalize failed after CRM update: {type(exc).__name__}\n")
+                fail_claim_operation_safely(
+                    operation_key,
+                    "audit_finalize_failed_after_remote_update",
+                    {"remoteUpdated": True},
+                )
+                success_result["auditRecorded"] = False
+                success_result.setdefault("warnings", []).append(
+                    "Сделка взята, но журнал временно не записался. Сообщите администратору."
+                )
+
+    if suppress_replay_greeting:
+        return success_result
+    return attach_greeting_to_claim(
+        success_result,
+        manager_id,
+        deal_id,
+        auth,
+        operation_key,
+    )
+
+
+def reconcile_stale_claim_operations(limit=None):
+    """Recover audit events after a process died around a CRM update.
+
+    This maintenance path never changes Bitrix. It only compares stale local
+    leases with live CRM state, records an exact confirmed claim, or releases a
+    lease whose deal is still in a source stage.
+    """
+
+    summary = {"checked": 0, "recovered": 0, "released": 0, "conflicts": 0, "errors": 0}
+    candidates = list(STATE_STORE.list_claim_operations(status="pending"))
+    for failed in STATE_STORE.list_claim_operations(status="failed"):
+        failed_result = failed.get("result") or {}
+        if (
+            failed_result.get("remoteUpdated")
+            or failed_result.get("remoteUpdateUncertain")
+            or failed_result.get("recoveryRequired")
+        ):
+            candidates.append(failed)
+    for listed_operation in candidates[: max(0, int(limit or CLAIM_RECONCILE_BATCH_SIZE))]:
+        if listed_operation.get("status") == "pending" and not claim_operation_is_stale(listed_operation):
+            continue
+        with DATA_LOCK:
+            operation_key = listed_operation.get("operationKey")
+            operation = STATE_STORE.get_claim_operation(operation_key)
+            if not operation or operation.get("status") not in {"pending", "failed"}:
+                continue
+            if operation.get("status") == "pending" and not claim_operation_is_stale(operation):
+                continue
+            summary["checked"] += 1
+            deal_id = str(operation.get("dealId") or "")
+            manager_id = str(operation.get("managerId") or "")
+            try:
+                deal = bitrix_call("crm.deal.get", {"id": deal_id}) or {}
+            except Exception as exc:
+                summary["errors"] += 1
+                sys.stderr.write(f"Claim reconciliation read failed: {type(exc).__name__}\n")
+                continue
+            stage_id = str(deal.get("STAGE_ID") or "")
+            assigned_manager_id = str(deal.get("ASSIGNED_BY_ID") or "")
+            expected_marker = str(((operation.get("request") or {}).get("claimMarker")) or "")
+            expected_deal_version = str(
+                ((operation.get("request") or {}).get("dealVersion")) or ""
+            )
+            marker_matches = (
+                claim_marker_field_valid()
+                and expected_marker
+                and str(deal.get(BITRIX_CLAIM_MARKER_FIELD) or "") == expected_marker
+            )
+            if marker_matches:
+                # Snapshot the attempt-specific time before retry/finalize
+                # rewrites operation transition timestamps.
+                recovery_claim_timestamp = claim_operation_attempt_timestamp(operation)
+                if operation.get("status") == "failed":
+                    recovery_request = dict(operation.get("request") or {})
+                    recovery_request.update(
+                        {"maintenanceRecovery": True, "claimMarker": expected_marker}
+                    )
+                    operation = STATE_STORE.retry_failed_claim_operation(
+                        deal_id,
+                        manager_id,
+                        operation_key=operation_key,
+                        request=recovery_request,
+                    )
+                    if not operation.get("retried"):
+                        summary["conflicts"] += 1
+                        continue
+                result = {
+                    "ok": True,
+                    "dryRun": False,
+                    "dealId": deal_id,
+                    "auditRecorded": True,
+                    "recoveredByMaintenance": True,
+                    "updated": {
+                        "ASSIGNED_BY_ID": manager_id,
+                        "STAGE_ID": TARGET_STAGE,
+                        "STAGE_NAME": TARGET_STAGE_NAME,
+                    },
+                    "message": "Журнал взятия восстановлен после перезапуска.",
+                }
+                finalized = STATE_STORE.finalize_claim_operation(
+                    operation_key,
+                    claim=claim_log_entry(
+                        manager_id,
+                        deal,
+                        timestamp=recovery_claim_timestamp,
+                    ),
+                    result=result,
+                    expected_claim_marker=expected_marker,
+                )
+                if finalized.get("status") == "succeeded" and finalized.get("claimEventId"):
+                    summary["recovered"] += 1
+                else:
+                    summary["conflicts"] += 1
+            elif (
+                stage_id in SOURCE_STAGES
+                and expected_marker
+                and not str(deal.get(BITRIX_CLAIM_MARKER_FIELD) or "")
+                and expected_deal_version
+                and deal_version(deal) == expected_deal_version
+            ):
+                # Exact unchanged source state proves this attempt did not
+                # apply. Clear its provisional quota block while preserving
+                # the prior uncertain result in attemptHistory.
+                if operation.get("status") == "failed":
+                    operation = STATE_STORE.retry_failed_claim_operation(
+                        deal_id,
+                        manager_id,
+                        operation_key=operation_key,
+                    )
+                    if not operation.get("retried"):
+                        summary["conflicts"] += 1
+                        continue
+                failed = STATE_STORE.fail_claim_operation(
+                    operation_key,
+                    "unapplied_claim_released_by_maintenance",
+                    result={"remoteUpdated": False, "reconciledSource": True},
+                )
+                if failed.get("status") == "failed":
+                    summary["released"] += 1
+                else:
+                    summary["conflicts"] += 1
+            elif stage_id not in SOURCE_STAGES:
+                STATE_STORE.fail_claim_operation(
+                    operation_key,
+                    "stale_pending_conflicts_with_live_crm",
+                    result={
+                        "remoteUpdateUncertain": True,
+                        "recoveryRequired": True,
+                        "stageId": stage_id,
+                    },
+                )
+                summary["conflicts"] += 1
+            else:
+                # The source deal changed, retained a marker, or came from an
+                # older operation without a version. Do not guess: keep the
+                # manager blocked and expose the unresolved item to admin.
+                summary["conflicts"] += 1
+    return summary
+
+
+def claim_reconciliation_loop():
+    while True:
+        try:
+            if readiness_state().get("ok"):
+                summary = reconcile_stale_claim_operations()
+                if summary["recovered"] or summary["released"] or summary["conflicts"] or summary["errors"]:
+                    sys.stderr.write(
+                        "Claim reconciliation: "
+                        + " ".join(f"{key}={value}" for key, value in summary.items())
+                        + "\n"
+                    )
+        except Exception as exc:
+            sys.stderr.write(f"Claim reconciliation failed: {type(exc).__name__}\n")
+        time.sleep(CLAIM_RECONCILE_INTERVAL_SECONDS)
 
 
 def record_rejection(manager_id, payload):
-    deal = payload.get("deal") if isinstance(payload.get("deal"), dict) else {}
-    deal_id = str(payload.get("dealId") or deal.get("id") or deal.get("ID") or "").strip()
-    if not deal_id:
-        return {"ok": False, "message": "Не указана сделка для отказа."}
-    deal.setdefault("id", deal_id)
+    manager_id = normalize_entity_id(manager_id)
+    deal_id = normalize_entity_id(payload.get("dealId"))
+    if not manager_id or not deal_id:
+        return {"ok": False, "message": "Некорректный ID сделки или менеджера."}
+    selection_token = payload.get("selectionToken")
+    selection = decode_selection_token(selection_token, deal_id, manager_id)
+    if not selection:
+        return {"ok": False, "message": "Выбор сделки устарел. Получите сделку заново."}
+    selection_version = str(selection.get("version") or "")
+    semantic_key = rejection_semantic_key(manager_id, deal_id, selection_version)
+    operation_key = claim_operation_key(deal_id, selection_version)
     reason = normalize_reject_reason(payload.get("reason"))
     with DATA_LOCK:
-        entry = append_reject_log(manager_id, deal, reason)
+        token_hash = hashlib.sha256(str(selection_token).encode("utf-8")).hexdigest()
+        existing = (
+            STATE_STORE.get_rejection_by_token_hash(token_hash)
+            or STATE_STORE.get_rejection_by_semantic_key(semantic_key)
+        )
+        if existing:
+            return {
+                "ok": True,
+                "dealId": deal_id,
+                "reason": existing.get("reason") or reason,
+                "reasonLabel": existing.get("reasonLabel") or REJECT_REASONS[reason],
+                "idempotentReplay": True,
+                "message": "Отказ уже был сохранён.",
+            }
+        conflicting_deal_operations = [
+            operation
+            for operation in STATE_STORE.list_unresolved_claim_operations_for_deal(
+                deal_id
+            )
+            if str(operation.get("operationKey") or "") != operation_key
+        ]
+        if conflicting_deal_operations:
+            return {
+                "ok": False,
+                "message": (
+                    "Предыдущая операция по этой сделке ещё сверяется с Bitrix24. "
+                    "Отказ не сохранён; сообщите администратору."
+                ),
+            }
+        actor_manager = get_manager_profile(manager_id)
+        if (
+            not actor_manager
+            or actor_manager.get("active") is not True
+            or actor_manager.get("intranet") is not True
+        ):
+            return {"ok": False, "message": "Пользователь не является активным сотрудником компании."}
+        configured_rules = STATE_STORE.list_rules()
+        if (
+            REQUIRE_EXPLICIT_ACCESS_RULE
+            and not is_unverified_dev_mode()
+            and manager_id not in configured_rules
+        ):
+            return {"ok": False, "message": "Администратор не открыл доступ к выдаче заявок."}
+        if get_manager_rule(manager_id).get("enabled") is False:
+            return {"ok": False, "message": "Для пользователя закрыт доступ к выдаче заявок."}
+        current_rule = get_manager_rule(manager_id)
+        if str(selection.get("policy") or "") != manager_policy_hash(
+            actor_manager,
+            current_rule,
+        ):
+            return {
+                "ok": False,
+                "message": "Навыки или правила доступа изменились. Получите заявку заново.",
+            }
+        claim_operation = STATE_STORE.get_claim_operation(operation_key)
+        claim_result = (claim_operation or {}).get("result") or {}
+        if claim_operation and (
+            claim_operation.get("status") in {"pending", "succeeded"}
+            or claim_result.get("remoteUpdated")
+            or claim_result.get("remoteUpdateUncertain")
+        ):
+            return {
+                "ok": False,
+                "message": "Сделка уже находится в процессе взятия и не может быть одновременно отклонена.",
+            }
+        deal = bitrix_call("crm.deal.get", {"id": deal_id}) or {}
+        if str(deal.get("STAGE_ID") or "") not in SOURCE_STAGES:
+            return {"ok": False, "message": "Сделка уже ушла из доступной стадии."}
+        if deal_version(deal) != selection_version:
+            return {"ok": False, "message": "Сделка изменилась после выбора. Получите её заново."}
+        cached_deal = None
+        with DEAL_ANALYSIS_CACHE_LOCK:
+            cached = DEAL_ANALYSIS_CACHE.get(deal_id)
+            if cached:
+                cached_deal = dict(cached.get("deal") or {})
+        classification = (cached_deal or {}).get("classification") or {}
+        try:
+            STATE_STORE.append_reject(
+                {
+                    "timestamp": local_now().isoformat(),
+                    "managerId": manager_id,
+                    "dealId": deal_id,
+                    "stageId": deal.get("STAGE_ID") or "",
+                    "direction": classification.get("direction") or "",
+                    "reason": reason,
+                    "reasonLabel": REJECT_REASONS[reason],
+                    "selectionTokenHash": token_hash,
+                    "semanticKey": semantic_key,
+                }
+            )
+        except Exception:
+            existing = (
+                STATE_STORE.get_rejection_by_token_hash(token_hash)
+                or STATE_STORE.get_rejection_by_semantic_key(semantic_key)
+            )
+            if existing:
+                return {
+                    "ok": True,
+                    "dealId": deal_id,
+                    "reason": existing.get("reason") or reason,
+                    "reasonLabel": existing.get("reasonLabel") or REJECT_REASONS[reason],
+                    "idempotentReplay": True,
+                    "message": "Отказ уже был сохранён.",
+                }
+            raise
     return {
         "ok": True,
         "dealId": deal_id,
         "reason": reason,
         "reasonLabel": REJECT_REASONS[reason],
-        "log": entry,
         "message": "Отказ сохранен.",
     }
 
@@ -1287,23 +3051,27 @@ def list_portal_users():
     now = time.monotonic()
     if PORTAL_USERS_CACHE and now - PORTAL_USERS_CACHE.get("cachedAt", 0) < PORTAL_USERS_CACHE_TTL_SECONDS:
         return list(PORTAL_USERS_CACHE["users"])
-    users = []
-    start = 0
-    while True:
-        params = {
+    users = bitrix_list_all(
+        "user.search",
+        {
             "FILTER[ACTIVE]": "Y",
             "SORT": "LAST_NAME",
             "ORDER": "ASC",
-            "start": start,
-        }
-        payload = bitrix_call_full("user.search", params)
-        users.extend(payload.get("result") or [])
-        if "next" not in payload:
-            break
-        start = payload.get("next")
+        },
+        max_items=5000,
+        timeout=BITRIX_TIMEOUT_SECONDS,
+    )
     PORTAL_USERS_CACHE["users"] = users
     PORTAL_USERS_CACHE["cachedAt"] = now
     return list(users)
+
+
+def admin_rule_state(manager_id, configured_rules):
+    rule = dict(get_manager_rule(manager_id))
+    rule["configured"] = str(manager_id) in configured_rules
+    if REQUIRE_EXPLICIT_ACCESS_RULE and not rule["configured"]:
+        rule["enabled"] = False
+    return rule
 
 
 def admin_state(payload):
@@ -1314,26 +3082,31 @@ def admin_state(payload):
     today = local_date()
     date_from = normalize_date(payload.get("dateFrom"), today)
     date_to = normalize_date(payload.get("dateTo"), date_from)
-    rules = load_access_rules().get("managers", {})
-    log = load_claim_log()
-    reject_log = load_reject_log()
-    log_manager_ids = {str(item.get("managerId")) for item in log if item.get("managerId")}
-    reject_manager_ids = {str(item.get("managerId")) for item in reject_log if item.get("managerId")}
-    manager_ids = set(rules.keys()) | log_manager_ids | reject_manager_ids
-    warnings = []
-    crm_period_counts = {}
-    crm_today_counts = {}
-    try:
-        crm_period_counts = crm_claim_counts(date_from, date_to)
-    except Exception as exc:
-        warnings.append(f"Не удалось загрузить статистику заявок из CRM: {exc}")
-    if date_from == today == date_to:
-        crm_today_counts = crm_period_counts
-    else:
-        try:
-            crm_today_counts = crm_claim_counts(today, today)
-        except Exception as exc:
-            warnings.append(f"Не удалось загрузить статистику заявок за сегодня из CRM: {exc}")
+    if date_to < date_from:
+        raise ValueError("Дата окончания не может быть раньше даты начала")
+    rules = STATE_STORE.list_rules()
+    manager_ids = set(STATE_STORE.list_manager_ids()) | set(rules)
+    reject_log = STATE_STORE.list_rejections(
+        date_from=min(date_from, today),
+        date_to=max(date_to, today),
+    )
+    warnings = [
+        "Показаны только точные события этого приложения. Ручные переводы в Bitrix24 в разбивку по менеджерам не включены."
+    ]
+    unresolved_claim_operations = 0
+    for operation in STATE_STORE.list_claim_operations():
+        operation_result = operation.get("result") or {}
+        if (
+            (operation.get("status") == "pending" and claim_operation_is_stale(operation))
+            or operation_result.get("remoteUpdated")
+            or operation_result.get("remoteUpdateUncertain")
+            or operation_result.get("recoveryRequired")
+        ):
+            unresolved_claim_operations += 1
+    if unresolved_claim_operations:
+        warnings.append(
+            f"Есть операций взятия, ожидающих сверки с Bitrix24: {unresolved_claim_operations}."
+        )
     try:
         portal_users = list_portal_users()
     except Exception as exc:
@@ -1352,38 +3125,34 @@ def admin_state(payload):
             continue
         profile = profiles_by_id.get(manager_id) or {}
         competencies = profile.get("competencies") or []
-        if not competencies:
-            continue
         manager_ids.discard(manager_id)
-        rule = get_manager_rule(manager_id)
+        rule = admin_rule_state(manager_id, rules)
         rows.append(
             {
                 "id": manager_id,
                 "name": profile.get("name") or " ".join(part for part in [user.get("NAME"), user.get("LAST_NAME")] if part).strip() or manager_id,
                 "competencies": competencies,
                 "rule": rule,
-                "takenInPeriod": max(crm_period_counts.get(manager_id, 0), count_claims_in_log(log, manager_id, date_from, date_to)),
-                "takenToday": max(crm_today_counts.get(manager_id, 0), count_claims_in_log(log, manager_id, today, today)),
-                "rejectedInPeriod": count_rejections_in_log(reject_log, manager_id, date_from, date_to),
-                "rejectedToday": count_rejections_in_log(reject_log, manager_id, today, today),
+                "takenInPeriod": STATE_STORE.count_claims(manager_id, date_from, date_to),
+                "takenToday": STATE_STORE.count_claims(manager_id, today, today),
+                "rejectedInPeriod": STATE_STORE.count_rejections(manager_id, date_from, date_to),
+                "rejectedToday": STATE_STORE.count_rejections(manager_id, today, today),
                 "topRejectReason": rejection_reason_summary(reject_log, manager_id, date_from, date_to),
             }
         )
 
     for manager_id in sorted(manager_ids):
         profile = get_manager_profile(manager_id) or {"id": manager_id, "name": manager_id, "competencies": []}
-        if not profile.get("competencies"):
-            continue
         rows.append(
             {
                 "id": manager_id,
                 "name": profile.get("name") or manager_id,
                 "competencies": profile.get("competencies") or [],
-                "rule": get_manager_rule(manager_id),
-                "takenInPeriod": max(crm_period_counts.get(manager_id, 0), count_claims_in_log(log, manager_id, date_from, date_to)),
-                "takenToday": max(crm_today_counts.get(manager_id, 0), count_claims_in_log(log, manager_id, today, today)),
-                "rejectedInPeriod": count_rejections_in_log(reject_log, manager_id, date_from, date_to),
-                "rejectedToday": count_rejections_in_log(reject_log, manager_id, today, today),
+                "rule": admin_rule_state(manager_id, rules),
+                "takenInPeriod": STATE_STORE.count_claims(manager_id, date_from, date_to),
+                "takenToday": STATE_STORE.count_claims(manager_id, today, today),
+                "rejectedInPeriod": STATE_STORE.count_rejections(manager_id, date_from, date_to),
+                "rejectedToday": STATE_STORE.count_rejections(manager_id, today, today),
                 "topRejectReason": rejection_reason_summary(reject_log, manager_id, date_from, date_to),
             }
         )
@@ -1396,6 +3165,8 @@ def admin_state(payload):
         "dateFrom": date_from,
         "dateTo": date_to,
         "today": today,
+        "statsSource": "app_events",
+        "statsLabel": "Взято через приложение",
         "managers": rows,
     }
     if warnings:
@@ -1407,24 +3178,46 @@ def update_admin_rule(payload):
     admin = require_admin(payload)
     if not admin:
         return {"ok": False, "isAdmin": False, "message": "Недостаточно прав."}
-    manager_id = str(payload.get("managerId") or "").strip()
+    manager_id = normalize_entity_id(payload.get("managerId"))
     if not manager_id:
-        return {"ok": False, "message": "Не указан менеджер."}
-    rule = set_manager_rule(
-        manager_id,
-        enabled=payload.get("enabled", True),
-        daily_limit=payload.get("dailyLimit"),
-        note=payload.get("note") or "",
-    )
+        return {"ok": False, "message": "Некорректный ID менеджера."}
+    enabled = payload.get("enabled", True)
+    if not isinstance(enabled, bool):
+        raise ValueError("Поле enabled должно быть true или false")
+    # Serialize policy changes with claim/reject critical sections. Once the
+    # administrator receives a successful disable response, no operation that
+    # passed the old rule can still be waiting to write Bitrix.
+    with DATA_LOCK:
+        rule = set_manager_rule(
+            manager_id,
+            enabled=enabled,
+            daily_limit=payload.get("dailyLimit"),
+            note=payload.get("note") or "",
+        )
     return {"ok": True, "managerId": manager_id, "rule": rule}
 
 
 def current_user_state(payload):
-    user = verify_bitrix_user(payload.get("auth"))
+    user = verify_bitrix_user(payload.get("auth"), allow_cached=False)
     if not user:
         return {"ok": False, "message": "Не удалось определить авторизованного пользователя Битрикс."}
     manager = get_manager_profile(user["id"])
-    return {"ok": True, "user": user, "manager": manager}
+    raw = user.get("raw") or {}
+    public_user = {
+        "id": user["id"],
+        "name": user.get("name") or "",
+        "isAdmin": bool(
+            user["id"] in ADMIN_USER_IDS
+            and bitrix_boolean(raw.get("ACTIVE"), default=False)
+            and is_intranet_user(raw)
+        ),
+        "raw": {
+            "ID": user["id"],
+            "NAME": raw.get("NAME") or "",
+            "LAST_NAME": raw.get("LAST_NAME") or "",
+        },
+    }
+    return {"ok": True, "user": public_user, "manager": manager}
 
 
 def extract_initial_auth(raw_payload):
@@ -1449,7 +3242,6 @@ def extract_initial_auth_from_values(parsed):
 
     auth = {
         "AUTH_ID": pick("AUTH_ID", "auth", "access_token"),
-        "REFRESH_ID": pick("REFRESH_ID", "refresh_token"),
         "DOMAIN": pick("DOMAIN", "domain"),
         "member_id": pick("member_id", "MEMBER_ID"),
         "client_endpoint": pick("client_endpoint", "CLIENT_ENDPOINT"),
@@ -1457,13 +3249,21 @@ def extract_initial_auth_from_values(parsed):
     return {key: value for key, value in auth.items() if value}
 
 
-def render_index_html(install_mode=False, initial_auth=None):
+def sanitize_initial_auth(initial_auth):
+    token, domain = extract_auth_credentials(initial_auth)
+    if not token or not domain:
+        return {}
+    return {"AUTH_ID": token, "DOMAIN": domain}
+
+
+def render_index_html(install_mode=False, initial_auth=None, nonce=""):
     return (
         INDEX_HTML
-        .replace("__PUBLIC_APP_URL__", PUBLIC_APP_URL)
+        .replace("__PUBLIC_APP_URL__", json_for_script(PUBLIC_APP_URL))
         .replace("__INSTALL_MODE__", "true" if install_mode else "false")
-        .replace("__ADMIN_USER_IDS__", json.dumps(sorted(ADMIN_USER_IDS), ensure_ascii=False))
-        .replace("__INITIAL_AUTH__", json.dumps(initial_auth or {}, ensure_ascii=False))
+        .replace("__INITIAL_AUTH__", json_for_script(sanitize_initial_auth(initial_auth or {})))
+        .replace("__ALLOW_UNVERIFIED_USERS__", "true" if is_unverified_dev_mode() else "false")
+        .replace("__CSP_NONCE__", str(nonce or ""))
     )
 
 
@@ -1478,138 +3278,367 @@ def looks_like_install_payload(raw_payload):
     return any(marker in lowered for marker in markers)
 
 
+def _compute_readiness_state():
+    errors = []
+    for name in sorted(INVALID_ENV_VALUES):
+        errors.append(f"Некорректное значение переменной {name}")
+    try:
+        load_env()
+    except Exception as exc:
+        errors.append(str(exc))
+    if not RAW_BITRIX_ALLOWED_DOMAINS:
+        errors.append("Не задан BITRIX_ALLOWED_DOMAINS")
+    for raw_domain in sorted(RAW_BITRIX_ALLOWED_DOMAINS):
+        if not normalize_allowed_hostname(raw_domain):
+            errors.append("BITRIX_ALLOWED_DOMAINS содержит некорректный домен")
+    webhook_domain = webhook_bitrix_domain()
+    if webhook_domain and ALLOWED_BITRIX_DOMAINS != {webhook_domain}:
+        errors.append("BITRIX_ALLOWED_DOMAINS должен точно совпадать с доменом server webhook")
+    if not configured_bitrix_domains():
+        errors.append("Не задан разрешённый домен Bitrix24")
+    if CLAIM_STATS_SOURCE != "app_events":
+        errors.append("CLAIM_STATS_SOURCE поддерживает только точный режим app_events")
+    if not REQUIRE_EXPLICIT_ACCESS_RULE and not is_unverified_dev_mode():
+        errors.append("REQUIRE_EXPLICIT_ACCESS_RULE должен быть включён вне локального DRY_RUN")
+    if GREETING_AUTO_SEND and not GREETING_AUTO_SEND_SUPPORTED:
+        errors.append("GREETING_AUTO_SEND=1 запрещён до безопасной привязки чата к сделке")
+    if not DRY_RUN and not claim_marker_field_valid():
+        errors.append("Для DRY_RUN=0 требуется корректный BITRIX_CLAIM_MARKER_FIELD")
+    if not ADMIN_USER_IDS:
+        errors.append("Не задан ADMIN_USER_IDS")
+    elif any(not item.isdigit() for item in ADMIN_USER_IDS):
+        errors.append("ADMIN_USER_IDS должен содержать только числовые ID")
+    for raw_origin in sorted(RAW_APP_ALLOWED_ORIGINS):
+        parsed = safe_urlparse(raw_origin)
+        normalized = url_origin(raw_origin)
+        if (
+            parsed is None
+            or not normalized
+            or raw_origin != normalized
+            or "*" in raw_origin
+            or parsed.path not in {"", "/"}
+        ):
+            errors.append("APP_ALLOWED_ORIGINS содержит некорректный origin")
+        elif parsed.scheme != "https" and not is_loopback_http_url(raw_origin):
+            errors.append("APP_ALLOWED_ORIGINS должен использовать HTTPS")
+    if not PUBLIC_APP_URL:
+        errors.append("Не задан PUBLIC_APP_URL")
+    else:
+        public_url = safe_urlparse(PUBLIC_APP_URL)
+        if (
+            public_url is None
+            or not url_origin(PUBLIC_APP_URL)
+            or (public_url.scheme != "https" and not is_loopback_http_url(PUBLIC_APP_URL))
+            or public_url.path not in {"", "/"}
+        ):
+            errors.append("PUBLIC_APP_URL должен быть корректным HTTPS URL")
+    if not APP_ALLOWED_ORIGINS:
+        errors.append("Не задан APP_ALLOWED_ORIGINS")
+    trusted_origins = {
+        item
+        for item in (
+            url_origin(PUBLIC_APP_URL),
+            f"https://{webhook_domain}" if webhook_domain else "",
+        )
+        if item
+    }
+    if not is_local_runtime() and any(
+        origin not in trusted_origins for origin in APP_ALLOWED_ORIGINS
+    ):
+        errors.append("APP_ALLOWED_ORIGINS содержит недоверенный production origin")
+    if is_railway_runtime():
+        volume_name = str(os.environ.get("RAILWAY_VOLUME_NAME") or "").strip()
+        volume_mount = str(os.environ.get("RAILWAY_VOLUME_MOUNT_PATH") or "").strip()
+        if not volume_name or not volume_mount:
+            errors.append("Railway Volume не подключён к сервису")
+        else:
+            try:
+                mount_path = Path(volume_mount).expanduser().resolve()
+                app_data_path = APP_DIR.expanduser().resolve()
+            except (OSError, RuntimeError):
+                errors.append("Railway Volume имеет некорректный mount path")
+            else:
+                if mount_path != app_data_path:
+                    errors.append("Railway Volume подключён не в APP_DATA_DIR")
+    if APP_DIR.exists():
+        if not APP_DIR.is_dir():
+            errors.append("APP_DATA_DIR не является каталогом")
+        elif not os.access(APP_DIR, os.R_OK | os.W_OK):
+            errors.append("APP_DATA_DIR недоступен для чтения/записи")
+    else:
+        existing_parent = APP_DIR.parent
+        while not existing_parent.exists() and existing_parent != existing_parent.parent:
+            existing_parent = existing_parent.parent
+        if not existing_parent.is_dir() or not os.access(existing_parent, os.W_OK):
+            errors.append("APP_DATA_DIR нельзя создать")
+    try:
+        managers = load_managers()
+        if not isinstance(managers, list):
+            errors.append("managers.json должен содержать список")
+    except Exception:
+        errors.append("managers.json повреждён")
+    if not errors:
+        STATE_STORE.initialize(require_complete_legacy_set=REQUIRE_LEGACY_MIGRATION)
+    storage_state = STATE_STORE.readiness_check()
+    if not storage_state.get("ok") and (storage_state.get("migration") or {}).get("state") != "not_initialized":
+        errors.append("SQLite-хранилище или миграция данных не готовы")
+        sys.stderr.write(f"State store readiness error: {storage_state.get('error', 'unknown')}\n")
+    migration_state = (storage_state.get("migration") or {}).get("state")
+    if REQUIRE_LEGACY_MIGRATION and migration_state != "completed":
+        errors.append("Ожидается обязательная миграция legacy JSON")
+    return {
+        "ok": not errors,
+        "version": APP_VERSION,
+        "errors": errors,
+        "dryRun": DRY_RUN,
+        "greetingAutoSend": bool(GREETING_AUTO_SEND and GREETING_AUTO_SEND_SUPPORTED),
+        "storage": {
+            "ok": bool(storage_state.get("ok")),
+            "schemaVersion": storage_state.get("schemaVersion"),
+            "journalMode": storage_state.get("journalMode"),
+            "synchronous": storage_state.get("synchronous"),
+            "migration": {
+                "state": (storage_state.get("migration") or {}).get("state"),
+            },
+        },
+    }
+
+
+def readiness_state(*, force=False):
+    """Return a short-lived, serialized readiness snapshot.
+
+    Public API requests and Railway health probes must not fan out concurrent
+    SQLite integrity scans. ``force`` is for hermetic tests and diagnostics.
+    """
+
+    now = time.monotonic()
+    cached = READINESS_CACHE.get("state")
+    if (
+        not force
+        and cached is not None
+        and now - READINESS_CACHE.get("checkedAt", 0) < READINESS_CACHE_TTL_SECONDS
+    ):
+        return cached
+    with READINESS_CACHE_LOCK:
+        now = time.monotonic()
+        cached = READINESS_CACHE.get("state")
+        if (
+            not force
+            and cached is not None
+            and now - READINESS_CACHE.get("checkedAt", 0) < READINESS_CACHE_TTL_SECONDS
+        ):
+            return cached
+        state = _compute_readiness_state()
+        READINESS_CACHE.update({"checkedAt": now, "state": state})
+        return state
+
+
 class Handler(BaseHTTPRequestHandler):
+    server_version = "KrugosvetDealPicker/1"
+
+    def request_origin_allowed(self):
+        origin = str(self.headers.get("Origin") or "").strip().rstrip("/")
+        if not origin:
+            return True
+        normalized_origin = url_origin(origin)
+        if normalized_origin and origin == normalized_origin and origin in APP_ALLOWED_ORIGINS:
+            return True
+        if is_unverified_dev_mode():
+            parsed = safe_urlparse(origin)
+            try:
+                return bool(
+                    parsed is not None
+                    and parsed.scheme == "http"
+                    and parsed.hostname in {"127.0.0.1", "localhost", "::1"}
+                )
+            except (TypeError, ValueError):
+                return False
+        return False
+
+    def client_key(self):
+        candidate = str(self.client_address[0])
+        if is_railway_runtime() and self.headers.get("X-Railway-Edge"):
+            candidate = str(self.headers.get("X-Real-IP") or candidate).strip()
+        try:
+            return ipaddress.ip_address(candidate).compressed
+        except ValueError:
+            return "invalid-client-ip"
+
+    def setup(self):
+        super().setup()
+        self.connection.settimeout(SOCKET_TIMEOUT_SECONDS)
+
+    def send_common_headers(self, nonce=None):
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+        origin = str(self.headers.get("Origin") or "").strip().rstrip("/")
+        if origin and self.request_origin_allowed():
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
+        if nonce is not None:
+            frame_ancestors = " ".join(
+                f"https://{domain}" for domain in sorted(configured_bitrix_domains())
+            ) or "'none'"
+            policy = [
+                "default-src 'self'",
+                f"script-src 'self' 'nonce-{nonce}' https://api.bitrix24.com",
+                f"style-src 'self' 'nonce-{nonce}'",
+                "connect-src 'self'",
+                "img-src 'self' data:",
+                f"frame-ancestors {frame_ancestors}",
+                "base-uri 'none'",
+                "form-action 'self'",
+                "object-src 'none'",
+            ]
+            self.send_header("Content-Security-Policy", "; ".join(policy))
+
     def send_json(self, payload, status=200):
-        body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_common_headers()
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
+    def send_html(self, install_mode=False, initial_auth=None, status=200):
+        nonce = secrets.token_urlsafe(24)
+        body = render_index_html(install_mode, initial_auth, nonce).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_common_headers(nonce=nonce)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def read_body(self):
+        if self.headers.get("Transfer-Encoding"):
+            raise ValueError("Transfer-Encoding не поддерживается")
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError as exc:
+            raise ValueError("Некорректный Content-Length") from exc
+        if length < 0 or length > MAX_REQUEST_BODY_BYTES:
+            raise OverflowError("Тело запроса слишком большое")
+        return self.rfile.read(length) if length else b""
+
+    def read_json(self):
+        raw = self.read_body()
+        try:
+            payload = json.loads(raw or b"{}")
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError("Некорректный JSON") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("JSON-запрос должен быть объектом")
+        return payload
+
     def do_OPTIONS(self):
+        if not self.request_origin_allowed():
+            self.send_json({"ok": False, "message": "Origin не разрешён"}, 403)
+            return
         self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_common_headers()
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
+        self.send_header("Access-Control-Max-Age", "600")
         self.end_headers()
 
     def do_GET(self):
-        parsed = urllib.parse.urlparse(self.path)
-        if parsed.path == "/install":
-            query = urllib.parse.parse_qs(parsed.query)
-            body = render_index_html(True, extract_initial_auth_from_values(query)).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-            return
-        if parsed.path == "/api/deals":
-            try:
-                self.send_json({"sourceStages": SOURCE_STAGES, "targetStage": TARGET_STAGE, "deals": list_allowed_deals()})
-            except Exception as exc:
-                self.send_json({"error": str(exc)}, 500)
-            return
-        if parsed.path == "/api/managers":
-            try:
-                self.send_json({"managers": load_managers()})
-            except Exception as exc:
-                self.send_json({"error": str(exc)}, 500)
+        parsed = safe_urlparse(self.path)
+        if parsed is None:
+            self.send_json({"ok": False, "message": "Некорректный URL запроса"}, 400)
             return
         if parsed.path == "/api/health":
-            self.send_json(
-                {
-                    "ok": True,
-                    "version": APP_VERSION,
-                    "sourceStages": SOURCE_STAGES,
-                    "debugDealLimit": 20,
-                    "nextDealScanLimit": NEXT_DEAL_SCAN_LIMIT,
-                    "nextDealScanWorkers": NEXT_DEAL_SCAN_WORKERS,
-                    "nextDealBatchTimeoutSeconds": NEXT_DEAL_BATCH_TIMEOUT_SECONDS,
-                    "dryRun": DRY_RUN,
-                    "sundayLimitBypass": True,
-                    "limitFreeWindow": {
-                        "start": LIMIT_FREE_WINDOW_START,
-                        "end": LIMIT_FREE_WINDOW_END,
-                        "activeNow": is_limit_free_time(),
-                    },
-                    "rejectReasons": REJECT_REASONS,
-                    "greetingAutoSend": GREETING_AUTO_SEND,
-                    "greetingLog": True,
-                }
-            )
+            self.send_json({"ok": True, "version": APP_VERSION})
             return
-        if parsed.path == "/api/manager":
-            try:
-                query = urllib.parse.parse_qs(parsed.query)
-                manager_id = (query.get("managerId") or [""])[0]
-                self.send_json({"manager": get_manager_profile(manager_id)})
-            except Exception as exc:
-                self.send_json({"error": str(exc)}, 500)
+        if parsed.path == "/api/ready":
+            state = readiness_state()
+            self.send_json(state, 200 if state.get("ok") else 503)
             return
-        if parsed.path == "/api/next-deal":
-            try:
-                query = urllib.parse.parse_qs(parsed.query)
-                manager_id = (query.get("managerId") or [""])[0]
-                skipped = query.get("skip[]", []) + query.get("skip", [])
-                self.send_json(get_next_deal_for_manager(manager_id, skipped))
-            except Exception as exc:
-                self.send_json({"error": str(exc)}, 500)
+        if parsed.path == "/install":
+            self.send_html(True, {})
             return
-        if parsed.path == "/" or not parsed.path.startswith("/api/"):
-            query = urllib.parse.parse_qs(parsed.query)
-            install_mode = parsed.path == "/install" or (query.get("install") or query.get("INSTALL") or [""])[0].upper() == "Y"
-            body = render_index_html(install_mode, extract_initial_auth_from_values(query)).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+        if parsed.path == "/":
+            self.send_html(False, {})
             return
-        self.send_error(404)
+        self.send_json({"ok": False, "message": "Маршрут не найден"}, 404)
 
     def do_POST(self):
-        parsed = urllib.parse.urlparse(self.path)
+        parsed = safe_urlparse(self.path)
+        if parsed is None:
+            self.send_json({"ok": False, "message": "Некорректный URL запроса"}, 400)
+            return
         if parsed.path in {"/", "/install"}:
-            length = int(self.headers.get("Content-Length", "0"))
-            raw_payload = self.rfile.read(length) if length else b""
+            try:
+                raw_payload = self.read_body()
+            except OverflowError as exc:
+                self.send_json({"ok": False, "message": str(exc)}, 413)
+                return
+            except ValueError as exc:
+                self.send_json({"ok": False, "message": str(exc)}, 400)
+                return
             install_mode = parsed.path == "/install" or looks_like_install_payload(raw_payload)
-            initial_auth = extract_initial_auth(raw_payload)
-            body = render_index_html(install_mode, initial_auth).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            self.send_html(install_mode, extract_initial_auth(raw_payload))
             return
         if not parsed.path.startswith("/api/"):
-            self.send_error(404)
+            self.send_json({"ok": False, "message": "Маршрут не найден"}, 404)
             return
-        length = int(self.headers.get("Content-Length", "0"))
-        payload = json.loads(self.rfile.read(length) or b"{}")
+        if not self.request_origin_allowed():
+            self.send_json({"ok": False, "message": "Origin не разрешён"}, 403)
+            return
+        if not rate_limit_allowed(self.client_key()):
+            self.send_json({"ok": False, "message": "Слишком много запросов. Повторите позже."}, 429)
+            return
+        if not readiness_state().get("ok"):
+            self.send_json({"ok": False, "message": "Сервис ещё не готов. Обратитесь к администратору."}, 503)
+            return
         try:
+            payload = self.read_json()
+            if parsed.path == "/api/dev/managers":
+                if not is_unverified_dev_mode():
+                    self.send_json({"ok": False, "message": "Маршрут доступен только локально в DRY_RUN"}, 403)
+                    return
+                self.send_json(
+                    {
+                        "ok": True,
+                        "managers": [
+                            {**manager, "intranet": True}
+                            for manager in load_managers()
+                            if isinstance(manager, dict)
+                        ],
+                    }
+                )
+                return
             if parsed.path == "/api/next-deal":
-                manager_id = actor_id_from_payload(payload)
+                manager_id = actor_id_from_payload(payload, allow_cached=False)
                 if not manager_id:
                     self.send_json({"deal": None, "reason": "Не удалось подтвердить пользователя Битрикс."}, 401)
                     return
-                result = get_next_deal_for_manager(manager_id, payload.get("skipped") or [])
-                self.send_json(result)
+                result = get_next_deal_for_manager(
+                    manager_id, payload.get("continuationToken")
+                )
+                status = int(result.pop("_httpStatus", 200))
+                self.send_json(result, status)
                 return
             if parsed.path == "/api/claim":
-                manager_id = actor_id_from_payload(payload)
+                manager_id = actor_id_from_payload(payload, allow_cached=False)
                 if not manager_id:
                     self.send_json({"ok": False, "message": "Не удалось подтвердить пользователя Битрикс."}, 401)
                     return
-                result = preview_claim(payload.get("dealId"), manager_id, payload.get("deal"), payload.get("auth"))
-                self.send_json(result)
+                result = preview_claim(
+                    payload.get("dealId"),
+                    manager_id,
+                    payload.get("auth"),
+                    payload.get("selectionToken"),
+                )
+                status = int(result.pop("_httpStatus", 200))
+                self.send_json(result, status)
                 return
             if parsed.path == "/api/reject":
-                manager_id = actor_id_from_payload(payload)
+                manager_id = actor_id_from_payload(payload, allow_cached=False)
                 if not manager_id:
                     self.send_json({"ok": False, "message": "Не удалось подтвердить пользователя Битрикс."}, 401)
                     return
@@ -1617,18 +3646,26 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(result, 200 if result.get("ok") else 400)
                 return
             if parsed.path == "/api/admin/state":
-                self.send_json(admin_state(payload))
+                result = admin_state(payload)
+                self.send_json(result, 200 if result.get("ok") else 403)
                 return
             if parsed.path == "/api/admin/rule":
-                self.send_json(update_admin_rule(payload))
+                result = update_admin_rule(payload)
+                self.send_json(result, 200 if result.get("ok") else 403)
                 return
             if parsed.path == "/api/current-user":
                 result = current_user_state(payload)
                 self.send_json(result, 200 if result.get("ok") else 401)
                 return
-            self.send_error(404)
+            self.send_json({"ok": False, "message": "Маршрут не найден"}, 404)
+        except OverflowError as exc:
+            self.send_json({"ok": False, "message": str(exc)}, 413)
+        except ValueError as exc:
+            self.send_json({"ok": False, "message": str(exc)}, 400)
+        except PermissionError:
+            self.send_json({"ok": False, "message": "Недостаточно прав"}, 403)
         except Exception as exc:
-            sys.stderr.write(f"API error {parsed.path}: {exc}\n")
+            sys.stderr.write(f"API error {parsed.path}: {type(exc).__name__}\n")
             if parsed.path == "/api/next-deal":
                 self.send_json(
                     {
@@ -1639,10 +3676,41 @@ class Handler(BaseHTTPRequestHandler):
                     503,
                 )
                 return
-            self.send_json({"ok": False, "error": str(exc)}, 500)
+            self.send_json({"ok": False, "message": "Внутренняя ошибка сервиса"}, 500)
 
     def log_message(self, fmt, *args):
-        sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
+        # Railway already has request correlation at the edge.  Persisting a
+        # visitor's full IP address in application logs adds personal data
+        # without helping this service diagnose a route-level failure.
+        parsed = safe_urlparse(self.path)
+        path = parsed.path if parsed is not None else "<invalid-path>"
+        sys.stderr.write(f"{self.command} {path}\n")
+
+
+class BoundedThreadingHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+    block_on_close = False
+    request_queue_size = 64
+
+    def __init__(self, server_address, request_handler_class):
+        self._request_slots = threading.BoundedSemaphore(MAX_CONCURRENT_REQUESTS)
+        super().__init__(server_address, request_handler_class)
+
+    def process_request(self, request, client_address):
+        if not self._request_slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._request_slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._request_slots.release()
 
 
 INDEX_HTML = """<!doctype html>
@@ -1651,7 +3719,7 @@ INDEX_HTML = """<!doctype html>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Получить сделку - тест</title>
-  <style>
+  <style nonce="__CSP_NONCE__">
     :root { color-scheme: light; font-family: Arial, sans-serif; background: #f6f7f9; color: #1f2933; }
     body { margin: 0; }
     header { background: #ffffff; border-bottom: 1px solid #d9dee7; padding: 18px 22px; }
@@ -1696,6 +3764,7 @@ INDEX_HTML = """<!doctype html>
     .greeting-text { white-space: pre-wrap; background: #f2f5f8; border-radius: 6px; padding: 10px; margin: 10px 0; line-height: 1.45; }
     .greeting-title { font-weight: 700; margin-bottom: 4px; }
     pre { white-space: pre-wrap; background: #111827; color: #e5e7eb; padding: 12px; border-radius: 8px; overflow: auto; }
+    pre.warning-output { background: #fff7e6; color: #7a4b00; border: 1px solid #f0c36d; }
   </style>
 </head>
 <body>
@@ -1705,9 +3774,9 @@ INDEX_HTML = """<!doctype html>
   </header>
   <main>
     <div class="toolbar">
-      <select id="managerSelect" class="hidden" onchange="syncManagerId()"></select>
+      <select id="managerSelect" class="hidden"></select>
       <input id="managerId" class="hidden" placeholder="ID менеджера для проверки">
-      <button id="getDealButton" onclick="getDeal()">Получить сделку</button>
+      <button id="getDealButton" disabled>Получить сделку</button>
     </div>
     <div id="managerInfo" class="status"></div>
     <div id="status" class="status">Выберите менеджера и нажмите “Получить сделку”.</div>
@@ -1720,43 +3789,40 @@ INDEX_HTML = """<!doctype html>
     <section id="greetingBox" class="card greeting-box hidden"></section>
     <section id="adminPanel" class="admin-panel hidden">
       <h2>Доступ менеджеров</h2>
-      <div class="meta">Этот блок видит только администратор. Здесь можно закрыть выдачу заявок или поставить дневной лимит. Лимит не применяется в воскресенье и каждый день с 18:00 до 21:30. Подсчёт взятых заявок берётся из CRM (сделки в стадии «В работе»), поэтому учитываются заявки, взятые как через приложение, так и напрямую в Битрикс24.</div>
+      <div class="meta">Этот блок видит только администратор. Здесь можно закрыть выдачу заявок или поставить дневной лимит. Лимит не применяется в воскресенье и каждый день с 18:00 до 21:30. В статистике и лимите учитываются только заявки, взятые через это приложение: Bitrix REST не даёт надёжной исторической разбивки ручных переходов по менеджерам.</div>
       <div class="toolbar">
         <input id="statsFrom" type="date">
         <input id="statsTo" type="date">
-        <button class="secondary" onclick="loadAdminPanel()">Обновить статистику</button>
+        <button id="refreshAdminButton" class="secondary">Обновить статистику</button>
       </div>
       <div id="adminRows"></div>
     </section>
   </main>
-<script src="//api.bitrix24.com/api/v1/"></script>
-<script>
+<script nonce="__CSP_NONCE__" src="https://api.bitrix24.com/api/v1/"></script>
+<script nonce="__CSP_NONCE__">
 let selectedDealId = null;
 let currentDeal = null;
 let skippedDeals = [];
 let managers = [];
 let currentBitrixUser = null;
+let currentUserIsAdmin = false;
 let isDealSearchRunning = false;
-const MAX_SEARCH_BATCHES = 8;
-const PUBLIC_APP_URL = "__PUBLIC_APP_URL__";
+let userVerified = false;
+let canRequestDeal = false;
+const MAX_SEARCH_BATCHES = 250;
+const PUBLIC_APP_URL = __PUBLIC_APP_URL__;
 const INSTALL_MODE = __INSTALL_MODE__;
-const ADMIN_USER_IDS = __ADMIN_USER_IDS__;
 const INITIAL_AUTH = __INITIAL_AUTH__;
+const ALLOW_UNVERIFIED_USERS = __ALLOW_UNVERIFIED_USERS__;
 const REJECT_REASONS = {
   not_my_country: 'Не моя страна',
   unclear_request: 'Непонятный запрос',
   duplicate: 'Дубль',
   other: 'Другое'
 };
-const PUBLIC_APP_ORIGIN = (() => {
-  try { return new URL(PUBLIC_APP_URL).origin; } catch (error) { return ''; }
-})();
-const API_BASE = PUBLIC_APP_ORIGIN && window.location.origin !== PUBLIC_APP_ORIGIN
-  ? PUBLIC_APP_ORIGIN
-  : '';
 function apiUrl(path) {
-  if (/^https?:\/\//i.test(path)) return path;
-  return `${API_BASE}${path}`;
+  if (!String(path || '').startsWith('/')) throw new Error('Некорректный адрес API.');
+  return path;
 }
 function currentUserId() {
   return String(
@@ -1766,7 +3832,7 @@ function currentUserId() {
   );
 }
 function isCurrentUserAdmin() {
-  return ADMIN_USER_IDS.includes(currentUserId());
+  return currentUserIsAdmin;
 }
 function currentAuth() {
   if (window.BX24 && BX24.getAuth) {
@@ -1800,28 +3866,15 @@ async function postJson(url, payload) {
   }
   return data;
 }
-async function getJson(url) {
-  const response = await fetch(apiUrl(url));
-  const text = await response.text();
-  let data;
-  try {
-    data = JSON.parse(text);
-  } catch (error) {
-    throw new Error(`Сервер вернул не JSON для ${url}.`);
-  }
-  if (!response.ok) {
-    throw new Error(data.message || data.reason || data.error || 'Ошибка запроса');
-  }
-  return data;
-}
 async function loadManagers() {
-  document.getElementById('status').textContent = 'Определяю пользователя Битрикс...';
+  if (!ALLOW_UNVERIFIED_USERS) return false;
+  document.getElementById('status').textContent = 'Загружаю локальный тестовый список...';
   let data;
   try {
-    data = await getJson('/api/managers');
+    data = await postJson('/api/dev/managers', {});
   } catch (error) {
     document.getElementById('status').textContent = error.message || 'Не удалось загрузить приложение.';
-    return;
+    return false;
   }
   managers = data.managers || [];
   const select = document.getElementById('managerSelect');
@@ -1829,31 +3882,54 @@ async function loadManagers() {
     .filter((manager) => manager.active !== false)
     .map((manager) => `<option value="${escapeHtml(manager.id)}">${escapeHtml(manager.name)}</option>`)
     .join('');
-  detectBitrixUser();
+  select.classList.remove('hidden');
+  document.getElementById('managerId').classList.remove('hidden');
+  document.getElementById('status').textContent = 'Локальный DRY_RUN: выберите тестового менеджера.';
+  return true;
 }
 function applyAuthorizedUser(user, manager) {
   const rawUser = user && user.raw ? user.raw : user;
   currentBitrixUser = rawUser || {};
+  if (user && Object.prototype.hasOwnProperty.call(user, 'isAdmin')) {
+    currentUserIsAdmin = Boolean(user.isAdmin);
+  }
   const managerId = String((rawUser && rawUser.ID) || (user && user.id) || (manager && manager.id) || '');
   if (managerId) {
     document.getElementById('managerId').value = managerId;
   }
   document.getElementById('managerSelect').classList.add('hidden');
   document.getElementById('managerId').classList.add('hidden');
+  userVerified = true;
   if (manager) {
     renderManagerInfo(manager);
-    loadAdminPanel();
-  } else if (managerId) {
-    loadCurrentManagerFromBitrix(managerId).then(() => {
-      loadAdminPanel();
-    });
+  } else {
+    canRequestDeal = false;
+    document.getElementById('managerInfo').textContent = 'Пользователь подтверждён, но профиль сотрудника недоступен.';
+    document.getElementById('status').textContent = 'Проверьте доступ приложения к карточкам сотрудников.';
+    document.getElementById('getDealButton').disabled = true;
   }
+  if (isCurrentUserAdmin()) loadAdminPanel();
 }
 function renderManagerInfo(manager) {
-  document.getElementById('managerInfo').textContent = (manager.competencies || []).length
+  const competencies = manager.competencies || [];
+  const isActive = manager.active !== false;
+  const isEmployee = manager.intranet === true;
+  canRequestDeal = userVerified && isActive && isEmployee && competencies.length > 0;
+  document.getElementById('getDealButton').disabled = !canRequestDeal;
+  if (!isActive) {
+    document.getElementById('managerInfo').textContent = `Пользователь ${manager.name} деактивирован.`;
+    document.getElementById('status').textContent = 'Обратитесь к администратору Bitrix24.';
+    return;
+  }
+  if (!isEmployee) {
+    document.getElementById('managerInfo').textContent = `Пользователь ${manager.name} не относится к сотрудникам компании.`;
+    document.getElementById('status').textContent = 'Выдача заявок недоступна.';
+    return;
+  }
+  document.getElementById('managerInfo').textContent = competencies.length
     ? `Вы вошли как ${manager.name}. Навыки из карточки сотрудника: ${manager.competencies.join(', ')}`
     : `Вы вошли как ${manager.name}. В карточке сотрудника не заполнено поле “Навыки”.`;
-  document.getElementById('status').textContent = (manager.competencies || []).length
+  document.getElementById('status').textContent = competencies.length
     ? 'Нажмите “Получить сделку”.'
     : 'Заполните поле “Навыки” в карточке сотрудника, иначе подбор невозможен.';
 }
@@ -1869,15 +3945,19 @@ async function detectUserFromServerAuth() {
     return false;
   }
 }
+async function identifyUserOrShowDevPicker() {
+  const found = await detectUserFromServerAuth();
+  if (found) return;
+  if (await loadManagers()) return;
+  userVerified = false;
+  canRequestDeal = false;
+  document.getElementById('getDealButton').disabled = true;
+  document.getElementById('status').textContent = 'Не удалось подтвердить пользователя Битрикс. Откройте приложение внутри Bitrix24 или обновите страницу.';
+}
 function detectBitrixUser() {
-  if (!window.BX24 || !BX24.init || !BX24.callMethod) {
-    detectUserFromServerAuth().then((found) => {
-      if (!found) {
-        document.getElementById('managerSelect').classList.remove('hidden');
-        document.getElementById('managerId').classList.remove('hidden');
-        document.getElementById('status').textContent = 'Локальный тест: выберите менеджера вручную.';
-      }
-    });
+  document.getElementById('status').textContent = 'Подтверждаю пользователя Битрикс...';
+  if (!window.BX24 || !BX24.init) {
+    identifyUserOrShowDevPicker();
     return;
   }
   BX24.init(() => {
@@ -1888,20 +3968,7 @@ function detectBitrixUser() {
       document.getElementById('status').textContent = 'Установка приложения завершена.';
       return;
     }
-    if (BX24.installFinish) {
-      try {
-        BX24.installFinish();
-      } catch (error) {}
-    }
-    BX24.callMethod('user.current', {}, (result) => {
-      if (result.error()) {
-        detectUserFromServerAuth().then((found) => {
-          if (!found) document.getElementById('status').textContent = 'Не удалось определить пользователя Битрикс. Проверьте права приложения.';
-        });
-        return;
-      }
-      applyAuthorizedUser(result.data(), null);
-    });
+    identifyUserOrShowDevPicker();
   });
 }
 function bx24Call(method, params) {
@@ -1975,22 +4042,6 @@ async function bindLeftMenu() {
   }
   showResult({ ok: false, message: 'Не удалось закрепить в левом меню.', errors });
 }
-async function loadCurrentManagerFromBitrix(managerId) {
-  let data;
-  try {
-    data = await getJson(`/api/manager?managerId=${encodeURIComponent(managerId)}`);
-  } catch (error) {
-    document.getElementById('status').textContent = error.message || 'Не удалось загрузить профиль менеджера.';
-    return;
-  }
-  const manager = data.manager;
-  if (!manager) {
-    document.getElementById('managerInfo').textContent = `Вы вошли как ${currentBitrixUser.NAME || ''} ${currentBitrixUser.LAST_NAME || ''}. Пользователь не найден.`;
-    document.getElementById('status').textContent = 'Проверьте доступ приложения к пользователям.';
-    return;
-  }
-  renderManagerInfo(manager);
-}
 function syncManagerId() {
   const select = document.getElementById('managerSelect');
   const managerId = select.value;
@@ -2002,16 +4053,22 @@ function syncManagerId() {
   clearGreeting();
   setSearching(false);
   const manager = managers.find((item) => String(item.id) === String(managerId));
-  document.getElementById('managerInfo').textContent = manager
-    ? `Компетенции: ${(manager.competencies || []).join(', ')}`
-    : '';
+  userVerified = Boolean(managerId && manager && ALLOW_UNVERIFIED_USERS);
+  currentBitrixUser = userVerified ? { ID: managerId } : null;
+  currentUserIsAdmin = false;
+  if (manager) renderManagerInfo(manager);
+  else {
+    canRequestDeal = false;
+    document.getElementById('managerInfo').textContent = '';
+    document.getElementById('getDealButton').disabled = true;
+  }
 }
 function setSearching(isSearching, text) {
   const progress = document.getElementById('searchProgress');
   const button = document.getElementById('getDealButton');
   progress.classList.toggle('hidden', !isSearching);
   if (button) {
-    button.disabled = isSearching;
+    button.disabled = isSearching || !canRequestDeal;
     button.textContent = isSearching ? 'Ищем...' : 'Получить сделку';
   }
   if (text) {
@@ -2020,6 +4077,10 @@ function setSearching(isSearching, text) {
 }
 async function getDeal() {
   if (isDealSearchRunning) return;
+  if (!userVerified || !canRequestDeal) {
+    document.getElementById('status').textContent = 'Сначала подтвердите пользователя и заполните навыки сотрудника.';
+    return;
+  }
   isDealSearchRunning = true;
   selectedDealId = null;
   currentDeal = null;
@@ -2035,19 +4096,18 @@ async function getDeal() {
   document.getElementById('result').hidden = true;
   clearGreeting();
   let data = null;
-  const searchSkipped = new Set(skippedDeals.map(String));
+  let continuationToken = null;
   let checkedCount = 0;
   try {
     for (let batch = 0; batch < MAX_SEARCH_BATCHES; batch += 1) {
       data = await postJson('/api/next-deal', {
         auth,
         managerId,
-        currentUserId: currentUserId(),
-        skipped: Array.from(searchSkipped)
+        continuationToken
       });
-      (data.scannedDealIds || []).forEach((dealId) => searchSkipped.add(String(dealId)));
+      continuationToken = data.continuationToken || null;
       checkedCount += Number(data.checkedCount || 0);
-      if (data.deal || !data.hasMore) break;
+      if (data.deal || !data.hasMore || !continuationToken) break;
       setSearching(
         true,
         `Проверено заявок: ${checkedCount}. Ищу дальше, начиная со старых...`
@@ -2085,23 +4145,27 @@ function renderDeal(deal) {
     ? deal.messages.map((m, i) => `<div class="msg">${i + 1}. ${escapeHtml(m.slice(0, 520))}</div>`).join('')
     : '<div class="msg empty">Полезные сообщения пока не найдены.</div>';
   const rejectButtons = Object.entries(REJECT_REASONS)
-    .map(([reason, label]) => `<button class="reason" onclick="rejectDeal('${escapeHtml(reason)}')">${escapeHtml(label)}</button>`)
+    .map(([reason, label]) => `<button class="reason reject-button" data-reject-reason="${escapeHtml(reason)}">${escapeHtml(label)}</button>`)
     .join('');
   card.innerHTML = `
-    <div class="badge">Сделка #${deal.id}</div>
+    <div class="badge">Сделка #${escapeHtml(deal.id)}</div>
     <div class="badge">${escapeHtml(deal.stageName)}</div>
     <div class="badge">Направление: ${escapeHtml(deal.classification.direction)}</div>
     <h3>${escapeHtml(deal.title || 'Без названия')}</h3>
     <div class="meta">Ответственный ID: ${escapeHtml(String(deal.assignedById || ''))}<br>Создана: ${escapeHtml(deal.dateCreate || '')}<br>Уверенность: ${escapeHtml(deal.classification.confidence)}<br>${escapeHtml(deal.matchReason || '')}</div>
     ${messages}
     <div class="toolbar">
-      <button class="claim-button" onclick="claimSelected()">Взять в работу</button>
+      <button class="claim-button">Взять в работу</button>
     </div>
     <div class="reject-reasons">
       <span class="label">Отказаться:</span>
       ${rejectButtons}
     </div>
   `;
+  card.querySelector('.claim-button').addEventListener('click', claimSelected);
+  card.querySelectorAll('.reject-button').forEach((button) => {
+    button.addEventListener('click', () => rejectDeal(button.dataset.rejectReason));
+  });
   return card;
 }
 async function claimSelected() {
@@ -2121,14 +4185,7 @@ async function claimSelected() {
       auth,
       dealId: selectedDealId,
       managerId,
-      currentUserId: currentUserId(),
-      deal: currentDeal ? {
-        id: currentDeal.id,
-        title: currentDeal.title || '',
-        classification: currentDeal.classification || {},
-        messages: currentDeal.messages || [],
-        openlineSessionIds: currentDeal.openlineSessionIds || []
-      } : null
+      selectionToken: currentDeal && currentDeal.selectionToken
     });
   } catch (error) {
     payload = { ok: false, message: error.message || 'Не удалось взять сделку.' };
@@ -2150,36 +4207,43 @@ async function claimSelected() {
     button.textContent = 'Взять в работу';
   }
 }
-function rejectDeal(reason) {
+async function rejectDeal(reason) {
   if (!currentDeal) return;
   const rejectedDeal = currentDeal;
   const managerId = document.getElementById('managerId').value.trim();
   const auth = currentAuth();
   reason = reason || 'other';
-  skippedDeals.push(String(rejectedDeal.id));
+  document.querySelectorAll('.reject-button').forEach((button) => { button.disabled = true; });
+  document.getElementById('status').textContent = 'Сохраняю отказ...';
+  try {
+    await postJson('/api/reject', {
+      auth,
+      managerId,
+      dealId: rejectedDeal.id,
+      reason,
+      selectionToken: rejectedDeal.selectionToken
+    });
+  } catch (error) {
+    document.querySelectorAll('.reject-button').forEach((button) => { button.disabled = false; });
+    document.getElementById('status').textContent = error.message || 'Не удалось сохранить отказ. Повторите ещё раз.';
+    return;
+  }
+  if (!skippedDeals.includes(String(rejectedDeal.id))) skippedDeals.push(String(rejectedDeal.id));
   currentDeal = null;
   selectedDealId = null;
   document.getElementById('cards').innerHTML = '';
   document.getElementById('status').textContent = `Отказ: ${REJECT_REASONS[reason] || REJECT_REASONS.other}. Ищу следующую...`;
   document.getElementById('result').hidden = true;
   clearGreeting();
-  postJson('/api/reject', {
-    auth,
-    managerId,
-    currentUserId: currentUserId(),
-    dealId: rejectedDeal.id,
-    reason,
-    deal: {
-      id: rejectedDeal.id,
-      title: rejectedDeal.title || '',
-      stageId: rejectedDeal.stageId || '',
-      stageName: rejectedDeal.stageName || '',
-      classification: rejectedDeal.classification || {}
-    }
-  }).then(() => {
-    loadAdminPanel();
-  }).catch(() => {});
+  if (isCurrentUserAdmin()) loadAdminPanel();
   getDeal();
+}
+function bishkekDate() {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Bishkek', year: 'numeric', month: '2-digit', day: '2-digit'
+  }).formatToParts(new Date());
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `${values.year}-${values.month}-${values.day}`;
 }
 async function loadAdminPanel() {
   if (!currentBitrixUser) return;
@@ -2187,7 +4251,7 @@ async function loadAdminPanel() {
   const panel = document.getElementById('adminPanel');
   panel.classList.remove('hidden');
   document.getElementById('adminRows').innerHTML = '<div class="status">Загружаю настройки доступа...</div>';
-  const today = new Date().toISOString().slice(0, 10);
+  const today = bishkekDate();
   const from = document.getElementById('statsFrom');
   const to = document.getElementById('statsTo');
   if (!from.value) from.value = today;
@@ -2196,7 +4260,6 @@ async function loadAdminPanel() {
   try {
     data = await postJson('/api/admin/state', {
       auth: currentAuth(),
-      currentUserId: currentUserId(),
       dateFrom: from.value,
       dateTo: to.value
     });
@@ -2208,15 +4271,18 @@ async function loadAdminPanel() {
     document.getElementById('adminRows').innerHTML = '<div class="status">Админский доступ не подтвержден.</div>';
     return;
   }
-  renderAdminRows(data.managers || []);
+  renderAdminRows(data.managers || [], data.warnings || []);
 }
-function renderAdminRows(rows) {
+function renderAdminRows(rows, warnings) {
   const target = document.getElementById('adminRows');
   if (!rows.length) {
     target.innerHTML = '<div class="status">Пока нет менеджеров с навыками или статистикой.</div>';
     return;
   }
-  target.innerHTML = `
+  const warningHtml = (warnings || []).length
+    ? `<div class="status empty">${(warnings || []).map(escapeHtml).join('<br>')}</div>`
+    : '';
+  target.innerHTML = `${warningHtml}
     <table class="admin-table">
       <thead>
         <tr>
@@ -2224,8 +4290,8 @@ function renderAdminRows(rows) {
           <th>Навыки</th>
           <th>Доступ</th>
           <th>Лимит в день</th>
-          <th>За период</th>
-          <th>Сегодня</th>
+          <th>Взято через приложение за период</th>
+          <th>Взято через приложение сегодня</th>
           <th>Отказы период</th>
           <th>Отказы сегодня</th>
           <th>Причина отказов</th>
@@ -2244,12 +4310,15 @@ function renderAdminRows(rows) {
             <td>${escapeHtml(row.rejectedInPeriod || 0)}</td>
             <td>${escapeHtml(row.rejectedToday || 0)}</td>
             <td>${escapeHtml(row.topRejectReason || '')}</td>
-            <td><button class="secondary" onclick="saveAccessRule('${escapeHtml(row.id)}')">Сохранить</button></td>
+            <td><button class="secondary save-rule-button" data-manager-id="${escapeHtml(row.id)}">Сохранить</button></td>
           </tr>
         `).join('')}
       </tbody>
     </table>
   `;
+  target.querySelectorAll('.save-rule-button').forEach((button) => {
+    button.addEventListener('click', () => saveAccessRule(button.dataset.managerId));
+  });
 }
 async function saveAccessRule(managerId) {
   const row = Array.from(document.querySelectorAll('tr[data-manager-id]'))
@@ -2261,7 +4330,6 @@ async function saveAccessRule(managerId) {
   try {
     await postJson('/api/admin/rule', {
       auth: currentAuth(),
-      currentUserId: currentUserId(),
       managerId,
       enabled: row.querySelector('.rule-enabled').checked,
       dailyLimit: row.querySelector('.rule-limit').value
@@ -2311,7 +4379,7 @@ function renderGreeting(greeting) {
   const button = document.createElement('button');
   button.className = 'secondary';
   button.textContent = 'Скопировать текст';
-  button.onclick = () => copyGreetingText(greeting.text, button);
+  button.addEventListener('click', () => copyGreetingText(greeting.text, button));
 
   box.appendChild(title);
   box.appendChild(meta);
@@ -2332,22 +4400,25 @@ async function copyGreetingText(text, button) {
 function showResult(payload) {
   const result = document.getElementById('result');
   if (payload && payload.ok) {
-    result.hidden = true;
+    const warnings = Array.isArray(payload.warnings) ? payload.warnings.filter(Boolean) : [];
+    result.classList.toggle('warning-output', warnings.length > 0);
+    result.hidden = warnings.length === 0;
+    result.textContent = warnings.length ? `Внимание:\n${warnings.join('\n')}` : '';
     if (payload.message) document.getElementById('status').textContent = payload.message;
     return;
   }
+  result.classList.remove('warning-output');
   result.hidden = false;
   result.textContent = JSON.stringify(payload, null, 2);
 }
 function escapeHtml(value) {
   return String(value).replace(/[&<>"']/g, (ch) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[ch]));
 }
-if (INSTALL_MODE) {
-  document.getElementById('status').textContent = 'Завершаю установку приложения...';
-  detectBitrixUser();
-} else {
-  loadManagers();
-}
+document.getElementById('managerSelect').addEventListener('change', syncManagerId);
+document.getElementById('getDealButton').addEventListener('click', getDeal);
+document.getElementById('refreshAdminButton').addEventListener('click', loadAdminPanel);
+if (INSTALL_MODE) document.getElementById('status').textContent = 'Завершаю установку приложения...';
+detectBitrixUser();
 </script>
 </body>
 </html>
@@ -2375,7 +4446,12 @@ def main():
         return
     host = os.environ.get("HOST", "127.0.0.1")
     port = int(os.environ.get("PORT", "3000"))
-    server = ThreadingHTTPServer((host, port), Handler)
+    server = BoundedThreadingHTTPServer((host, port), Handler)
+    threading.Thread(
+        target=claim_reconciliation_loop,
+        name="claim-reconciler",
+        daemon=True,
+    ).start()
     print(f"Открыть тест: http://{host}:{port}")
     server.serve_forever()
 
