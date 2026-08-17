@@ -141,7 +141,7 @@ DEAL_ANALYSIS_CACHE_LOCK = threading.Lock()
 DEAL_HEADERS_CACHE_LOCK = threading.Lock()
 LOCAL_TZ = timezone(timedelta(hours=env_int("APP_TZ_OFFSET_HOURS", 6, -12, 14)))
 STATE_STORE = StateStore(APP_DIR, local_timezone=LOCAL_TZ, auto_initialize=False)
-APP_VERSION = "2026-08-17-security-reliability-hardening"
+APP_VERSION = "2026-08-17-bitrix-bootstrap-fix"
 # Bump whenever classifier, eligibility, source-completeness or oldest-first
 # routing semantics change. Pre-deploy tokens must not authorize post-deploy
 # decisions under a different routing policy.
@@ -4403,7 +4403,7 @@ function showResult(payload) {
     const warnings = Array.isArray(payload.warnings) ? payload.warnings.filter(Boolean) : [];
     result.classList.toggle('warning-output', warnings.length > 0);
     result.hidden = warnings.length === 0;
-    result.textContent = warnings.length ? `Внимание:\n${warnings.join('\n')}` : '';
+    result.textContent = warnings.length ? `Внимание:\\n${warnings.join('\\n')}` : '';
     if (payload.message) document.getElementById('status').textContent = payload.message;
     return;
   }
