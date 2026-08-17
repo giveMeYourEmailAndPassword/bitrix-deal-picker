@@ -260,6 +260,33 @@ class StateStore:
                     finalized_at TEXT
                 );
 
+                CREATE TABLE IF NOT EXISTS greeting_outbox (
+                    operation_key TEXT PRIMARY KEY
+                        REFERENCES claim_operations(operation_key),
+                    deal_id TEXT NOT NULL,
+                    manager_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    direction TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending'
+                        CHECK (status IN (
+                            'pending', 'checking', 'dispatching',
+                            'sent', 'manual', 'uncertain'
+                        )),
+                    text TEXT NOT NULL DEFAULT '',
+                    attempt_count INTEGER NOT NULL DEFAULT 0
+                        CHECK (attempt_count >= 0),
+                    lease_token TEXT NOT NULL DEFAULT '',
+                    leased_at TEXT,
+                    lease_expires_at TEXT,
+                    next_attempt_at TEXT,
+                    error_code TEXT NOT NULL DEFAULT '',
+                    message_id TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    dispatching_at TEXT,
+                    finalized_at TEXT
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_claim_events_manager_date
                     ON claim_events(manager_id, event_date);
                 CREATE INDEX IF NOT EXISTS idx_reject_events_manager_date
@@ -272,6 +299,10 @@ class StateStore:
                     ON claim_operations(manager_id, status);
                 CREATE INDEX IF NOT EXISTS idx_claim_operations_status_deal
                     ON claim_operations(status, deal_id);
+                CREATE INDEX IF NOT EXISTS idx_greeting_outbox_work
+                    ON greeting_outbox(status, next_attempt_at, lease_expires_at, created_at);
+                CREATE INDEX IF NOT EXISTS idx_greeting_outbox_manager_status
+                    ON greeting_outbox(manager_id, status);
                 """
             )
             for statement in schema_sql.split(";"):
@@ -440,6 +471,7 @@ class StateStore:
                         "reject_events",
                         "greeting_events",
                         "claim_operations",
+                        "greeting_outbox",
                     )
                 )
             if quick_check != "ok":
@@ -599,6 +631,7 @@ class StateStore:
                     "reject_events",
                     "greeting_events",
                     "claim_operations",
+                    "greeting_outbox",
                 )
             }
             if any(state_counts.values()):
@@ -1317,13 +1350,580 @@ class StateStore:
                 UNION SELECT manager_id FROM reject_events
                 UNION SELECT manager_id FROM greeting_events
                 UNION SELECT manager_id FROM claim_operations
+                UNION SELECT manager_id FROM greeting_outbox
                 """
             ).fetchall()
         return sorted((row[0] for row in rows if row[0]), key=lambda value: (not value.isdigit(), value))
 
     # ------------------------------------------------------------------
+    # Durable greeting outbox
+    # ------------------------------------------------------------------
+
+    _GREETING_OUTBOX_STATUSES = frozenset(
+        {"pending", "checking", "dispatching", "sent", "manual", "uncertain"}
+    )
+
+    def _outbox_datetime(self, value: Optional[Any] = None) -> datetime:
+        if value is None:
+            parsed = datetime.now(self.local_timezone)
+        elif isinstance(value, datetime):
+            parsed = value
+        else:
+            raw = str(value).strip()
+            try:
+                parsed = datetime.fromisoformat(
+                    raw[:-1] + "+00:00" if raw.endswith("Z") else raw
+                )
+            except ValueError as exc:
+                raise ValueError("now must be an ISO-8601 datetime") from exc
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(self.local_timezone)
+
+    @staticmethod
+    def _outbox_time(value: datetime) -> str:
+        return value.isoformat(timespec="microseconds")
+
+    @staticmethod
+    def _outbox_error_code(value: Any) -> str:
+        code = str(value or "unspecified").strip().lower()
+        if not re.fullmatch(r"[a-z0-9][a-z0-9_.:-]{0,79}", code):
+            raise ValueError("error_code must be a short machine-readable code")
+        return code
+
+    @staticmethod
+    def _outbox_message_id(value: Any) -> str:
+        message_id = str(value or "").strip()
+        if message_id and not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", message_id):
+            raise ValueError("message_id must be a short opaque identifier")
+        return message_id
+
+    @staticmethod
+    def _greeting_outbox_row(
+        row: sqlite3.Row,
+        *,
+        transitioned: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        """Return worker/UI-safe job state (never the private lease token)."""
+
+        result = {
+            "operationKey": row["operation_key"],
+            "dealId": row["deal_id"],
+            "managerId": row["manager_id"],
+            "sessionId": row["session_id"],
+            "direction": row["direction"],
+            "status": row["status"],
+            "text": row["text"],
+            "attemptCount": row["attempt_count"],
+            "leasedAt": row["leased_at"],
+            "leaseExpiresAt": row["lease_expires_at"],
+            "nextAttemptAt": row["next_attempt_at"],
+            "errorCode": row["error_code"],
+            "messageId": row["message_id"],
+            "createdAt": row["created_at"],
+            "updatedAt": row["updated_at"],
+            "dispatchingAt": row["dispatching_at"],
+            "finalizedAt": row["finalized_at"],
+        }
+        if transitioned is not None:
+            result["transitioned"] = transitioned
+        return result
+
+    @staticmethod
+    def _owns_active_greeting_check(
+        row: sqlite3.Row,
+        worker_token: str,
+        now_iso: str,
+    ) -> bool:
+        return bool(
+            row["status"] == "checking"
+            and row["lease_token"] == worker_token
+            and row["lease_expires_at"]
+            and row["lease_expires_at"] > now_iso
+        )
+
+    def get_greeting_outbox(self, operation_key: Any) -> Optional[Dict[str, Any]]:
+        self._ensure_ready()
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM greeting_outbox WHERE operation_key = ?",
+                (str(operation_key),),
+            ).fetchone()
+        return self._greeting_outbox_row(row) if row else None
+
+    def list_greeting_outbox(
+        self,
+        *,
+        statuses: Optional[Iterable[str]] = None,
+        limit: Optional[int] = None,
+    ) -> list[Dict[str, Any]]:
+        self._ensure_ready()
+        params: list[Any] = []
+        sql = "SELECT * FROM greeting_outbox"
+        if statuses is not None:
+            normalized = tuple(dict.fromkeys(str(status) for status in statuses))
+            if not normalized:
+                return []
+            unknown = set(normalized) - self._GREETING_OUTBOX_STATUSES
+            if unknown:
+                raise ValueError("unsupported greeting outbox status")
+            sql += " WHERE status IN (" + ",".join("?" for _ in normalized) + ")"
+            params.extend(normalized)
+        sql += " ORDER BY created_at, operation_key"
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(max(0, int(limit)))
+        with self._connect() as connection:
+            rows = connection.execute(sql, params).fetchall()
+        return [self._greeting_outbox_row(row) for row in rows]
+
+    def list_pending_greeting_outbox(
+        self,
+        *,
+        limit: Optional[int] = None,
+    ) -> list[Dict[str, Any]]:
+        return self.list_greeting_outbox(
+            statuses=("pending", "checking"),
+            limit=limit,
+        )
+
+    def lease_greeting_outbox(
+        self,
+        worker_token: Any,
+        *,
+        limit: int = 1,
+        lease_seconds: int = 60,
+        max_attempts: int = 3,
+        now: Optional[Any] = None,
+    ) -> list[Dict[str, Any]]:
+        """Atomically lease eligible pre-send jobs to one worker.
+
+        A stale ``checking`` lease is safe to retry because dispatch has not
+        started.  ``dispatching`` is deliberately never selected here.
+        """
+
+        self._ensure_ready()
+        worker_token = str(worker_token or "").strip()
+        if not worker_token or len(worker_token) > 200:
+            raise ValueError("worker_token is required")
+        limit = max(0, min(100, int(limit)))
+        if not limit:
+            return []
+        lease_seconds = max(1, min(3600, int(lease_seconds)))
+        max_attempts = max(1, min(100, int(max_attempts)))
+        now_dt = self._outbox_datetime(now)
+        now_iso = self._outbox_time(now_dt)
+        expires_iso = self._outbox_time(now_dt + timedelta(seconds=lease_seconds))
+        with self._transaction(immediate=True) as connection:
+            # A worker that died during its final safe checking attempt must
+            # not leave the job permanently invisible.
+            connection.execute(
+                """
+                UPDATE greeting_outbox SET
+                    status='manual', lease_token='', lease_expires_at=NULL,
+                    next_attempt_at=NULL, error_code='checking_attempts_exhausted',
+                    updated_at=?, finalized_at=?
+                WHERE status='checking'
+                  AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?
+                  AND attempt_count >= ?
+                """,
+                (now_iso, now_iso, now_iso, max_attempts),
+            )
+            rows = connection.execute(
+                """
+                SELECT operation_key FROM greeting_outbox
+                WHERE attempt_count < ? AND (
+                    (status='pending' AND (
+                        next_attempt_at IS NULL OR next_attempt_at <= ?
+                    )) OR
+                    (status='checking' AND lease_expires_at IS NOT NULL
+                        AND lease_expires_at <= ?)
+                )
+                ORDER BY created_at, operation_key
+                LIMIT ?
+                """,
+                (max_attempts, now_iso, now_iso, limit),
+            ).fetchall()
+            leased: list[Dict[str, Any]] = []
+            for candidate in rows:
+                operation_key = candidate["operation_key"]
+                cursor = connection.execute(
+                    """
+                    UPDATE greeting_outbox SET
+                        status='checking', attempt_count=attempt_count + 1,
+                        lease_token=?, leased_at=?, lease_expires_at=?,
+                        next_attempt_at=NULL, error_code='', updated_at=?
+                    WHERE operation_key=? AND attempt_count < ? AND (
+                        (status='pending' AND (
+                            next_attempt_at IS NULL OR next_attempt_at <= ?
+                        )) OR
+                        (status='checking' AND lease_expires_at IS NOT NULL
+                            AND lease_expires_at <= ?)
+                    )
+                    """,
+                    (
+                        worker_token,
+                        now_iso,
+                        expires_iso,
+                        now_iso,
+                        operation_key,
+                        max_attempts,
+                        now_iso,
+                        now_iso,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    continue
+                leased_row = connection.execute(
+                    "SELECT * FROM greeting_outbox WHERE operation_key = ?",
+                    (operation_key,),
+                ).fetchone()
+                leased.append(self._greeting_outbox_row(leased_row))
+            return leased
+
+    def update_greeting_outbox_check(
+        self,
+        operation_key: Any,
+        worker_token: Any,
+        *,
+        session_id: Optional[Any] = None,
+        direction: Optional[Any] = None,
+        text: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        """Persist a checked target/text while the caller owns the lease."""
+
+        self._ensure_ready()
+        operation_key = str(operation_key)
+        worker_token = str(worker_token or "").strip()
+        if not operation_key or not worker_token:
+            raise ValueError("operation_key and worker_token are required")
+        now = self._now_iso()
+        with self._transaction(immediate=True) as connection:
+            row = connection.execute(
+                "SELECT * FROM greeting_outbox WHERE operation_key = ?",
+                (operation_key,),
+            ).fetchone()
+            if not row:
+                raise StateStoreError(f"greeting outbox job {operation_key!r} not found")
+            if not self._owns_active_greeting_check(row, worker_token, now):
+                return self._greeting_outbox_row(row, transitioned=False)
+            new_session_id = row["session_id"] if session_id is None else str(session_id).strip()
+            new_direction = row["direction"] if direction is None else str(direction).strip()
+            new_text = row["text"] if text is None else str(text)
+            if not new_session_id or not new_direction:
+                raise ValueError("session_id and direction must remain non-empty")
+            connection.execute(
+                """
+                UPDATE greeting_outbox SET
+                    session_id=?, direction=?, text=?, updated_at=?
+                WHERE operation_key=? AND status='checking' AND lease_token=?
+                """,
+                (
+                    new_session_id,
+                    new_direction,
+                    new_text,
+                    now,
+                    operation_key,
+                    worker_token,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM greeting_outbox WHERE operation_key = ?",
+                (operation_key,),
+            ).fetchone()
+            return self._greeting_outbox_row(row, transitioned=True)
+
+    def retry_greeting_outbox_check(
+        self,
+        operation_key: Any,
+        worker_token: Any,
+        *,
+        error_code: Any,
+        delay_seconds: int = 5,
+        max_attempts: int = 3,
+        now: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        """Retry only a pre-send checking failure, with a hard bound."""
+
+        self._ensure_ready()
+        operation_key = str(operation_key)
+        worker_token = str(worker_token or "").strip()
+        code = self._outbox_error_code(error_code)
+        delay_seconds = max(0, min(86_400, int(delay_seconds)))
+        max_attempts = max(1, min(100, int(max_attempts)))
+        now_dt = self._outbox_datetime(now)
+        now_iso = self._outbox_time(now_dt)
+        with self._transaction(immediate=True) as connection:
+            row = connection.execute(
+                "SELECT * FROM greeting_outbox WHERE operation_key = ?",
+                (operation_key,),
+            ).fetchone()
+            if not row:
+                raise StateStoreError(f"greeting outbox job {operation_key!r} not found")
+            if not self._owns_active_greeting_check(row, worker_token, now_iso):
+                return self._greeting_outbox_row(row, transitioned=False)
+            exhausted = int(row["attempt_count"]) >= max_attempts
+            status = "manual" if exhausted else "pending"
+            next_attempt = (
+                None
+                if exhausted
+                else self._outbox_time(now_dt + timedelta(seconds=delay_seconds))
+            )
+            connection.execute(
+                """
+                UPDATE greeting_outbox SET
+                    status=?, lease_token='', lease_expires_at=NULL,
+                    next_attempt_at=?, error_code=?, updated_at=?, finalized_at=?
+                WHERE operation_key=? AND status='checking' AND lease_token=?
+                """,
+                (
+                    status,
+                    next_attempt,
+                    code,
+                    now_iso,
+                    now_iso if exhausted else None,
+                    operation_key,
+                    worker_token,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM greeting_outbox WHERE operation_key = ?",
+                (operation_key,),
+            ).fetchone()
+            return self._greeting_outbox_row(row, transitioned=True)
+
+    def _mark_greeting_outbox_from_checking(
+        self,
+        operation_key: Any,
+        worker_token: Any,
+        *,
+        status: str,
+        error_code: Any = "",
+    ) -> Dict[str, Any]:
+        self._ensure_ready()
+        operation_key = str(operation_key)
+        worker_token = str(worker_token or "").strip()
+        if status not in {"dispatching", "manual"}:
+            raise ValueError("invalid checking transition")
+        code = "" if status == "dispatching" else self._outbox_error_code(error_code)
+        now = self._now_iso()
+        with self._transaction(immediate=True) as connection:
+            row = connection.execute(
+                "SELECT * FROM greeting_outbox WHERE operation_key = ?",
+                (operation_key,),
+            ).fetchone()
+            if not row:
+                raise StateStoreError(f"greeting outbox job {operation_key!r} not found")
+            if not self._owns_active_greeting_check(row, worker_token, now):
+                return self._greeting_outbox_row(row, transitioned=False)
+            if status == "dispatching" and (
+                not row["session_id"] or not row["direction"] or not row["text"]
+            ):
+                raise StateStoreError("checked greeting target and text are required before dispatch")
+            connection.execute(
+                """
+                UPDATE greeting_outbox SET
+                    status=?, lease_token=?, lease_expires_at=NULL, next_attempt_at=NULL,
+                    error_code=?, updated_at=?, dispatching_at=?, finalized_at=?
+                WHERE operation_key=? AND status='checking' AND lease_token=?
+                """,
+                (
+                    status,
+                    worker_token if status == "dispatching" else "",
+                    code,
+                    now,
+                    now if status == "dispatching" else None,
+                    now if status == "manual" else None,
+                    operation_key,
+                    worker_token,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM greeting_outbox WHERE operation_key = ?",
+                (operation_key,),
+            ).fetchone()
+            return self._greeting_outbox_row(row, transitioned=True)
+
+    def mark_greeting_outbox_dispatching(
+        self,
+        operation_key: Any,
+        worker_token: Any,
+    ) -> Dict[str, Any]:
+        """Durably cross the no-automatic-retry boundary before remote send."""
+
+        return self._mark_greeting_outbox_from_checking(
+            operation_key,
+            worker_token,
+            status="dispatching",
+        )
+
+    def mark_greeting_outbox_manual(
+        self,
+        operation_key: Any,
+        worker_token: Any,
+        *,
+        error_code: Any,
+    ) -> Dict[str, Any]:
+        return self._mark_greeting_outbox_from_checking(
+            operation_key,
+            worker_token,
+            status="manual",
+            error_code=error_code,
+        )
+
+    def _mark_greeting_outbox_after_dispatch(
+        self,
+        operation_key: Any,
+        worker_token: Any,
+        *,
+        status: str,
+        error_code: Any = "",
+        message_id: Any = "",
+    ) -> Dict[str, Any]:
+        self._ensure_ready()
+        operation_key = str(operation_key)
+        worker_token = str(worker_token or "").strip()
+        if status not in {"sent", "uncertain"}:
+            raise ValueError("invalid dispatch transition")
+        code = "" if status == "sent" else self._outbox_error_code(error_code)
+        normalized_message_id = self._outbox_message_id(message_id)
+        now = self._now_iso()
+        with self._transaction(immediate=True) as connection:
+            row = connection.execute(
+                "SELECT * FROM greeting_outbox WHERE operation_key = ?",
+                (operation_key,),
+            ).fetchone()
+            if not row:
+                raise StateStoreError(f"greeting outbox job {operation_key!r} not found")
+            if row["status"] != "dispatching" or row["lease_token"] != worker_token:
+                return self._greeting_outbox_row(row, transitioned=False)
+            connection.execute(
+                """
+                UPDATE greeting_outbox SET
+                    status=?, lease_token='', lease_expires_at=NULL,
+                    error_code=?, message_id=?, updated_at=?, finalized_at=?
+                WHERE operation_key=? AND status='dispatching' AND lease_token=?
+                """,
+                (
+                    status,
+                    code,
+                    normalized_message_id,
+                    now,
+                    now,
+                    operation_key,
+                    worker_token,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM greeting_outbox WHERE operation_key = ?",
+                (operation_key,),
+            ).fetchone()
+            return self._greeting_outbox_row(row, transitioned=True)
+
+    def mark_greeting_outbox_sent(
+        self,
+        operation_key: Any,
+        worker_token: Any,
+        *,
+        message_id: Any = "",
+    ) -> Dict[str, Any]:
+        return self._mark_greeting_outbox_after_dispatch(
+            operation_key,
+            worker_token,
+            status="sent",
+            message_id=message_id,
+        )
+
+    def mark_greeting_outbox_uncertain(
+        self,
+        operation_key: Any,
+        worker_token: Any,
+        *,
+        error_code: Any,
+    ) -> Dict[str, Any]:
+        return self._mark_greeting_outbox_after_dispatch(
+            operation_key,
+            worker_token,
+            status="uncertain",
+            error_code=error_code,
+        )
+
+    def recover_stale_greeting_dispatches(
+        self,
+        *,
+        stale_after_seconds: int = 300,
+        now: Optional[Any] = None,
+    ) -> list[Dict[str, Any]]:
+        """Quarantine stale sends; an external send may already have happened."""
+
+        self._ensure_ready()
+        stale_after_seconds = max(1, min(86_400, int(stale_after_seconds)))
+        now_dt = self._outbox_datetime(now)
+        now_iso = self._outbox_time(now_dt)
+        cutoff = self._outbox_time(now_dt - timedelta(seconds=stale_after_seconds))
+        with self._transaction(immediate=True) as connection:
+            candidates = connection.execute(
+                """
+                SELECT operation_key FROM greeting_outbox
+                WHERE status='dispatching' AND dispatching_at IS NOT NULL
+                  AND dispatching_at <= ?
+                ORDER BY dispatching_at, operation_key
+                """,
+                (cutoff,),
+            ).fetchall()
+            if not candidates:
+                return []
+            keys = [row["operation_key"] for row in candidates]
+            placeholders = ",".join("?" for _ in keys)
+            connection.execute(
+                f"""
+                UPDATE greeting_outbox SET
+                    status='uncertain', lease_token='', lease_expires_at=NULL,
+                    error_code='stale_dispatching', updated_at=?, finalized_at=?
+                WHERE status='dispatching' AND operation_key IN ({placeholders})
+                """,
+                (now_iso, now_iso, *keys),
+            )
+            rows = connection.execute(
+                f"SELECT * FROM greeting_outbox WHERE operation_key IN ({placeholders}) "
+                "ORDER BY created_at, operation_key",
+                keys,
+            ).fetchall()
+            return [self._greeting_outbox_row(row) for row in rows]
+
+    # ------------------------------------------------------------------
     # Idempotent claim operations
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _prepare_operation_request(request: Mapping[str, Any]) -> Dict[str, Any]:
+        """Keep the private greeting target minimal before durable storage.
+
+        The outbox never needs an OAuth token, chat transcript, or arbitrary
+        browser payload.  Only the already-discovered session and direction
+        are retained under the private ``greetingContext`` key.
+        """
+
+        prepared = dict(request)
+        context = prepared.get("greetingContext")
+        if isinstance(context, Mapping):
+            prepared["greetingContext"] = {
+                "sessionId": str(context.get("sessionId") or "").strip(),
+                "direction": str(context.get("direction") or "").strip(),
+            }
+        elif "greetingContext" in prepared:
+            prepared.pop("greetingContext", None)
+        return prepared
+
+    @staticmethod
+    def _safe_operation_request(request: Any) -> Any:
+        """Remove internal greeting routing data from status/JSON output."""
+
+        if not isinstance(request, dict):
+            return request
+        safe = dict(request)
+        safe.pop("greetingContext", None)
+        return safe
 
     @staticmethod
     def _operation_row(row: sqlite3.Row, *, created: Optional[bool] = None) -> Dict[str, Any]:
@@ -1336,15 +1936,29 @@ class StateStore:
             except (TypeError, json.JSONDecodeError):
                 return None
 
+        request = StateStore._safe_operation_request(decode("request_json"))
+        attempt_history = decode("attempt_history_json") or []
+        if isinstance(attempt_history, list):
+            safe_attempt_history = []
+            for attempt in attempt_history:
+                if not isinstance(attempt, dict):
+                    safe_attempt_history.append(attempt)
+                    continue
+                safe_attempt = dict(attempt)
+                safe_attempt["request"] = StateStore._safe_operation_request(
+                    safe_attempt.get("request")
+                )
+                safe_attempt_history.append(safe_attempt)
+            attempt_history = safe_attempt_history
         result = {
             "operationKey": row["operation_key"],
             "dealId": row["deal_id"],
             "managerId": row["manager_id"],
             "status": row["status"],
-            "request": decode("request_json"),
+            "request": request,
             "result": decode("result_json"),
             "error": row["error"],
-            "attemptHistory": decode("attempt_history_json") or [],
+            "attemptHistory": attempt_history,
             "claimEventId": row["claim_event_id"],
             "createdAt": row["created_at"],
             "updatedAt": row["updated_at"],
@@ -1388,7 +2002,9 @@ class StateStore:
                     )
                 if retry_failed and row["status"] == "failed":
                     request_json = (
-                        _json_dumps(dict(request)) if request is not None else row["request_json"]
+                        _json_dumps(self._prepare_operation_request(request))
+                        if request is not None
+                        else row["request_json"]
                     )
                     try:
                         attempt_history = json.loads(row["attempt_history_json"])
@@ -1440,7 +2056,9 @@ class StateStore:
                     operation_key,
                     deal_id,
                     manager_id,
-                    _json_dumps(dict(request)) if request is not None else None,
+                    _json_dumps(self._prepare_operation_request(request))
+                    if request is not None
+                    else None,
                     now,
                     now,
                 ),
@@ -1539,7 +2157,9 @@ class StateStore:
                 """,
                 (
                     manager_id,
-                    _json_dumps(dict(request)) if request is not None else None,
+                    _json_dumps(self._prepare_operation_request(request))
+                    if request is not None
+                    else None,
                     _json_dumps(attempt_history),
                     now,
                     operation_key,
@@ -1594,6 +2214,50 @@ class StateStore:
                 return operation
         return None
 
+    @staticmethod
+    def _enqueue_greeting_from_request(
+        connection: sqlite3.Connection,
+        operation_row: sqlite3.Row,
+        request: Any,
+        timestamp: str,
+    ) -> bool:
+        """Create one durable job from the claim's private request context.
+
+        This helper is intentionally called only while the pending claim is
+        being finalized.  Therefore installing the additive table on an old
+        database cannot backfill greetings for historical claims.
+        """
+
+        if not isinstance(request, dict) or request.get("greetingRequested") is not True:
+            return False
+        context = request.get("greetingContext")
+        if not isinstance(context, dict):
+            return False
+        session_id = str(context.get("sessionId") or "").strip()
+        direction = str(context.get("direction") or "").strip()
+        if not session_id or not direction:
+            return False
+        cursor = connection.execute(
+            """
+            INSERT OR IGNORE INTO greeting_outbox(
+                operation_key, deal_id, manager_id, session_id, direction,
+                status, text, attempt_count, lease_token, next_attempt_at,
+                error_code, message_id, created_at, updated_at
+            ) VALUES(?, ?, ?, ?, ?, 'pending', '', 0, '', ?, '', '', ?, ?)
+            """,
+            (
+                operation_row["operation_key"],
+                operation_row["deal_id"],
+                operation_row["manager_id"],
+                session_id,
+                direction,
+                timestamp,
+                timestamp,
+                timestamp,
+            ),
+        )
+        return cursor.rowcount == 1
+
     def finalize_claim_operation(
         self,
         operation_key: Any,
@@ -1616,11 +2280,11 @@ class StateStore:
             ).fetchone()
             if not row:
                 raise StateStoreError(f"claim operation {operation_key!r} not found")
+            try:
+                current_request = json.loads(row["request_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                current_request = {}
             if expected_claim_marker is not None:
-                try:
-                    current_request = json.loads(row["request_json"] or "{}")
-                except (TypeError, json.JSONDecodeError):
-                    current_request = {}
                 if (
                     not isinstance(current_request, dict)
                     or current_request.get("claimMarker") != str(expected_claim_marker)
@@ -1631,6 +2295,12 @@ class StateStore:
             if row["status"] != "pending":
                 operation = self._operation_row(row)
                 operation["transitioned"] = False
+                operation["greetingQueued"] = bool(
+                    connection.execute(
+                        "SELECT 1 FROM greeting_outbox WHERE operation_key = ?",
+                        (operation_key,),
+                    ).fetchone()
+                )
                 return operation
 
             if claim is None:
@@ -1674,11 +2344,18 @@ class StateStore:
                     operation_key,
                 ),
             )
+            greeting_queued = self._enqueue_greeting_from_request(
+                connection,
+                row,
+                current_request,
+                now,
+            )
             row = connection.execute(
                 "SELECT * FROM claim_operations WHERE operation_key = ?", (operation_key,)
             ).fetchone()
             operation = self._operation_row(row)
             operation["transitioned"] = True
+            operation["greetingQueued"] = greeting_queued
             return operation
 
     def fail_claim_operation(

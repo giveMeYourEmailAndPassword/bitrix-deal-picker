@@ -4,7 +4,7 @@ import os
 import sqlite3
 import tempfile
 import unittest
-from datetime import timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -1019,6 +1019,254 @@ class TestClaimOperations(StateStoreTestCase):
             store.finalize_claim_operation("missing")
         with self.assertRaisesRegex(Exception, "not found"):
             store.fail_claim_operation("missing", "error")
+
+
+class TestGreetingOutbox(StateStoreTestCase):
+    REQUEST = {
+        "claimMarker": "claim:greeting",
+        "greetingRequested": True,
+        "greetingContext": {
+            "sessionId": "session-77",
+            "direction": "Турция",
+            # Unknown private data must not be persisted with the target.
+            "accessToken": "must-not-be-stored",
+        },
+    }
+
+    def create_job(self, store, operation_key="greeting-op"):
+        started = store.begin_claim_operation(
+            "700",
+            "1001",
+            operation_key=operation_key,
+            request=self.REQUEST,
+        )
+        self.assertNotIn("greetingContext", started["request"])
+        finalized = store.finalize_claim_operation(
+            operation_key,
+            claim={"managerId": "1001", "dealId": "700"},
+            expected_claim_marker="claim:greeting",
+        )
+        self.assertTrue(finalized["greetingQueued"])
+        return store.get_greeting_outbox(operation_key)
+
+    def test_finalize_atomically_creates_exactly_one_minimal_outbox_job(self):
+        store = self.make_store()
+        job = self.create_job(store)
+
+        self.assertEqual(job["operationKey"], "greeting-op")
+        self.assertEqual(job["dealId"], "700")
+        self.assertEqual(job["managerId"], "1001")
+        self.assertEqual(job["sessionId"], "session-77")
+        self.assertEqual(job["direction"], "Турция")
+        self.assertEqual(job["status"], "pending")
+        self.assertEqual(job["attemptCount"], 0)
+        self.assertNotIn("leaseToken", job)
+        with sqlite3.connect(store.db_path) as connection:
+            raw_request = connection.execute(
+                "SELECT request_json FROM claim_operations WHERE operation_key='greeting-op'"
+            ).fetchone()[0]
+        self.assertNotIn("accessToken", raw_request)
+        self.assertIn("session-77", raw_request)
+
+        replay = store.finalize_claim_operation(
+            "greeting-op",
+            claim={"managerId": "1001", "dealId": "700"},
+        )
+        self.assertFalse(replay["transitioned"])
+        self.assertTrue(replay["greetingQueued"])
+        self.assertEqual(self.raw_count("claim_events"), 1)
+        self.assertEqual(self.raw_count("greeting_outbox"), 1)
+
+    def test_outbox_failure_rolls_back_claim_and_operation_finalize_together(self):
+        store = self.make_store()
+        store.begin_claim_operation(
+            "700", "1001", operation_key="atomic", request=self.REQUEST
+        )
+
+        with patch.object(
+            StateStore,
+            "_enqueue_greeting_from_request",
+            side_effect=RuntimeError("simulated outbox failure"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "simulated outbox failure"):
+                store.finalize_claim_operation(
+                    "atomic", claim={"managerId": "1001", "dealId": "700"}
+                )
+
+        self.assertEqual(store.get_claim_operation("atomic")["status"], "pending")
+        self.assertEqual(self.raw_count("claim_events"), 0)
+        self.assertEqual(self.raw_count("greeting_outbox"), 0)
+
+    def test_two_workers_can_never_lease_the_same_job(self):
+        store = self.make_store(busy_timeout_ms=30_000)
+        job = self.create_job(store)
+        now = datetime.fromisoformat(job["nextAttemptAt"]) + timedelta(seconds=1)
+
+        def lease(token):
+            return store.lease_greeting_outbox(token, now=now)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(lease, ("worker-a", "worker-b")))
+
+        self.assertEqual(sum(len(result) for result in results), 1)
+        job = store.get_greeting_outbox("greeting-op")
+        self.assertEqual(job["status"], "checking")
+        self.assertEqual(job["attemptCount"], 1)
+        self.assertNotIn("leaseToken", job)
+
+    def test_stale_checking_lease_has_exactly_one_safe_new_owner(self):
+        store = self.make_store(busy_timeout_ms=30_000)
+        job = self.create_job(store)
+        first_now = datetime.fromisoformat(job["nextAttemptAt"]) + timedelta(seconds=1)
+        store.lease_greeting_outbox(
+            "dead-worker", now=first_now, lease_seconds=10
+        )
+        stale_now = first_now + timedelta(seconds=11)
+
+        def reclaim(token):
+            return store.lease_greeting_outbox(
+                token, now=stale_now, lease_seconds=10
+            )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(reclaim, ("worker-b", "worker-c")))
+
+        self.assertEqual(sum(len(result) for result in results), 1)
+        reclaimed = next(result[0] for result in results if result)
+        self.assertEqual(reclaimed["status"], "checking")
+        self.assertEqual(reclaimed["attemptCount"], 2)
+
+    def test_checked_job_crosses_dispatch_boundary_then_becomes_sent(self):
+        store = self.make_store()
+        self.create_job(store)
+        leased = store.lease_greeting_outbox("worker-a")[0]
+        self.assertEqual(leased["status"], "checking")
+        checked = store.update_greeting_outbox_check(
+            "greeting-op",
+            "worker-a",
+            session_id="verified-session",
+            direction="Египет",
+            text="Здравствуйте! Я ваш менеджер.",
+        )
+        self.assertTrue(checked["transitioned"])
+
+        wrong_worker = store.mark_greeting_outbox_dispatching(
+            "greeting-op", "worker-b"
+        )
+        self.assertFalse(wrong_worker["transitioned"])
+        dispatching = store.mark_greeting_outbox_dispatching(
+            "greeting-op", "worker-a"
+        )
+        self.assertTrue(dispatching["transitioned"])
+        self.assertEqual(dispatching["status"], "dispatching")
+        self.assertIsNotNone(dispatching["dispatchingAt"])
+        self.assertEqual(store.lease_greeting_outbox("worker-b"), [])
+
+        sent = store.mark_greeting_outbox_sent(
+            "greeting-op", "worker-a", message_id="message-900"
+        )
+        self.assertTrue(sent["transitioned"])
+        self.assertEqual(sent["status"], "sent")
+        self.assertEqual(sent["messageId"], "message-900")
+        self.assertIsNotNone(sent["finalizedAt"])
+        self.assertNotIn("leaseToken", sent)
+
+    def test_checking_failure_retries_only_before_send_and_is_bounded(self):
+        store = self.make_store()
+        job = self.create_job(store)
+        first_now = datetime.fromisoformat(job["nextAttemptAt"]) + timedelta(seconds=1)
+        store.lease_greeting_outbox(
+            "worker-a", now=first_now, max_attempts=2
+        )
+        retry = store.retry_greeting_outbox_check(
+            "greeting-op",
+            "worker-a",
+            error_code="history_timeout",
+            delay_seconds=10,
+            max_attempts=2,
+            now=first_now,
+        )
+        self.assertEqual(retry["status"], "pending")
+        self.assertEqual(
+            store.lease_greeting_outbox(
+                "worker-b", now=first_now + timedelta(seconds=9), max_attempts=2
+            ),
+            [],
+        )
+        second = store.lease_greeting_outbox(
+            "worker-b", now=first_now + timedelta(seconds=10), max_attempts=2
+        )[0]
+        self.assertEqual(second["attemptCount"], 2)
+        exhausted = store.retry_greeting_outbox_check(
+            "greeting-op",
+            "worker-b",
+            error_code="history_timeout",
+            max_attempts=2,
+            now=first_now + timedelta(seconds=10),
+        )
+        self.assertEqual(exhausted["status"], "manual")
+        self.assertEqual(exhausted["errorCode"], "history_timeout")
+        self.assertEqual(
+            store.lease_greeting_outbox(
+                "worker-c", now=first_now + timedelta(hours=1), max_attempts=2
+            ),
+            [],
+        )
+
+    def test_stale_dispatching_is_uncertain_and_never_automatically_retried(self):
+        store = self.make_store()
+        self.create_job(store)
+        store.lease_greeting_outbox("worker-a")
+        store.update_greeting_outbox_check(
+            "greeting-op", "worker-a", text="Здравствуйте!"
+        )
+        dispatching = store.mark_greeting_outbox_dispatching(
+            "greeting-op", "worker-a"
+        )
+        recovered = store.recover_stale_greeting_dispatches(
+            stale_after_seconds=300,
+            now=datetime.fromisoformat(dispatching["dispatchingAt"])
+            + timedelta(seconds=301),
+        )
+
+        self.assertEqual(len(recovered), 1)
+        self.assertEqual(recovered[0]["status"], "uncertain")
+        self.assertEqual(recovered[0]["errorCode"], "stale_dispatching")
+        self.assertEqual(store.lease_greeting_outbox("worker-b"), [])
+
+    def test_terminal_old_operation_is_not_backfilled_after_additive_schema_install(self):
+        store = self.make_store()
+        self.create_job(store, operation_key="historical")
+        with sqlite3.connect(store.db_path) as connection:
+            connection.execute("DELETE FROM greeting_outbox WHERE operation_key='historical'")
+            connection.execute("DROP TABLE greeting_outbox")
+
+        restarted = self.make_store()
+        self.assertEqual(restarted.readiness_check()["schemaVersion"], 1)
+        self.assertEqual(restarted.list_greeting_outbox(), [])
+        replay = restarted.finalize_claim_operation(
+            "historical", claim={"managerId": "1001", "dealId": "700"}
+        )
+        self.assertFalse(replay["transitioned"])
+        self.assertFalse(replay["greetingQueued"])
+        self.assertEqual(restarted.list_greeting_outbox(), [])
+
+    def test_incomplete_or_disabled_greeting_request_does_not_create_job(self):
+        store = self.make_store()
+        for suffix, request in (
+            ("disabled", {"greetingRequested": False, "greetingContext": {"sessionId": "1", "direction": "x"}}),
+            ("missing-direction", {"greetingRequested": True, "greetingContext": {"sessionId": "1"}}),
+            ("missing-context", {"greetingRequested": True}),
+        ):
+            operation_key = f"no-job-{suffix}"
+            store.begin_claim_operation(
+                suffix, "1001", operation_key=operation_key, request=request
+            )
+            finalized = store.finalize_claim_operation(
+                operation_key, claim={"managerId": "1001", "dealId": suffix}
+            )
+            self.assertFalse(finalized["greetingQueued"])
+        self.assertEqual(store.list_greeting_outbox(), [])
 
 
 if __name__ == "__main__":
