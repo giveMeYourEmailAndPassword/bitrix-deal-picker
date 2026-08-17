@@ -312,6 +312,8 @@ class StateStore:
                         CHECK (history_message_count >= 0),
                     history_signature TEXT NOT NULL DEFAULT '',
                     activity_id TEXT NOT NULL DEFAULT '',
+                    chat_lookup_mode TEXT NOT NULL DEFAULT '',
+                    activity_updated_at TEXT NOT NULL DEFAULT '',
                     attempt_count INTEGER NOT NULL DEFAULT 1 CHECK (attempt_count >= 1),
                     lease_token TEXT NOT NULL DEFAULT '',
                     lease_expires_at TEXT,
@@ -415,6 +417,16 @@ class StateStore:
                 connection.execute(
                     "ALTER TABLE lost_deal_close_operations "
                     "ADD COLUMN history_signature TEXT NOT NULL DEFAULT ''"
+                )
+            if "chat_lookup_mode" not in lost_close_columns:
+                connection.execute(
+                    "ALTER TABLE lost_deal_close_operations "
+                    "ADD COLUMN chat_lookup_mode TEXT NOT NULL DEFAULT ''"
+                )
+            if "activity_updated_at" not in lost_close_columns:
+                connection.execute(
+                    "ALTER TABLE lost_deal_close_operations "
+                    "ADD COLUMN activity_updated_at TEXT NOT NULL DEFAULT ''"
                 )
             # Older development builds keyed the uncertain auto-send
             # reservation only by dealId, which incorrectly crossed claim
@@ -2713,6 +2725,8 @@ class StateStore:
             "historyMessageCount": int(row["history_message_count"] or 0),
             "historySignature": str(row["history_signature"] or ""),
             "activityId": str(row["activity_id"] or ""),
+            "chatLookupMode": str(row["chat_lookup_mode"] or ""),
+            "activityUpdatedAt": str(row["activity_updated_at"] or ""),
             "attemptCount": int(row["attempt_count"]),
             "leaseToken": str(row["lease_token"] or ""),
             "leaseExpiresAt": row["lease_expires_at"],
@@ -3115,6 +3129,8 @@ class StateStore:
         history_message_count: int,
         history_signature: Any,
         activity_id: Any,
+        chat_lookup_mode: Any,
+        activity_updated_at: Any,
     ) -> Dict[str, Any]:
         """Commit the no-retry boundary before the remote finish call."""
 
@@ -3126,6 +3142,8 @@ class StateStore:
         last_message_id = str(last_message_id or "").strip()
         activity_id = str(activity_id or "").strip()
         history_signature = str(history_signature or "").strip().lower()
+        chat_lookup_mode = str(chat_lookup_mode or "")
+        activity_updated_at = str(activity_updated_at or "").strip()
         if not re.fullmatch(r"[1-9]\d{0,19}", chat_id):
             raise ValueError("chat_id must be a positive integer")
         if not re.fullmatch(r"[1-9]\d{0,19}", session_id):
@@ -3139,6 +3157,38 @@ class StateStore:
             raise ValueError("activity_id must be a positive integer")
         if not re.fullmatch(r"[0-9a-f]{64}", history_signature):
             raise ValueError("history_signature must be a SHA-256 digest")
+        if chat_lookup_mode not in {"active_registry", "activity_fallback"}:
+            raise ValueError(
+                "chat_lookup_mode must be active_registry or activity_fallback"
+            )
+        if chat_lookup_mode == "active_registry":
+            if activity_updated_at:
+                raise ValueError(
+                    "activity_updated_at must be empty for active_registry"
+                )
+        else:
+            if not activity_updated_at:
+                raise ValueError(
+                    "activity_updated_at is required for activity_fallback"
+                )
+            try:
+                parsed_activity_updated_at = datetime.fromisoformat(
+                    activity_updated_at[:-1] + "+00:00"
+                    if activity_updated_at.endswith("Z")
+                    else activity_updated_at
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    "activity_updated_at must be an ISO-8601 datetime"
+                ) from exc
+            if (
+                parsed_activity_updated_at.tzinfo is None
+                or parsed_activity_updated_at.utcoffset() is None
+            ):
+                raise ValueError("activity_updated_at must include a timezone")
+            activity_updated_at = parsed_activity_updated_at.isoformat(
+                timespec="microseconds"
+            )
         now = self._now_iso()
         with self._transaction(immediate=True) as connection:
             cursor = connection.execute(
@@ -3147,6 +3197,7 @@ class StateStore:
                 SET status='dispatching', outcome_code='finish_started',
                     chat_id=?, session_id=?, last_message_id=?,
                     history_message_count=?, history_signature=?, activity_id=?,
+                    chat_lookup_mode=?, activity_updated_at=?,
                     lease_token='', lease_expires_at=NULL,
                     updated_at=?, dispatching_at=?
                 WHERE transition_id=? AND status='checking' AND lease_token=?
@@ -3158,6 +3209,8 @@ class StateStore:
                     history_message_count,
                     history_signature,
                     activity_id,
+                    chat_lookup_mode,
+                    activity_updated_at,
                     now,
                     now,
                     transition_id,

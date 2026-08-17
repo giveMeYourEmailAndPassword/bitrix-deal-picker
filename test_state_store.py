@@ -1340,12 +1340,16 @@ class TestLostDealAutocloseState(StateStoreTestCase):
             12,
             "a" * 64,
             "8401",
+            "active_registry",
+            "",
         )
         self.assertEqual(dispatching["status"], "dispatching")
         self.assertEqual(dispatching["sessionId"], "8201")
         self.assertEqual(dispatching["lastMessageId"], "8301")
         self.assertEqual(dispatching["historySignature"], "a" * 64)
         self.assertEqual(dispatching["activityId"], "8401")
+        self.assertEqual(dispatching["chatLookupMode"], "active_registry")
+        self.assertEqual(dispatching["activityUpdatedAt"], "")
 
         replay = store.claim_lost_deal_close_transition(self.transition())
         self.assertFalse(replay["claimed"])
@@ -1355,6 +1359,119 @@ class TestLostDealAutocloseState(StateStoreTestCase):
         self.assertEqual(
             store.get_lost_deal_close_operation("9001")["status"], "closed"
         )
+
+    def test_dispatch_boundary_round_trips_activity_fallback_provenance(self):
+        store = self.make_store()
+        claim = store.claim_lost_deal_close_transition(self.transition())
+
+        dispatching = store.mark_lost_deal_close_dispatching(
+            "9001",
+            claim["leaseToken"],
+            "8101",
+            "8201",
+            "8301",
+            12,
+            "b" * 64,
+            "8401",
+            "activity_fallback",
+            "2099-01-01T16:00:01.123456+06:00",
+        )
+
+        self.assertEqual(dispatching["chatLookupMode"], "activity_fallback")
+        self.assertEqual(
+            dispatching["activityUpdatedAt"],
+            "2099-01-01T16:00:01.123456+06:00",
+        )
+        persisted = store.get_lost_deal_close_operation("9001")
+        self.assertEqual(persisted["chatLookupMode"], "activity_fallback")
+        self.assertEqual(
+            persisted["activityUpdatedAt"],
+            "2099-01-01T16:00:01.123456+06:00",
+        )
+        with sqlite3.connect(store.db_path) as connection:
+            raw = connection.execute(
+                """
+                SELECT chat_lookup_mode, activity_updated_at
+                FROM lost_deal_close_operations WHERE transition_id='9001'
+                """
+            ).fetchone()
+        self.assertEqual(
+            raw,
+            ("activity_fallback", "2099-01-01T16:00:01.123456+06:00"),
+        )
+
+    def test_dispatch_boundary_rejects_invalid_lookup_provenance(self):
+        store = self.make_store()
+        claim = store.claim_lost_deal_close_transition(self.transition())
+        valid_prefix = (
+            "9001",
+            claim["leaseToken"],
+            "8101",
+            "8201",
+            "8301",
+            12,
+            "c" * 64,
+            "8401",
+        )
+        invalid_cases = (
+            ("", ""),
+            ("ACTIVE_REGISTRY", ""),
+            (" active_registry", ""),
+            ("active_registry", "2099-01-01T10:00:01+00:00"),
+            ("activity_fallback", ""),
+            ("activity_fallback", "not-a-timestamp"),
+            ("activity_fallback", "2099-01-01T10:00:01"),
+        )
+
+        for chat_lookup_mode, activity_updated_at in invalid_cases:
+            with self.subTest(
+                chat_lookup_mode=chat_lookup_mode,
+                activity_updated_at=activity_updated_at,
+            ):
+                with self.assertRaises(ValueError):
+                    store.mark_lost_deal_close_dispatching(
+                        *valid_prefix,
+                        chat_lookup_mode,
+                        activity_updated_at,
+                    )
+                operation = store.get_lost_deal_close_operation("9001")
+                self.assertEqual(operation["status"], "checking")
+                self.assertEqual(operation["chatLookupMode"], "")
+                self.assertEqual(operation["activityUpdatedAt"], "")
+
+    def test_existing_schema_adds_lookup_provenance_columns_without_version_bump(self):
+        store = self.make_store()
+        store.claim_lost_deal_close_transition(self.transition())
+        with sqlite3.connect(store.db_path) as connection:
+            connection.execute(
+                "ALTER TABLE lost_deal_close_operations DROP COLUMN chat_lookup_mode"
+            )
+            connection.execute(
+                "ALTER TABLE lost_deal_close_operations DROP COLUMN activity_updated_at"
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT value FROM meta WHERE key='schema_version'"
+                ).fetchone()[0],
+                "1",
+            )
+
+        restarted = self.make_store()
+
+        self.assertTrue(restarted.readiness_check()["ok"])
+        self.assertEqual(restarted.readiness_check()["schemaVersion"], 1)
+        with sqlite3.connect(restarted.db_path) as connection:
+            columns = {
+                row[1]: (row[2], row[3], row[4])
+                for row in connection.execute(
+                    "PRAGMA table_info(lost_deal_close_operations)"
+                )
+            }
+        self.assertEqual(columns["chat_lookup_mode"], ("TEXT", 1, "''"))
+        self.assertEqual(columns["activity_updated_at"], ("TEXT", 1, "''"))
+        migrated = restarted.get_lost_deal_close_operation("9001")
+        self.assertEqual(migrated["chatLookupMode"], "")
+        self.assertEqual(migrated["activityUpdatedAt"], "")
 
 
 if __name__ == "__main__":
