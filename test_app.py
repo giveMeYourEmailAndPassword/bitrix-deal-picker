@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -344,6 +345,75 @@ class TestBrowserBootstrapSafety(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
         return json.loads(completed.stdout)
 
+    def run_rendered_claim_selected(self, payload):
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("Node.js is unavailable for the browser behavior check")
+        rendered = app.render_index_html(initial_auth={}, nonce="fixed-nonce")
+        marker = '<script nonce="fixed-nonce">'
+        inline_script = rendered.rsplit(marker, 1)[1].split("</script>", 1)[0]
+        start = inline_script.index("async function claimSelected()")
+        end = inline_script.index("async function rejectDeal(", start)
+        claim_script = inline_script[start:end]
+        scenario = f"""
+let selectedDealId = '100';
+let currentDeal = {{
+  id: '100',
+  dealUrl: 'https://test-fake.bitrix24.test/crm/deal/details/100/',
+  selectionToken: 'signed-selection'
+}};
+const managerInput = {{value: '42'}};
+const claimButton = {{disabled: false, textContent: 'Взять в работу'}};
+global.document = {{
+  getElementById: (id) => id === 'managerId' ? managerInput : null,
+  querySelector: (selector) => selector === '.claim-button' ? claimButton : null
+}};
+const openCalls = [];
+const popup = {{
+  location: {{href: 'about:blank'}},
+  closed: false,
+  close() {{ this.closed = true; }}
+}};
+global.window = {{
+  open(url, target) {{
+    openCalls.push({{url, target}});
+    return popup;
+  }}
+}};
+let shownPayload = null;
+let adminLoads = 0;
+let statusLoads = 0;
+function currentAuth() {{ return {{AUTH_ID: 'token'}}; }}
+async function postJson() {{ return {json.dumps(payload, ensure_ascii=False)}; }}
+function showResult(value) {{ shownPayload = value; }}
+function renderGreeting() {{}}
+function loadAdminPanel() {{ adminLoads += 1; }}
+function loadExtraClaimStatus() {{ statusLoads += 1; }}
+(async () => {{
+  await claimSelected();
+  process.stdout.write(JSON.stringify({{
+    openCalls,
+    popupClosed: popup.closed,
+    popupHref: popup.location.href,
+    shownPayload,
+    adminLoads,
+    statusLoads
+  }}));
+}})().catch((error) => {{
+  process.stderr.write(error.stack || String(error));
+  process.exitCode = 1;
+}});
+"""
+        completed = subprocess.run(
+            [node],
+            input=claim_script + "\n" + scenario,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+        return json.loads(completed.stdout)
+
     def test_json_for_script_neutralizes_script_breakout(self):
         encoded = app.json_for_script({"token": "</script><script>alert(1)</script>&"})
         self.assertNotIn("</script", encoded.lower())
@@ -401,6 +471,36 @@ class TestBrowserBootstrapSafety(unittest.TestCase):
             check=False,
         )
         self.assertEqual(checked.returncode, 0, checked.stderr or checked.stdout)
+
+    def test_dry_run_claim_closes_placeholder_and_never_opens_deal(self):
+        result = self.run_rendered_claim_selected(
+            {
+                "ok": True,
+                "dryRun": True,
+                "message": "Проверка успешна. В безопасном режиме CRM не изменена.",
+            }
+        )
+
+        self.assertEqual(result["openCalls"], [{"url": "about:blank", "target": "_blank"}])
+        self.assertTrue(result["popupClosed"])
+        self.assertEqual(result["popupHref"], "about:blank")
+        self.assertIn("CRM не изменена", result["shownPayload"]["message"])
+        self.assertEqual(result["adminLoads"], 0)
+        self.assertEqual(result["statusLoads"], 0)
+
+    def test_real_claim_navigates_placeholder_to_bitrix_deal(self):
+        result = self.run_rendered_claim_selected(
+            {"ok": True, "dryRun": False, "message": "Сделка назначена."}
+        )
+
+        self.assertEqual(result["openCalls"], [{"url": "about:blank", "target": "_blank"}])
+        self.assertFalse(result["popupClosed"])
+        self.assertEqual(
+            result["popupHref"],
+            "https://test-fake.bitrix24.test/crm/deal/details/100/",
+        )
+        self.assertEqual(result["adminLoads"], 1)
+        self.assertEqual(result["statusLoads"], 1)
 
     def test_next_deal_retries_one_fetch_rejection_then_returns_success(self):
         result = self.run_rendered_post_json(
@@ -1638,6 +1738,312 @@ class TestClaimWorkflow(ClaimWorkflowTestCase):
         self.assertTrue(result["remoteUpdateUncertain"])
         self.assertEqual(result["_httpStatus"], 503)
         self.assertEqual(self.store.get_claim_operation(self.operation_key())["status"], "failed")
+
+
+class TestExtraClaimAuthorization(ClaimWorkflowTestCase):
+    business_date = "2026-08-17"
+    request_id = "req-42"
+    grant_id = "grant-42"
+
+    def manager(self):
+        return {
+            "id": self.manager_id,
+            "name": "Manager",
+            "active": True,
+            "intranet": True,
+            "competencies": ["Турция"],
+        }
+
+    def quota_token(self):
+        return app.issue_selection_token(
+            self.deal_id,
+            self.manager_id,
+            self.version,
+            test_manager_policy(rule=self.store.get_rule(self.manager_id)),
+            now=1_000,
+        )
+
+    def seed_approved_extra_claim(self):
+        self.store.set_rule(self.manager_id, enabled=True, daily_limit=1)
+        self.store.append_claim(
+            {
+                "timestamp": f"{self.business_date}T09:00:00+06:00",
+                "managerId": self.manager_id,
+                "dealId": "99",
+            }
+        )
+        request = self.store.create_extra_claim_request(
+            self.manager_id,
+            self.business_date,
+            "Клиент ждёт дополнительную срочную заявку",
+            taken_today_snapshot=1,
+            daily_limit_snapshot=1,
+        )
+        self.store.import_extra_claim_state(
+            self.manager_id,
+            self.business_date,
+            {
+                "request": {"id": self.request_id, "status": "approved"},
+                "grants": [
+                    {
+                        "id": self.grant_id,
+                        "requestId": self.request_id,
+                        "status": "approved",
+                        "bitrixUserId": self.manager_id,
+                        "businessDate": self.business_date,
+                    }
+                ],
+            },
+        )
+        return request
+
+    @contextmanager
+    def extra_claim_context(self):
+        with (
+            patch.multiple(
+                app,
+                EXTRA_CLAIM_REQUESTS_ENABLED=True,
+                BAZA_API_BASE_URL="https://baza.example.test",
+                BAZA_HMAC_KEY_ID="picker-v1",
+                BAZA_HMAC_SECRET="s" * 32,
+            ),
+            patch.object(app, "local_date", return_value=self.business_date),
+            patch.object(app, "is_limit_bypassed_now", return_value=False),
+        ):
+            yield
+
+    def revoked_response(self):
+        return {
+            "ok": True,
+            "request": {
+                "id": self.request_id,
+                "status": "expired",
+                "bitrixUserId": self.manager_id,
+                "businessDate": self.business_date,
+            },
+            "grants": [],
+        }
+
+    def approved_response(self):
+        return {
+            "ok": True,
+            "request": {
+                "id": self.request_id,
+                "status": "approved",
+                "bitrixUserId": self.manager_id,
+                "businessDate": self.business_date,
+            },
+            "grants": [
+                {
+                    "id": self.grant_id,
+                    "requestId": self.request_id,
+                    "status": "approved",
+                    "bitrixUserId": self.manager_id,
+                    "businessDate": self.business_date,
+                }
+            ],
+        }
+
+    def test_fresh_authoritative_grant_allows_one_real_claim(self):
+        self.seed_approved_extra_claim()
+        side_effect = self.claim_side_effect(
+            [self.source_deal(), self.source_deal(), self.claimed_deal()]
+        )
+        with (
+            self.common_claim_context(),
+            self.extra_claim_context(),
+            patch.object(app, "baza_post", return_value=self.approved_response()) as baza_post,
+            patch.object(app, "bitrix_call", side_effect=side_effect) as bitrix_call,
+        ):
+            result = app.preview_claim(
+                self.deal_id,
+                self.manager_id,
+                selection_token=self.quota_token(),
+            )
+
+        self.assertTrue(result["ok"])
+        baza_post.assert_called_once_with(
+            "/integrations/deal-picker/v1/grants/query",
+            {"bitrixUserId": self.manager_id, "businessDate": self.business_date},
+        )
+        self.assertEqual(
+            [item.args[0] for item in bitrix_call.call_args_list].count("crm.deal.update"),
+            1,
+        )
+        operation = self.store.get_claim_operation(self.operation_key())
+        self.assertEqual(operation["status"], "succeeded")
+        self.assertEqual(operation["extraClaimGrantId"], self.grant_id)
+        state = self.store.get_extra_claim_state(self.manager_id, self.business_date)
+        self.assertFalse(state["grantAvailable"])
+
+    def test_revoked_approved_grant_blocks_claim_before_crm_update(self):
+        self.seed_approved_extra_claim()
+        with (
+            self.common_claim_context(),
+            self.extra_claim_context(),
+            patch.object(app, "baza_post", return_value=self.revoked_response()),
+            patch.object(app, "bitrix_call", return_value=self.source_deal()) as bitrix_call,
+        ):
+            result = app.preview_claim(
+                self.deal_id,
+                self.manager_id,
+                selection_token=self.quota_token(),
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["_httpStatus"], 409)
+        self.assertFalse(result["integrationUnavailable"])
+        self.assertIn("CRM не изменена", result["message"])
+        self.assertNotIn(
+            "crm.deal.update",
+            [item.args[0] for item in bitrix_call.call_args_list],
+        )
+        self.assertIsNone(self.store.get_claim_operation(self.operation_key()))
+
+    def test_baza_outage_blocks_over_limit_claim_before_crm_update(self):
+        self.seed_approved_extra_claim()
+        with (
+            self.common_claim_context(),
+            self.extra_claim_context(),
+            patch.object(app, "baza_post", side_effect=TimeoutError("down")) as baza_post,
+            patch.object(app, "bitrix_call", return_value=self.source_deal()) as bitrix_call,
+        ):
+            result = app.preview_claim(
+                self.deal_id,
+                self.manager_id,
+                selection_token=self.quota_token(),
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["_httpStatus"], 503)
+        self.assertTrue(result["integrationUnavailable"])
+        self.assertIn("CRM не изменена", result["message"])
+        baza_post.assert_called_once()
+        self.assertNotIn(
+            "crm.deal.update",
+            [item.args[0] for item in bitrix_call.call_args_list],
+        )
+        self.assertIsNone(self.store.get_claim_operation(self.operation_key()))
+
+    def test_within_limit_claim_never_depends_on_baza(self):
+        self.store.set_rule(self.manager_id, enabled=True, daily_limit=1)
+        side_effect = self.claim_side_effect(
+            [self.source_deal(), self.source_deal(), self.claimed_deal()]
+        )
+        with (
+            self.common_claim_context(),
+            self.extra_claim_context(),
+            patch.object(app, "baza_post", side_effect=TimeoutError("down")) as baza_post,
+            patch.object(app, "bitrix_call", side_effect=side_effect) as bitrix_call,
+        ):
+            result = app.preview_claim(
+                self.deal_id,
+                self.manager_id,
+                selection_token=self.quota_token(),
+            )
+
+        self.assertTrue(result["ok"])
+        baza_post.assert_not_called()
+        self.assertEqual(
+            [item.args[0] for item in bitrix_call.call_args_list].count("crm.deal.update"),
+            1,
+        )
+
+    def test_revoked_reserved_grant_blocks_retry_write_and_keeps_evidence(self):
+        self.seed_approved_extra_claim()
+        self.store.begin_claim_operation(
+            self.deal_id,
+            self.manager_id,
+            operation_key=self.operation_key(),
+            request={
+                "claimMarker": self.attempt_marker(),
+                "dealVersion": self.version,
+                "extraClaimRequired": True,
+                "businessDate": self.business_date,
+            },
+            require_extra_grant=True,
+            business_date=self.business_date,
+        )
+        self.store.fail_claim_operation(
+            self.operation_key(),
+            "verification timeout",
+            result={"remoteUpdateUncertain": True},
+        )
+        with (
+            self.common_claim_context(),
+            self.extra_claim_context(),
+            patch.object(app, "baza_post", return_value=self.revoked_response()),
+            patch.object(app, "bitrix_call", return_value=self.source_deal()) as bitrix_call,
+        ):
+            result = app.preview_claim(
+                self.deal_id,
+                self.manager_id,
+                selection_token=self.quota_token(),
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["_httpStatus"], 409)
+        self.assertNotIn(
+            "crm.deal.update",
+            [item.args[0] for item in bitrix_call.call_args_list],
+        )
+        operation = self.store.get_claim_operation(self.operation_key())
+        self.assertEqual(operation["status"], "failed")
+        self.assertEqual(operation["extraClaimGrantId"], self.grant_id)
+        state = self.store.get_extra_claim_state(
+            self.manager_id,
+            self.business_date,
+            operation_key=self.operation_key(),
+        )
+        self.assertEqual(state["grant"]["status"], "reserved")
+
+    def test_next_deal_returns_no_deal_when_grant_refresh_is_unavailable(self):
+        self.seed_approved_extra_claim()
+        handler = HandlerHarness.make(
+            "POST",
+            "/api/next-deal",
+            {"auth": {"AUTH_ID": "fresh", "DOMAIN": "test-fake.bitrix24.test"}},
+        )
+        with (
+            self.extra_claim_context(),
+            patch.object(app, "readiness_state", return_value={"ok": True}),
+            patch.object(app, "rate_limit_allowed", return_value=True),
+            patch.object(app, "actor_id_from_payload", return_value=self.manager_id),
+            patch.object(app, "baza_post", side_effect=TimeoutError("down")),
+            patch.object(app, "get_next_deal_for_manager") as search,
+        ):
+            handler.do_POST()
+
+        self.assertEqual(HandlerHarness.status(handler), 200)
+        payload = HandlerHarness.json(handler)
+        self.assertIsNone(payload["deal"])
+        self.assertTrue(payload["integrationUnavailable"])
+        self.assertIn("Ничего не изменено", payload["reason"])
+        search.assert_not_called()
+
+    def test_remote_empty_grants_stop_search_before_bitrix_deal_listing(self):
+        self.seed_approved_extra_claim()
+        handler = HandlerHarness.make(
+            "POST",
+            "/api/next-deal",
+            {"auth": {"AUTH_ID": "fresh", "DOMAIN": "test-fake.bitrix24.test"}},
+        )
+        with (
+            self.extra_claim_context(),
+            patch.object(app, "readiness_state", return_value={"ok": True}),
+            patch.object(app, "rate_limit_allowed", return_value=True),
+            patch.object(app, "actor_id_from_payload", return_value=self.manager_id),
+            patch.object(app, "baza_post", return_value=self.revoked_response()),
+            patch.object(app, "get_manager_profile", return_value=self.manager()),
+            patch.object(app, "list_allowed_deal_headers") as list_headers,
+        ):
+            handler.do_POST()
+
+        self.assertEqual(HandlerHarness.status(handler), 200)
+        payload = HandlerHarness.json(handler)
+        self.assertIsNone(payload["deal"])
+        self.assertTrue(payload["limitReached"])
+        list_headers.assert_not_called()
 
 
 class TestStalePendingRecovery(ClaimWorkflowTestCase):
@@ -3869,6 +4275,544 @@ class TestSafeConfigurationAndMinimization(TemporaryStateTestCase):
             result = app.readiness_state(force=True)
         self.assertFalse(result["ok"])
         self.assertTrue(any("BITRIX_CLAIM_MARKER_FIELD" in item for item in result["errors"]))
+
+    def test_enabled_baza_integration_rejects_public_placeholder_secret(self):
+        with patch.multiple(
+            app,
+            APP_DIR=self.data_dir,
+            MANAGERS_FILE=self.data_dir / "managers.json",
+            PUBLIC_APP_URL="https://picker.example.test",
+            RAW_APP_ALLOWED_ORIGINS={"https://picker.example.test"},
+            APP_ALLOWED_ORIGINS={"https://picker.example.test"},
+            RAW_BITRIX_ALLOWED_DOMAINS={"test-fake.bitrix24.test"},
+            ALLOWED_BITRIX_DOMAINS={"test-fake.bitrix24.test"},
+            ADMIN_USER_IDS={"1"},
+            CLAIM_STATS_SOURCE="app_events",
+            REQUIRE_LEGACY_MIGRATION=False,
+            REQUIRE_EXPLICIT_ACCESS_RULE=True,
+            DRY_RUN=True,
+            GREETING_AUTO_SEND=False,
+            EXTRA_CLAIM_REQUESTS_ENABLED=True,
+            BAZA_API_BASE_URL="https://baza.example.test",
+            BAZA_HMAC_KEY_ID="deal-picker-v1",
+            BAZA_HMAC_SECRET="REPLACE_WITH_A_PUBLIC_PLACEHOLDER_SECRET",
+            STATE_STORE=self.store,
+        ):
+            result = app.readiness_state(force=True)
+        self.assertFalse(result["ok"])
+        self.assertTrue(any("BAZA_HMAC_SECRET" in item for item in result["errors"]))
+
+
+class TestBazaExtraClaimIntegration(TemporaryStateTestCase):
+    def setUp(self):
+        super().setUp()
+        self.store.set_rule("42", enabled=True, daily_limit=1)
+
+    def add_taken_claim(self, timestamp="2026-08-17T10:00:00+06:00"):
+        self.store.append_claim(
+            {"timestamp": timestamp, "managerId": "42", "dealId": "taken-1"}
+        )
+
+    def test_extra_claim_routes_use_fresh_verified_actor_not_browser_manager_id(self):
+        body = {
+            "auth": {"AUTH_ID": "fresh-token", "DOMAIN": "test-fake.bitrix24.test"},
+            "managerId": "999",
+            "reason": "Клиент ждёт срочный ответ сегодня",
+        }
+        for path in ("/api/extra-claim/status", "/api/extra-claim/request"):
+            with self.subTest(path=path):
+                handler = HandlerHarness.make("POST", path, body)
+                with (
+                    patch.object(app, "readiness_state", return_value={"ok": True}),
+                    patch.object(app, "rate_limit_allowed", return_value=True),
+                    patch.object(app, "actor_id_from_payload", return_value="42") as actor,
+                    patch.object(
+                        app,
+                        "extra_claim_limit_state",
+                        return_value={"ok": True, "managerId": "42"},
+                    ) as status,
+                    patch.object(
+                        app,
+                        "request_extra_claim",
+                        return_value={"ok": True, "managerId": "42"},
+                    ) as request,
+                ):
+                    handler.do_POST()
+
+                self.assertEqual(HandlerHarness.status(handler), 200)
+                actor.assert_called_once_with(body, allow_cached=False)
+                if path.endswith("/status"):
+                    status.assert_called_once_with("42", refresh=True)
+                    request.assert_not_called()
+                else:
+                    request.assert_called_once_with("42", body["reason"])
+                    status.assert_not_called()
+
+    def test_hmac_headers_match_canonical_contract(self):
+        body = app.canonical_json_bytes({"reason": "Пример", "count": 1})
+        with patch.multiple(
+            app,
+            BAZA_HMAC_KEY_ID="picker-v1",
+            BAZA_HMAC_SECRET="s" * 32,
+        ):
+            headers = app.sign_baza_request(
+                "POST",
+                "/integrations/deal-picker/v1/claim-events",
+                body,
+                timestamp="1700000000",
+                nonce="nonce-1",
+            )
+        canonical = (
+            "1700000000\nnonce-1\nPOST\n"
+            "/integrations/deal-picker/v1/claim-events\n"
+            + app.hashlib.sha256(body).hexdigest()
+        ).encode("utf-8")
+        expected = app.hmac.new(b"s" * 32, canonical, app.hashlib.sha256).hexdigest()
+        self.assertEqual(headers["X-Krugosvet-Key-Id"], "picker-v1")
+        self.assertEqual(headers["X-Krugosvet-Signature"], expected)
+
+    def test_baza_outage_is_not_contacted_for_within_limit_state(self):
+        with (
+            patch.multiple(
+                app,
+                EXTRA_CLAIM_REQUESTS_ENABLED=True,
+                BAZA_API_BASE_URL="https://baza.example.test",
+                BAZA_HMAC_KEY_ID="picker-v1",
+                BAZA_HMAC_SECRET="s" * 32,
+            ),
+            patch.object(app, "local_date", return_value="2026-08-17"),
+            patch.object(app, "is_limit_bypassed_now", return_value=False),
+            patch.object(app, "baza_post", side_effect=TimeoutError("down")) as baza_post,
+        ):
+            state = app.extra_claim_limit_state("42", refresh=True)
+        self.assertFalse(state["limitReached"])
+        baza_post.assert_not_called()
+
+    def test_limit_response_exposes_request_and_approved_grant(self):
+        self.add_taken_claim()
+        request = self.store.create_extra_claim_request(
+            "42",
+            "2026-08-17",
+            "Нужна дополнительная срочная заявка",
+            taken_today_snapshot=1,
+            daily_limit_snapshot=1,
+        )
+        self.store.apply_extra_claim_request_response(
+            request["requestKey"], {"id": "req-42", "status": "pending"}
+        )
+        with (
+            patch.multiple(app, EXTRA_CLAIM_REQUESTS_ENABLED=True),
+            patch.object(app, "local_date", return_value="2026-08-17"),
+            patch.object(app, "is_limit_bypassed_now", return_value=False),
+        ):
+            denied = app.check_manager_access("42")
+            self.assertFalse(denied["ok"])
+            self.assertTrue(denied["limitReached"])
+            self.assertEqual(denied["extraClaimRequest"]["status"], "pending")
+
+            self.store.import_extra_claim_state(
+                "42",
+                "2026-08-17",
+                {
+                    "request": {"id": "req-42", "status": "approved"},
+                    "grants": [
+                        {
+                            "id": "req-42",
+                            "requestId": "req-42",
+                            "status": "approved",
+                            "businessDate": "2026-08-17",
+                        }
+                    ],
+                },
+            )
+            allowed = app.check_manager_access("42")
+        self.assertTrue(allowed["ok"])
+        self.assertTrue(allowed["extraClaimRequired"])
+
+    def test_request_double_click_is_local_idempotent_during_baza_outage(self):
+        self.add_taken_claim()
+        manager = {
+            "id": "42",
+            "name": "Manager",
+            "active": True,
+            "intranet": True,
+            "competencies": ["Турция"],
+        }
+        with (
+            patch.multiple(
+                app,
+                EXTRA_CLAIM_REQUESTS_ENABLED=True,
+                BAZA_API_BASE_URL="https://baza.example.test",
+                BAZA_HMAC_KEY_ID="picker-v1",
+                BAZA_HMAC_SECRET="s" * 32,
+            ),
+            patch.object(app, "local_date", return_value="2026-08-17"),
+            patch.object(app, "is_limit_bypassed_now", return_value=False),
+            patch.object(app, "get_manager_profile", return_value=manager),
+            patch.object(app, "flush_integration_outbox", return_value={"sent": 0}),
+            patch.object(app, "refresh_extra_claim_state", side_effect=TimeoutError("down")),
+        ):
+            first = app.request_extra_claim("42", "Клиент ждёт срочный ответ сегодня")
+            second = app.request_extra_claim("42", "Повторный клик с другой причиной")
+        self.assertTrue(first["ok"])
+        self.assertTrue(second["ok"])
+        self.assertEqual(
+            first["request"]["requestKey"], second["request"]["requestKey"]
+        )
+        requests = [i for i in self.store.list_outbox() if i["kind"] == "extra_claim_request"]
+        self.assertEqual(len(requests), 1)
+
+    def test_rendered_ui_contains_reason_modal_and_all_request_states(self):
+        rendered = app.render_index_html(initial_auth={}, nonce="fixed-nonce")
+        for expected in (
+            "Запросить ещё 1 заявку",
+            "Получить дополнительную заявку",
+            "Запрос на рассмотрении",
+            "В дополнительной заявке отказано",
+            "extraClaimReason",
+            "shouldPollExtraClaimStatus",
+            "/api/extra-claim/request",
+            "/api/extra-claim/status",
+        ):
+            self.assertIn(expected, rendered)
+
+    def test_status_refresh_never_flushes_historical_claim_events(self):
+        self.add_taken_claim()
+        request = self.store.create_extra_claim_request(
+            "42",
+            "2026-08-17",
+            "Нужна ещё одна заявка для клиента",
+            taken_today_snapshot=1,
+            daily_limit_snapshot=1,
+        )
+        calls = []
+
+        def fake_baza(path, payload, timeout=None):
+            calls.append(path)
+            if path.endswith("extra-claim-requests"):
+                return {"request": {"id": "req-priority", "status": "pending"}}
+            if path.endswith("grants/query"):
+                return {
+                    "request": {"id": "req-priority", "status": "pending"},
+                    "grants": [],
+                }
+            raise AssertionError(f"unexpected synchronous path: {path}")
+
+        with (
+            patch.multiple(
+                app,
+                EXTRA_CLAIM_REQUESTS_ENABLED=True,
+                BAZA_API_BASE_URL="https://baza.example.test",
+                BAZA_HMAC_KEY_ID="picker-v1",
+                BAZA_HMAC_SECRET="s" * 32,
+            ),
+            patch.object(app, "local_date", return_value="2026-08-17"),
+            patch.object(app, "is_limit_bypassed_now", return_value=False),
+            patch.object(app, "baza_post", side_effect=fake_baza),
+        ):
+            state = app.extra_claim_limit_state("42", refresh=True)
+
+        self.assertEqual(
+            calls,
+            [
+                "/integrations/deal-picker/v1/extra-claim-requests",
+                "/integrations/deal-picker/v1/grants/query",
+            ],
+        )
+        self.assertEqual(state["request"]["requestKey"], request["requestKey"])
+        pending_claims = [
+            item for item in self.store.list_outbox(delivered=False)
+            if item["kind"] == "claim_event"
+        ]
+        self.assertEqual(len(pending_claims), 1)
+
+    def test_active_request_exists_409_adopts_remote_pending_instead_of_rejecting(self):
+        request = self.store.create_extra_claim_request(
+            "42",
+            "2026-08-17",
+            "Нужна ещё одна заявка для клиента",
+            taken_today_snapshot=1,
+            daily_limit_snapshot=1,
+        )
+        conflict = app.BazaIntegrationHttpError(
+            409,
+            {
+                "code": "active_request_exists",
+                "request": {
+                    "id": "remote-active",
+                    "status": "pending",
+                    "reason": "Запрос уже ожидает решения",
+                },
+            },
+        )
+        with (
+            patch.multiple(
+                app,
+                EXTRA_CLAIM_REQUESTS_ENABLED=True,
+                BAZA_API_BASE_URL="https://baza.example.test",
+                BAZA_HMAC_KEY_ID="picker-v1",
+                BAZA_HMAC_SECRET="s" * 32,
+            ),
+            patch.object(app, "baza_post", side_effect=conflict),
+        ):
+            summary = app.flush_integration_outbox(
+                limit=1,
+                kinds={"extra_claim_request"},
+                dedupe_key=f"extra-claim-request:{request['requestKey']}",
+            )
+        state = self.store.get_extra_claim_state("42", "2026-08-17")
+        self.assertEqual(summary["sent"], 1)
+        self.assertEqual(state["request"]["status"], "pending")
+        self.assertEqual(state["request"]["id"], "remote-active")
+        outbox = self.store.list_outbox()[0]
+        self.assertIsNotNone(outbox["deliveredAt"])
+        self.assertIsNone(outbox["deadLetterAt"])
+
+    def test_outage_then_old_409_reconciles_claim_before_creating_next_request(self):
+        old_request = self.store.create_extra_claim_request(
+            "42",
+            "2026-08-17",
+            "Нужна первая дополнительная заявка",
+            taken_today_snapshot=1,
+            daily_limit_snapshot=1,
+        )
+        self.store.apply_extra_claim_request_response(
+            old_request["requestKey"],
+            {"id": "remote-old", "status": "pending"},
+        )
+        for item in self.store.list_outbox(delivered=False):
+            if item["kind"] == "extra_claim_request":
+                self.store.mark_outbox_delivered(item["id"], {"ok": True})
+        self.store.import_extra_claim_state(
+            "42",
+            "2026-08-17",
+            {
+                "request": {
+                    "requestKey": old_request["requestKey"],
+                    "id": "remote-old",
+                    "status": "approved",
+                },
+                "grants": [
+                    {
+                        "id": "remote-old",
+                        "requestId": "remote-old",
+                        "status": "approved",
+                        "bitrixUserId": "42",
+                        "businessDate": "2026-08-17",
+                    }
+                ],
+            },
+        )
+        self.store.begin_claim_operation(
+            "deal-old",
+            "42",
+            operation_key="claim:old-extra",
+            require_extra_grant=True,
+            business_date="2026-08-17",
+        )
+        self.store.finalize_claim_operation(
+            "claim:old-extra",
+            claim={"timestamp": "2026-08-17T12:00:00+06:00"},
+        )
+        next_request = self.store.create_extra_claim_request(
+            "42",
+            "2026-08-17",
+            "Нужна следующая заявка после использованной",
+            taken_today_snapshot=2,
+            daily_limit_snapshot=1,
+        )
+
+        outage_calls = []
+
+        def outage(path, _payload, timeout=None):
+            outage_calls.append(path)
+            if path.endswith("claim-events"):
+                raise TimeoutError("Baza is unavailable")
+            raise app.BazaIntegrationHttpError(
+                409,
+                {
+                    "code": "active_request_exists",
+                    "request": {
+                        "requestKey": old_request["requestKey"],
+                        "id": "remote-old",
+                        "status": "approved",
+                        "bitrixUserId": "42",
+                        "businessDate": "2026-08-17",
+                    },
+                },
+            )
+
+        with (
+            patch.multiple(
+                app,
+                EXTRA_CLAIM_REQUESTS_ENABLED=True,
+                BAZA_API_BASE_URL="https://baza.example.test",
+                BAZA_HMAC_KEY_ID="picker-v1",
+                BAZA_HMAC_SECRET="s" * 32,
+            ),
+            patch.object(app, "baza_post", side_effect=outage),
+        ):
+            outage_summary = app.flush_integration_outbox(limit=10)
+
+        self.assertEqual(outage_summary["retried"], 2)
+        self.assertEqual(
+            outage_calls,
+            [
+                "/integrations/deal-picker/v1/claim-events",
+                "/integrations/deal-picker/v1/extra-claim-requests",
+            ],
+        )
+        with sqlite3.connect(self.store.db_path) as connection:
+            statuses = dict(
+                connection.execute(
+                    "SELECT request_key, status FROM extra_claim_requests"
+                ).fetchall()
+            )
+        self.assertEqual(statuses[old_request["requestKey"]], "consumed")
+        self.assertEqual(statuses[next_request["requestKey"]], "queued")
+
+        # Simulate the stale grant snapshot seen before Baza receives the
+        # durable claim event.  It must not revive the consumed local record.
+        self.store.import_extra_claim_state(
+            "42",
+            "2026-08-17",
+            {
+                "request": {
+                    "requestKey": old_request["requestKey"],
+                    "id": "remote-old",
+                    "status": "approved",
+                },
+                "grants": [
+                    {
+                        "id": "remote-old",
+                        "requestId": "remote-old",
+                        "status": "approved",
+                        "businessDate": "2026-08-17",
+                    }
+                ],
+            },
+        )
+        with sqlite3.connect(self.store.db_path) as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT status FROM extra_claim_requests "
+                    "WHERE request_key=?",
+                    (old_request["requestKey"],),
+                ).fetchone()[0],
+                "consumed",
+            )
+            connection.execute(
+                "UPDATE integration_outbox SET next_attempt_at='2000-01-01T00:00:00+00:00' "
+                "WHERE delivered_at IS NULL AND dead_letter_at IS NULL"
+            )
+
+        restored_calls = []
+        old_remote_consumed = False
+
+        def restored(path, _payload, timeout=None):
+            nonlocal old_remote_consumed
+            restored_calls.append(path)
+            if path.endswith("claim-events"):
+                old_remote_consumed = True
+                return {"ok": True, "created": True}
+            self.assertTrue(old_remote_consumed)
+            return {
+                "ok": True,
+                "request": {
+                    "requestKey": next_request["requestKey"],
+                    "id": "remote-next",
+                    "status": "pending",
+                    "bitrixUserId": "42",
+                    "businessDate": "2026-08-17",
+                },
+            }
+
+        with (
+            patch.multiple(
+                app,
+                EXTRA_CLAIM_REQUESTS_ENABLED=True,
+                BAZA_API_BASE_URL="https://baza.example.test",
+                BAZA_HMAC_KEY_ID="picker-v1",
+                BAZA_HMAC_SECRET="s" * 32,
+            ),
+            patch.object(app, "baza_post", side_effect=restored),
+        ):
+            restored_summary = app.flush_integration_outbox(limit=10)
+
+        self.assertEqual(restored_summary["sent"], 2)
+        self.assertEqual(restored_summary["retried"], 0)
+        self.assertEqual(
+            restored_calls,
+            [
+                "/integrations/deal-picker/v1/claim-events",
+                "/integrations/deal-picker/v1/extra-claim-requests",
+            ],
+        )
+        self.assertEqual(self.store.list_outbox(delivered=False), [])
+        state = self.store.get_extra_claim_state("42", "2026-08-17")
+        self.assertEqual(state["request"]["requestKey"], next_request["requestKey"])
+        self.assertEqual(state["request"]["id"], "remote-next")
+        self.assertEqual(state["request"]["status"], "pending")
+
+    def test_claim_event_integrity_409_is_dead_letter_not_false_duplicate(self):
+        claim = self.store.append_claim(
+            {
+                "timestamp": "2026-08-17T12:00:00+06:00",
+                "managerId": "42",
+                "dealId": "integrity-conflict",
+            }
+        )
+        conflict = app.BazaIntegrationHttpError(
+            409,
+            {
+                "code": "idempotency_conflict",
+                "eventUuid": claim["eventUuid"],
+            },
+        )
+        with (
+            patch.multiple(
+                app,
+                EXTRA_CLAIM_REQUESTS_ENABLED=True,
+                BAZA_API_BASE_URL="https://baza.example.test",
+                BAZA_HMAC_KEY_ID="picker-v1",
+                BAZA_HMAC_SECRET="s" * 32,
+            ),
+            patch.object(app, "baza_post", side_effect=conflict),
+        ):
+            summary = app.flush_integration_outbox(limit=1, kinds={"claim_event"})
+
+        self.assertEqual(summary["sent"], 0)
+        self.assertEqual(summary["dead"], 1)
+        outbox = self.store.list_outbox()[0]
+        self.assertIsNone(outbox["deliveredAt"])
+        self.assertIsNotNone(outbox["deadLetterAt"])
+
+    def test_hmac_replay_409_retries_exact_durable_payload(self):
+        self.store.append_claim(
+            {
+                "timestamp": "2026-08-17T12:00:00+06:00",
+                "managerId": "42",
+                "dealId": "replay",
+            }
+        )
+        replay = app.BazaIntegrationHttpError(409, {"code": "replay_detected"})
+        with (
+            patch.multiple(
+                app,
+                EXTRA_CLAIM_REQUESTS_ENABLED=True,
+                BAZA_API_BASE_URL="https://baza.example.test",
+                BAZA_HMAC_KEY_ID="picker-v1",
+                BAZA_HMAC_SECRET="s" * 32,
+            ),
+            patch.object(app, "baza_post", side_effect=replay),
+        ):
+            summary = app.flush_integration_outbox(limit=1, kinds={"claim_event"})
+
+        self.assertEqual(summary["retried"], 1)
+        outbox = self.store.list_outbox()[0]
+        self.assertIsNone(outbox["deliveredAt"])
+        self.assertIsNone(outbox["deadLetterAt"])
+        self.assertEqual(outbox["attemptCount"], 1)
 
 
 class TestLostDealAutoclose(TemporaryStateTestCase):

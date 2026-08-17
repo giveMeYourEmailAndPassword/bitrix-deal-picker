@@ -21,7 +21,12 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from state_store import IdempotencyConflictError, StateStore
+from state_store import (
+    ExtraClaimGrantReconciliationRequiredError,
+    ExtraClaimGrantUnavailableError,
+    IdempotencyConflictError,
+    StateStore,
+)
 
 
 INVALID_ENV_VALUES = set()
@@ -143,11 +148,14 @@ DEAL_ANALYSIS_CACHE_LOCK = threading.Lock()
 DEAL_HEADERS_CACHE_LOCK = threading.Lock()
 LOCAL_TZ = timezone(timedelta(hours=env_int("APP_TZ_OFFSET_HOURS", 6, -12, 14)))
 STATE_STORE = StateStore(APP_DIR, local_timezone=LOCAL_TZ, auto_initialize=False)
-APP_VERSION = "2026-08-18-lost-deal-chat-autoclose-inbound-fix"
+APP_VERSION = (
+    "2026-08-18-office-extra-claims-proven-greeting-"
+    "lost-deal-chat-autoclose-inbound-fix"
+)
 # Bump whenever classifier, eligibility, source-completeness or oldest-first
 # routing semantics change. Pre-deploy tokens must not authorize post-deploy
 # decisions under a different routing policy.
-ROUTING_POLICY_VERSION = "2026-08-17-routing-v2"
+ROUTING_POLICY_VERSION = "2026-08-17-routing-v3-extra-claims"
 
 SOURCE_STAGES = {
     "UC_ZJ55BR": "Необработанные ЛИДЫ",
@@ -263,6 +271,20 @@ CLAIM_RECONCILE_INTERVAL_SECONDS = env_float(
     "CLAIM_RECONCILE_INTERVAL_SECONDS", 60, 30, 3600
 )
 CLAIM_RECONCILE_BATCH_SIZE = env_int("CLAIM_RECONCILE_BATCH_SIZE", 100, 1, 1000)
+EXTRA_CLAIM_REQUESTS_ENABLED = env_bool("EXTRA_CLAIM_REQUESTS_ENABLED", False)
+BAZA_API_BASE_URL = os.environ.get("BAZA_API_BASE_URL", "").strip().rstrip("/")
+BAZA_HMAC_SECRET = os.environ.get("BAZA_HMAC_SECRET", "")
+BAZA_HMAC_KEY_ID = os.environ.get("BAZA_HMAC_KEY_ID", "").strip()
+BAZA_TIMEOUT_SECONDS = env_float("BAZA_TIMEOUT_SECONDS", 5, 1, 30)
+BAZA_MAX_RESPONSE_BYTES = env_int(
+    "BAZA_MAX_RESPONSE_BYTES", 1024 * 1024, 4096, 5 * 1024 * 1024
+)
+INTEGRATION_OUTBOX_INTERVAL_SECONDS = env_float(
+    "INTEGRATION_OUTBOX_INTERVAL_SECONDS", 15, 5, 3600
+)
+INTEGRATION_OUTBOX_BATCH_SIZE = env_int(
+    "INTEGRATION_OUTBOX_BATCH_SIZE", 20, 1, 200
+)
 
 REJECT_REASONS = {
     "not_my_country": "Не моя страна",
@@ -446,6 +468,148 @@ def is_railway_runtime():
 
 def is_unverified_dev_mode():
     return ALLOW_UNVERIFIED_USERS and DRY_RUN and is_local_runtime()
+
+
+class BazaIntegrationHttpError(RuntimeError):
+    def __init__(self, status, payload=None):
+        super().__init__(f"Baza HTTP {int(status)}")
+        self.status = int(status)
+        self.payload = payload if isinstance(payload, dict) else {}
+
+    @property
+    def retryable(self):
+        return self.status == 429 or self.status >= 500
+
+
+def baza_base_url_valid():
+    parsed = safe_urlparse(BAZA_API_BASE_URL)
+    try:
+        return bool(
+            parsed is not None
+            and parsed.scheme in {"https", "http"}
+            and parsed.hostname
+            and not parsed.username
+            and not parsed.password
+            and parsed.path in {"", "/"}
+            and not parsed.query
+            and not parsed.fragment
+            and (
+                parsed.scheme == "https"
+                or (
+                    parsed.hostname in {"127.0.0.1", "localhost", "::1"}
+                    and is_local_runtime()
+                )
+            )
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+def baza_integration_configured():
+    return bool(
+        EXTRA_CLAIM_REQUESTS_ENABLED
+        and baza_base_url_valid()
+        and BAZA_HMAC_KEY_ID
+        and len(BAZA_HMAC_SECRET.encode("utf-8")) >= 32
+        and "REPLACE" not in BAZA_HMAC_SECRET.upper()
+    )
+
+
+def canonical_json_bytes(payload):
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def sign_baza_request(method, path, body, *, timestamp=None, nonce=None):
+    """Return the canonical cross-system HMAC headers.
+
+    ``body`` must be the exact bytes sent on the wire.  Keeping signing in one
+    function lets both services test the same byte-for-byte contract.
+    """
+
+    method = str(method or "").upper()
+    path = str(path or "")
+    if not path.startswith("/") or "?" in path or "#" in path:
+        raise ValueError("Baza integration path must be an absolute path without query")
+    body = bytes(body)
+    timestamp = str(timestamp if timestamp is not None else int(time.time()))
+    nonce = str(nonce or secrets.token_hex(16))
+    canonical = "\n".join(
+        (
+            timestamp,
+            nonce,
+            method,
+            path,
+            hashlib.sha256(body).hexdigest(),
+        )
+    ).encode("utf-8")
+    signature = hmac.new(
+        BAZA_HMAC_SECRET.encode("utf-8"), canonical, hashlib.sha256
+    ).hexdigest()
+    return {
+        "X-Krugosvet-Key-Id": BAZA_HMAC_KEY_ID,
+        "X-Krugosvet-Timestamp": timestamp,
+        "X-Krugosvet-Nonce": nonce,
+        "X-Krugosvet-Signature": signature,
+    }
+
+
+def read_bounded_json_response(response, maximum_bytes=BAZA_MAX_RESPONSE_BYTES):
+    raw_length = response.headers.get("Content-Length") if response.headers else None
+    if raw_length:
+        try:
+            if int(raw_length) > maximum_bytes:
+                raise RuntimeError("Baza response exceeds the safe size")
+        except ValueError as exc:
+            raise RuntimeError("Baza returned an invalid response size") from exc
+    raw = response.read(maximum_bytes + 1)
+    if len(raw) > maximum_bytes:
+        raise RuntimeError("Baza response exceeds the safe size")
+    if not raw:
+        return {}
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("Baza returned invalid JSON") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("Baza returned an unexpected response")
+    return payload
+
+
+def baza_post(path, payload, *, timeout=None):
+    if not baza_integration_configured():
+        raise RuntimeError("Baza integration is not configured")
+    body = canonical_json_bytes(dict(payload or {}))
+    headers = {
+        "Content-Type": "application/json; charset=utf-8",
+        "Accept": "application/json",
+        **sign_baza_request("POST", path, body),
+    }
+    request = urllib.request.Request(
+        BAZA_API_BASE_URL + path,
+        data=body,
+        headers=headers,
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(
+            request, timeout=timeout or BAZA_TIMEOUT_SECONDS
+        ) as response:
+            payload = read_bounded_json_response(response)
+            status = int(getattr(response, "status", 200) or 200)
+    except urllib.error.HTTPError as exc:
+        try:
+            payload = read_bounded_json_response(exc)
+        except Exception:
+            payload = {}
+        raise BazaIntegrationHttpError(exc.code, payload) from exc
+    if not 200 <= status < 300:
+        raise BazaIntegrationHttpError(status, payload)
+    return payload
 
 
 def json_for_script(value):
@@ -985,6 +1149,344 @@ def rejection_reason_summary(log, manager_id, date_from=None, date_to=None):
     return f"{REJECT_REASONS[reason]} ({count})"
 
 
+def _outbox_request_key(item):
+    payload = item.get("payload") if isinstance(item, dict) else {}
+    return str((payload or {}).get("requestKey") or "")
+
+
+def _deliver_integration_outbox_item(item):
+    """Deliver one item and return its summary bucket.
+
+    The caller wraps this entire function so a local state-merge failure in a
+    409 handler cannot abort the rest of the already selected batch.
+    """
+
+    try:
+        response = baza_post(item["path"], item["payload"])
+        if item["kind"] == "extra_claim_request":
+            STATE_STORE.apply_extra_claim_request_response(
+                _outbox_request_key(item), response
+            )
+        STATE_STORE.mark_outbox_delivered(item["id"], response)
+        return "sent"
+    except BazaIntegrationHttpError as exc:
+        error_container = (
+            exc.payload.get("data")
+            if isinstance(exc.payload.get("data"), dict)
+            else exc.payload
+        )
+        error_code = str(
+            error_container.get("code")
+            or error_container.get("error")
+            or exc.payload.get("code")
+            or exc.payload.get("error")
+            or ""
+        ).strip().lower()
+        active_remote_request = (
+            error_container.get("request") or exc.payload.get("request")
+        )
+        active_remote = (
+            active_remote_request if isinstance(active_remote_request, dict) else {}
+        )
+        active_request_payload = item.get("payload") or {}
+        active_remote_status = str(active_remote.get("status") or "").lower()
+        active_remote_id = str(
+            active_remote.get("id") or active_remote.get("requestId") or ""
+        )
+        active_remote_manager = str(active_remote.get("bitrixUserId") or "")
+        active_remote_date = str(active_remote.get("businessDate") or "")
+        active_request_exists = bool(
+            item.get("kind") == "extra_claim_request"
+            and exc.status == 409
+            and error_code == "active_request_exists"
+            and isinstance(active_remote_request, dict)
+            and active_remote_id
+            and active_remote_status in {"pending", "approved"}
+            and (
+                not active_remote_manager
+                or active_remote_manager
+                == str(active_request_payload.get("bitrixUserId") or "")
+            )
+            and (
+                not active_remote_date
+                or active_remote_date
+                == str(active_request_payload.get("businessDate") or "")
+            )
+        )
+        if active_request_exists:
+            # A retry of the same logical request is safe to adopt.  If this
+            # response actually belongs to an older locally consumed request,
+            # the state store raises an association conflict.  The outer
+            # per-item guard then delays this new request until the linked
+            # claim event has reconciled the old remote grant.
+            STATE_STORE.apply_extra_claim_request_response(
+                _outbox_request_key(item), {"request": active_remote_request}
+            )
+            STATE_STORE.mark_outbox_delivered(item["id"], exc.payload)
+            return "sent"
+        if error_code == "replay_detected" or exc.retryable:
+            # Every retry is signed with a fresh nonce.  A replay response is
+            # therefore transient, while 5xx may mean Baza committed before
+            # its response failed; the exact same durable payload must retry.
+            STATE_STORE.mark_outbox_failed(item["id"], f"HTTP {exc.status}")
+            return "retried"
+
+        safe_reason = (
+            "База не смогла принять запрос. Обратитесь к администратору."
+            if item.get("kind") == "extra_claim_request"
+            else "Baza rejected a claim event integrity check"
+        )
+        if item.get("kind") == "extra_claim_request":
+            STATE_STORE.reject_extra_claim_request_locally(
+                _outbox_request_key(item), safe_reason
+            )
+        # Exact duplicate claim events return 200 from Baza.  Any 409 such as
+        # idempotency_conflict or grant_unavailable is integrity evidence and
+        # must remain terminal/manual instead of being treated as success.
+        STATE_STORE.mark_outbox_dead_letter(item["id"], safe_reason, exc.payload)
+        return "dead"
+
+
+def flush_integration_outbox(limit=None, *, kinds=None, dedupe_key=None):
+    """Deliver a bounded durable batch without affecting Bitrix availability."""
+
+    summary = {"enabled": baza_integration_configured(), "sent": 0, "retried": 0, "dead": 0}
+    if not summary["enabled"]:
+        return summary
+    for item in STATE_STORE.list_due_outbox(
+        limit=limit or INTEGRATION_OUTBOX_BATCH_SIZE,
+        kinds=kinds,
+        dedupe_key=dedupe_key,
+    ):
+        try:
+            outcome = _deliver_integration_outbox_item(item)
+        except Exception as exc:
+            # This includes local merge/constraint failures raised while
+            # handling an HTTP 409.  One poison item must not prevent a linked
+            # claim event or unrelated audit records later in the batch from
+            # being delivered.
+            try:
+                STATE_STORE.mark_outbox_failed(item["id"], type(exc).__name__)
+            except Exception as state_exc:
+                sys.stderr.write(
+                    "Baza integration outbox state update failed: "
+                    f"{type(state_exc).__name__}\n"
+                )
+            outcome = "retried"
+        summary[outcome] += 1
+    return summary
+
+
+def integration_outbox_loop():
+    while True:
+        try:
+            if readiness_state().get("ok"):
+                summary = flush_integration_outbox()
+                if summary["sent"] or summary["retried"] or summary["dead"]:
+                    sys.stderr.write(
+                        "Baza integration outbox: "
+                        + " ".join(f"{key}={value}" for key, value in summary.items())
+                        + "\n"
+                    )
+        except Exception as exc:
+            sys.stderr.write(f"Baza integration outbox failed: {type(exc).__name__}\n")
+        time.sleep(INTEGRATION_OUTBOX_INTERVAL_SECONDS)
+
+
+def authoritative_extra_claim_grant_ids(response, manager_id, business_date):
+    """Return approved grant IDs from this exact signed Baza response.
+
+    The local store intentionally retains a reserved grant while a CRM write
+    is uncertain.  Therefore a local ``grantAvailable`` flag alone cannot
+    authorize a new/retried write after an office transfer or remote revoke.
+    """
+
+    response = dict(response or {})
+    container = response.get("data") if isinstance(response.get("data"), dict) else response
+    grants = container.get("grants")
+    if grants is None and isinstance(container.get("grant"), dict):
+        grants = [container["grant"]]
+    if not isinstance(grants, list):
+        return set()
+    manager_id = str(manager_id or "")
+    business_date = str(business_date or "")
+    approved = set()
+    for raw_grant in grants:
+        if not isinstance(raw_grant, dict):
+            continue
+        grant_id = str(raw_grant.get("id") or raw_grant.get("requestId") or "")
+        if (
+            grant_id
+            and str(raw_grant.get("status") or "approved").strip().lower() == "approved"
+            and str(raw_grant.get("bitrixUserId") or manager_id) == manager_id
+            and str(raw_grant.get("businessDate") or business_date) == business_date
+        ):
+            approved.add(grant_id)
+    return approved
+
+
+def refresh_extra_claim_state(manager_id, business_date=None, *, operation_key=None):
+    business_date = business_date or local_date()
+    response = baza_post(
+        "/integrations/deal-picker/v1/grants/query",
+        {
+            "bitrixUserId": str(manager_id),
+            "businessDate": business_date,
+        },
+    )
+    STATE_STORE.import_extra_claim_state(manager_id, business_date, response)
+    state = STATE_STORE.get_extra_claim_state(
+        manager_id,
+        business_date,
+        operation_key=operation_key,
+    )
+    authoritative_ids = authoritative_extra_claim_grant_ids(
+        response,
+        manager_id,
+        business_date,
+    )
+    local_grant_id = str((state.get("grant") or {}).get("id") or "")
+    state["authoritativeGrantAvailable"] = bool(
+        local_grant_id and local_grant_id in authoritative_ids
+    )
+    return state
+
+
+def extra_claim_limit_state(manager_id, *, refresh=False):
+    today = local_date()
+    rule = get_manager_rule(manager_id)
+    taken_today = count_claims(manager_id, today, today)
+    limit = rule.get("dailyLimit")
+    bypassed = bool(limit is not None and is_limit_bypassed_now())
+    limit_reached = bool(
+        limit is not None and not bypassed and taken_today >= int(limit)
+    )
+    integration_unavailable = False
+    local_state = STATE_STORE.get_extra_claim_state(manager_id, today)
+    if refresh and limit_reached and EXTRA_CLAIM_REQUESTS_ENABLED:
+        if not baza_integration_configured():
+            integration_unavailable = True
+        else:
+            try:
+                pending_request = local_state.get("request") or {}
+                pending_key = str(pending_request.get("requestKey") or "")
+                if pending_key and pending_request.get("status") == "queued":
+                    flush_integration_outbox(
+                        limit=1,
+                        kinds={"extra_claim_request"},
+                        dedupe_key=f"extra-claim-request:{pending_key}",
+                    )
+                refresh_extra_claim_state(manager_id, today)
+            except Exception:
+                integration_unavailable = True
+        local_state = STATE_STORE.get_extra_claim_state(manager_id, today)
+    request_state = local_state.get("request")
+    return {
+        "ok": True,
+        "enabled": bool(EXTRA_CLAIM_REQUESTS_ENABLED),
+        "configured": bool(baza_integration_configured()),
+        "businessDate": today,
+        "takenToday": taken_today,
+        "dailyLimit": limit,
+        "limitBypassed": bypassed,
+        "limitReached": limit_reached,
+        "request": request_state,
+        "grant": local_state.get("grant"),
+        "grantAvailable": bool(local_state.get("grantAvailable")),
+        "integrationUnavailable": integration_unavailable,
+    }
+
+
+def request_extra_claim(manager_id, reason):
+    if not EXTRA_CLAIM_REQUESTS_ENABLED:
+        return {
+            "ok": False,
+            "message": "Запросы дополнительных заявок пока не включены.",
+            "_httpStatus": 403,
+        }
+    if not baza_integration_configured():
+        return {
+            "ok": False,
+            "message": "Связь с Базой ещё не настроена. Обратитесь к администратору.",
+            "_httpStatus": 503,
+        }
+    manager = get_manager_profile(manager_id)
+    if (
+        not manager
+        or manager.get("active") is not True
+        or manager.get("intranet") is not True
+    ):
+        return {
+            "ok": False,
+            "message": "Запрос доступен только активному сотруднику компании.",
+            "_httpStatus": 403,
+        }
+    configured_rules = STATE_STORE.list_rules()
+    if (
+        REQUIRE_EXPLICIT_ACCESS_RULE
+        and not is_unverified_dev_mode()
+        and str(manager_id) not in configured_rules
+    ):
+        return {
+            "ok": False,
+            "message": "Администратор ещё не открыл вам доступ к выдаче заявок.",
+            "_httpStatus": 403,
+        }
+    rule = get_manager_rule(manager_id)
+    if rule.get("enabled") is False:
+        return {
+            "ok": False,
+            "message": "Для вас закрыт доступ к получению заявок.",
+            "_httpStatus": 403,
+        }
+    reason = str(reason or "").strip()
+    if not 10 <= len(reason) <= 500:
+        return {
+            "ok": False,
+            "message": "Напишите причину запроса: от 10 до 500 символов.",
+            "_httpStatus": 400,
+        }
+    state = extra_claim_limit_state(manager_id, refresh=True)
+    if not state["limitReached"]:
+        return {
+            "ok": False,
+            "message": "Ваш дневной лимит ещё не закончился или сейчас действует свободное время.",
+            "_httpStatus": 409,
+        }
+    request = STATE_STORE.create_extra_claim_request(
+        manager_id,
+        state["businessDate"],
+        reason,
+        taken_today_snapshot=state["takenToday"],
+        daily_limit_snapshot=state["dailyLimit"],
+    )
+    # Best effort only. The durable row/outbox is already committed, so a Baza
+    # outage cannot lose the click or affect ordinary claims.
+    flush_integration_outbox(
+        limit=1,
+        kinds={"extra_claim_request"},
+        dedupe_key=f"extra-claim-request:{request['requestKey']}",
+    )
+    state = extra_claim_limit_state(manager_id, refresh=False)
+    state["request"] = state.get("request") or request
+    request_state = state.get("request") or {}
+    request_status = request_state.get("status")
+    if request_status == "pending":
+        state["message"] = "Запрос отправлен директору офиса."
+    elif request_status == "approved":
+        state["message"] = "Директор одобрил одну дополнительную заявку."
+    elif request_status == "rejected":
+        state["message"] = (
+            request_state.get("rejectionReason")
+            or "Директор отказал в дополнительной заявке."
+        )
+    else:
+        state["message"] = (
+            "Запрос сохранён и будет отправлен директору, когда связь с Базой восстановится."
+        )
+    return state
+
+
 def check_manager_access(manager_id, allow_operation_key=None):
     configured_rules = STATE_STORE.list_rules()
     if (
@@ -1023,10 +1525,32 @@ def check_manager_access(manager_id, allow_operation_key=None):
         today = local_date()
         taken_today = count_claims(manager_id, today, today)
         if taken_today >= int(rule["dailyLimit"]):
+            extra_state = STATE_STORE.get_extra_claim_state(
+                manager_id,
+                today,
+                operation_key=allow_operation_key,
+            )
+            if EXTRA_CLAIM_REQUESTS_ENABLED and extra_state.get("grantAvailable"):
+                return {
+                    "ok": True,
+                    "rule": rule,
+                    "limitReached": True,
+                    "takenToday": taken_today,
+                    "dailyLimit": rule["dailyLimit"],
+                    "extraClaimRequired": True,
+                    "extraClaimGrant": extra_state.get("grant"),
+                    "extraClaimRequest": extra_state.get("request"),
+                }
             return {
                 "ok": False,
                 "rule": rule,
                 "reason": f"Дневной лимит заявок уже достигнут: {taken_today}/{rule['dailyLimit']}.",
+                "limitReached": True,
+                "takenToday": taken_today,
+                "dailyLimit": rule["dailyLimit"],
+                "extraClaimEnabled": bool(EXTRA_CLAIM_REQUESTS_ENABLED),
+                "extraClaimRequest": extra_state.get("request"),
+                "extraClaimGrantAvailable": False,
             }
     return {"ok": True, "rule": rule}
 
@@ -3120,7 +3644,17 @@ def _get_next_deal_for_manager(manager_id, continuation_token=None):
         return {"manager": manager, "deal": None, "reason": "Выдача доступна только сотрудникам компании."}
     access = check_manager_access(manager_id)
     if not access["ok"]:
-        return {"manager": manager, "deal": None, "reason": access["reason"]}
+        return {
+            "manager": manager,
+            "deal": None,
+            "reason": access["reason"],
+            "limitReached": bool(access.get("limitReached")),
+            "takenToday": access.get("takenToday"),
+            "dailyLimit": access.get("dailyLimit"),
+            "extraClaimEnabled": bool(access.get("extraClaimEnabled")),
+            "extraClaimRequest": access.get("extraClaimRequest"),
+            "extraClaimGrantAvailable": bool(access.get("extraClaimGrantAvailable")),
+        }
 
     rejected_keys = STATE_STORE.list_rejection_semantic_keys(manager_id)
     unresolved_deal_ids = STATE_STORE.list_unresolved_claim_deal_ids()
@@ -3827,6 +4361,7 @@ def preview_claim(deal_id, manager_id, auth=None, selection_token=None):
         }
     success_result = None
     suppress_replay_greeting = False
+    claim_access = None
     with DATA_LOCK:
         # Reject and claim are mutually exclusive for one offered lifecycle.
         # Recheck after acquiring the same process-wide lock used by
@@ -3905,11 +4440,17 @@ def preview_claim(deal_id, manager_id, auth=None, selection_token=None):
                     "_httpStatus": 403,
                 }
             access = check_manager_access(manager_id, allow_operation_key=operation_key)
+            claim_access = access
             if not access["ok"]:
                 return {
                     "ok": False,
                     "dryRun": DRY_RUN,
                     "message": access["reason"],
+                    "limitReached": bool(access.get("limitReached")),
+                    "takenToday": access.get("takenToday"),
+                    "dailyLimit": access.get("dailyLimit"),
+                    "extraClaimEnabled": bool(access.get("extraClaimEnabled")),
+                    "extraClaimRequest": access.get("extraClaimRequest"),
                     "_httpStatus": 403,
                 }
             if str(selection.get("policy") or "") != manager_policy_hash(
@@ -4016,6 +4557,8 @@ def preview_claim(deal_id, manager_id, auth=None, selection_token=None):
                         ),
                         result=success_result,
                         expected_claim_marker=expected_existing_marker,
+                        app_version=APP_VERSION,
+                        recovered=True,
                     )
                     if (
                         finalized_operation.get("status") != "succeeded"
@@ -4125,6 +4668,61 @@ def preview_claim(deal_id, manager_id, auth=None, selection_token=None):
 
         if success_result is None:
             attempt_marker = claim_attempt_marker(operation_key, manager_id)
+            requires_extra_grant = bool(
+                (claim_access or {}).get("extraClaimRequired")
+            )
+            claim_business_date = local_date()
+            if requires_extra_grant:
+                # This is deliberately the last external authorization check
+                # before the atomic local reservation and the Bitrix write.
+                # Ordinary within-limit claims never contact Baza here.
+                try:
+                    authoritative_extra_state = refresh_extra_claim_state(
+                        manager_id,
+                        claim_business_date,
+                        operation_key=operation_key,
+                    )
+                except Exception:
+                    latest_extra_state = STATE_STORE.get_extra_claim_state(
+                        manager_id,
+                        claim_business_date,
+                        operation_key=operation_key,
+                    )
+                    return {
+                        "ok": False,
+                        "dryRun": False,
+                        "message": (
+                            "Не удалось подтвердить дополнительное разрешение в Базе. "
+                            "CRM не изменена; повторите попытку позже."
+                        ),
+                        "limitReached": True,
+                        "takenToday": (claim_access or {}).get("takenToday"),
+                        "dailyLimit": (claim_access or {}).get("dailyLimit"),
+                        "extraClaimEnabled": bool(EXTRA_CLAIM_REQUESTS_ENABLED),
+                        "extraClaimRequest": latest_extra_state.get("request"),
+                        "extraClaimGrantAvailable": False,
+                        "integrationUnavailable": True,
+                        "_httpStatus": 503,
+                    }
+                if not authoritative_extra_state.get(
+                    "authoritativeGrantAvailable"
+                ):
+                    return {
+                        "ok": False,
+                        "dryRun": False,
+                        "message": (
+                            "Дополнительное разрешение отозвано, истекло или уже использовано. "
+                            "CRM не изменена; обновите статус запроса."
+                        ),
+                        "limitReached": True,
+                        "takenToday": (claim_access or {}).get("takenToday"),
+                        "dailyLimit": (claim_access or {}).get("dailyLimit"),
+                        "extraClaimEnabled": bool(EXTRA_CLAIM_REQUESTS_ENABLED),
+                        "extraClaimRequest": authoritative_extra_state.get("request"),
+                        "extraClaimGrantAvailable": False,
+                        "integrationUnavailable": False,
+                        "_httpStatus": 409,
+                    }
             request_context = dict((existing_operation or {}).get("request") or {})
             request_context.update({
                 "dealId": deal_id,
@@ -4132,15 +4730,17 @@ def preview_claim(deal_id, manager_id, auth=None, selection_token=None):
                 "dealVersion": selection_version,
                 "claimMarker": attempt_marker,
                 "attemptStartedAt": local_now().isoformat(),
-            })
+                "extraClaimRequired": requires_extra_grant,
+                "businessDate": claim_business_date,
+             })
             if greeting_snapshot:
                 request_context["greetingRequested"] = True
                 request_context["greetingContext"] = {
                     "sessionId": greeting_snapshot["openlineSessionIds"][0],
                     "direction": (
                         greeting_snapshot.get("classification") or {}
-                    ).get("direction") or "Не определено",
-                }
+                     ).get("direction") or "Не определено",
+                 }
             try:
                 if existing_operation and existing_operation.get("status") == "failed":
                     if existing_operation.get("managerId") == manager_id:
@@ -4149,6 +4749,8 @@ def preview_claim(deal_id, manager_id, auth=None, selection_token=None):
                             manager_id,
                             operation_key=operation_key,
                             request=request_context,
+                            require_extra_grant=requires_extra_grant,
+                            business_date=claim_business_date,
                         )
                     else:
                         operation = STATE_STORE.reassign_failed_claim_operation(
@@ -4156,6 +4758,8 @@ def preview_claim(deal_id, manager_id, auth=None, selection_token=None):
                             manager_id,
                             operation_key=operation_key,
                             request=request_context,
+                            require_extra_grant=requires_extra_grant,
+                            business_date=claim_business_date,
                         )
                 else:
                     operation = STATE_STORE.begin_claim_operation(
@@ -4163,11 +4767,35 @@ def preview_claim(deal_id, manager_id, auth=None, selection_token=None):
                         manager_id,
                         operation_key=operation_key,
                         request=request_context,
+                        require_extra_grant=requires_extra_grant,
+                        business_date=claim_business_date,
                     )
             except IdempotencyConflictError:
                 return {
                     "ok": False,
                     "message": "Эту сделку уже обрабатывает другой менеджер.",
+                    "_httpStatus": 409,
+                }
+            except ExtraClaimGrantUnavailableError:
+                return {
+                    "ok": False,
+                    "message": (
+                        "Дополнительная заявка ещё не одобрена или уже использована. "
+                        "Обновите статус запроса."
+                    ),
+                    "limitReached": True,
+                    "extraClaimEnabled": bool(EXTRA_CLAIM_REQUESTS_ENABLED),
+                    "_httpStatus": 409,
+                }
+            except ExtraClaimGrantReconciliationRequiredError:
+                return {
+                    "ok": False,
+                    "message": (
+                        "Предыдущая попытка могла уже изменить сделку и удерживает "
+                        "дополнительную заявку. Ничего не изменено; попросите "
+                        "администратора сверить операцию."
+                    ),
+                    "recoveryPending": True,
                     "_httpStatus": 409,
                 }
             if not (
@@ -4333,6 +4961,7 @@ def preview_claim(deal_id, manager_id, auth=None, selection_token=None):
                     claim=claim_log_entry(manager_id, verified_deal),
                     result=success_result,
                     expected_claim_marker=attempt_marker,
+                    app_version=APP_VERSION,
                 )
                 if (
                     finalized_operation.get("status") != "succeeded"
@@ -4453,6 +5082,8 @@ def reconcile_stale_claim_operations(limit=None):
                     ),
                     result=result,
                     expected_claim_marker=expected_marker,
+                    app_version=APP_VERSION,
+                    recovered=True,
                 )
                 if finalized.get("status") == "succeeded" and finalized.get("claimEventId"):
                     summary["recovered"] += 1
@@ -4909,6 +5540,16 @@ def _compute_readiness_state():
         errors.append("Не задан разрешённый домен Bitrix24")
     if CLAIM_STATS_SOURCE != "app_events":
         errors.append("CLAIM_STATS_SOURCE поддерживает только точный режим app_events")
+    if EXTRA_CLAIM_REQUESTS_ENABLED:
+        if not baza_base_url_valid():
+            errors.append("BAZA_API_BASE_URL должен быть корректным HTTPS URL")
+        if not BAZA_HMAC_KEY_ID:
+            errors.append("Не задан BAZA_HMAC_KEY_ID")
+        if (
+            len(BAZA_HMAC_SECRET.encode("utf-8")) < 32
+            or "REPLACE" in BAZA_HMAC_SECRET.upper()
+        ):
+            errors.append("BAZA_HMAC_SECRET должен содержать не менее 32 байт")
     if not REQUIRE_EXPLICIT_ACCESS_RULE and not is_unverified_dev_mode():
         errors.append("REQUIRE_EXPLICIT_ACCESS_RULE должен быть включён вне локального DRY_RUN")
     if GREETING_AUTO_SEND and not GREETING_AUTO_SEND_SUPPORTED:
@@ -5245,6 +5886,35 @@ class Handler(BaseHTTPRequestHandler):
                 if not manager_id:
                     self.send_json({"deal": None, "reason": "Не удалось подтвердить пользователя Битрикс."}, 401)
                     return
+                extra_state = (
+                    extra_claim_limit_state(manager_id, refresh=True)
+                    if EXTRA_CLAIM_REQUESTS_ENABLED
+                    else {"enabled": False}
+                )
+                if (
+                    extra_state.get("enabled")
+                    and extra_state.get("limitReached")
+                    and extra_state.get("integrationUnavailable")
+                ):
+                    self.send_json(
+                        {
+                            "deal": None,
+                            "reason": (
+                                "Не удалось подтвердить дополнительное разрешение в Базе. "
+                                "Ничего не изменено; повторите позже."
+                            ),
+                            "limitReached": True,
+                            "takenToday": extra_state.get("takenToday"),
+                            "dailyLimit": extra_state.get("dailyLimit"),
+                            "extraClaimEnabled": True,
+                            "extraClaimConfigured": bool(extra_state.get("configured")),
+                            "extraClaimRequest": extra_state.get("request"),
+                            "extraClaimGrantAvailable": False,
+                            "integrationUnavailable": True,
+                        },
+                        200,
+                    )
+                    return
                 result = get_next_deal_for_manager(
                     manager_id, payload.get("continuationToken")
                 )
@@ -5261,12 +5931,62 @@ class Handler(BaseHTTPRequestHandler):
                 if not manager_id:
                     self.send_json({"ok": False, "message": "Не удалось подтвердить пользователя Битрикс."}, 401)
                     return
+                extra_state = (
+                    extra_claim_limit_state(manager_id, refresh=True)
+                    if EXTRA_CLAIM_REQUESTS_ENABLED
+                    else {"enabled": False}
+                )
+                if (
+                    extra_state.get("enabled")
+                    and extra_state.get("limitReached")
+                    and extra_state.get("integrationUnavailable")
+                ):
+                    self.send_json(
+                        {
+                            "ok": False,
+                            "message": (
+                                "Не удалось подтвердить дополнительное разрешение в Базе. "
+                                "CRM не изменена; повторите попытку позже."
+                            ),
+                            "limitReached": True,
+                            "takenToday": extra_state.get("takenToday"),
+                            "dailyLimit": extra_state.get("dailyLimit"),
+                            "extraClaimEnabled": True,
+                            "extraClaimRequest": extra_state.get("request"),
+                            "extraClaimGrantAvailable": False,
+                            "integrationUnavailable": True,
+                        },
+                        503,
+                    )
+                    return
                 result = preview_claim(
                     payload.get("dealId"),
                     manager_id,
                     payload.get("auth"),
                     payload.get("selectionToken"),
                 )
+                status = int(result.pop("_httpStatus", 200))
+                self.send_json(result, status)
+                return
+            if parsed.path == "/api/extra-claim/status":
+                manager_id = actor_id_from_payload(payload, allow_cached=False)
+                if not manager_id:
+                    self.send_json(
+                        {"ok": False, "message": "Не удалось подтвердить пользователя Битрикс."},
+                        401,
+                    )
+                    return
+                self.send_json(extra_claim_limit_state(manager_id, refresh=True))
+                return
+            if parsed.path == "/api/extra-claim/request":
+                manager_id = actor_id_from_payload(payload, allow_cached=False)
+                if not manager_id:
+                    self.send_json(
+                        {"ok": False, "message": "Не удалось подтвердить пользователя Битрикс."},
+                        401,
+                    )
+                    return
+                result = request_extra_claim(manager_id, payload.get("reason"))
                 status = int(result.pop("_httpStatus", 200))
                 self.send_json(result, status)
                 return
@@ -5360,6 +6080,7 @@ INDEX_HTML = """<!doctype html>
     h1 { font-size: 22px; margin: 0 0 8px; }
     .toolbar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin: 16px 0; }
     input, select { height: 36px; border: 1px solid #b9c2cf; border-radius: 6px; padding: 0 10px; min-width: 190px; background: #fff; }
+    textarea { width: 100%; min-height: 110px; box-sizing: border-box; border: 1px solid #b9c2cf; border-radius: 6px; padding: 10px; resize: vertical; font: inherit; }
     button { height: 38px; border: 1px solid #1769aa; border-radius: 6px; background: #1976c9; color: #fff; padding: 0 14px; cursor: pointer; }
     button.secondary { background: #ffffff; color: #1769aa; }
     button.reason { height: 32px; border-color: #c2ccd8; color: #52616f; background: #fff; padding: 0 10px; font-size: 12px; }
@@ -5375,6 +6096,14 @@ INDEX_HTML = """<!doctype html>
       100% { transform: translateX(250%); }
     }
     .hidden { display: none; }
+    .extra-claim-box { max-width: 760px; margin: 10px 0 14px; }
+    .extra-claim-box.approved { border-color: #55a36a; background: #f2fbf4; }
+    .extra-claim-box.rejected { border-color: #e1a3a3; background: #fff6f6; }
+    .modal-backdrop { position: fixed; inset: 0; z-index: 1000; display: flex; align-items: center; justify-content: center; padding: 18px; background: rgba(15, 31, 50, .55); }
+    .modal-backdrop.hidden { display: none; }
+    .modal-card { width: min(520px, 100%); background: #fff; border-radius: 10px; box-shadow: 0 18px 60px rgba(0,0,0,.25); padding: 20px; }
+    .modal-card h2 { margin: 0 0 8px; font-size: 20px; }
+    .modal-error { color: #a32626; min-height: 20px; font-size: 13px; }
     .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 12px; }
     .card { background: #ffffff; border: 1px solid #d9dee7; border-radius: 8px; padding: 14px; }
     .deal-view { max-width: 760px; }
@@ -5413,6 +6142,7 @@ INDEX_HTML = """<!doctype html>
     </div>
     <div id="managerInfo" class="status"></div>
     <div id="status" class="status">Выберите менеджера и нажмите “Получить сделку”.</div>
+    <section id="extraClaimBox" class="card extra-claim-box hidden"></section>
     <div id="searchProgress" class="search-progress hidden">
       <div class="search-progress-track"><div class="search-progress-bar"></div></div>
       <div class="search-progress-text">Ищем подходящую заявку по навыкам менеджера...</div>
@@ -5431,6 +6161,18 @@ INDEX_HTML = """<!doctype html>
       <div id="adminRows"></div>
     </section>
   </main>
+  <div id="extraClaimModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="extraClaimTitle">
+    <div class="modal-card">
+      <h2 id="extraClaimTitle">Запросить ещё 1 заявку</h2>
+      <div class="meta">Коротко объясните директору офиса, почему нужна дополнительная заявка.</div>
+      <div class="toolbar"><textarea id="extraClaimReason" maxlength="500" placeholder="Например: клиент ждёт срочный подбор, готов взять ещё одну заявку"></textarea></div>
+      <div id="extraClaimModalError" class="modal-error"></div>
+      <div class="toolbar">
+        <button id="submitExtraClaimButton">Отправить запрос</button>
+        <button id="cancelExtraClaimButton" class="secondary">Отмена</button>
+      </div>
+    </div>
+  </div>
 <script nonce="__CSP_NONCE__" src="https://api.bitrix24.com/api/v1/"></script>
 <script nonce="__CSP_NONCE__">
 let selectedDealId = null;
@@ -5442,6 +6184,9 @@ let currentUserIsAdmin = false;
 let isDealSearchRunning = false;
 let userVerified = false;
 let canRequestDeal = false;
+let extraClaimState = null;
+let extraClaimRequestSubmitting = false;
+let extraClaimStatusLoading = false;
 const MAX_SEARCH_BATCHES = 250;
 const PUBLIC_APP_URL = __PUBLIC_APP_URL__;
 const INSTALL_MODE = __INSTALL_MODE__;
@@ -5562,6 +6307,7 @@ function applyAuthorizedUser(user, manager) {
   userVerified = true;
   if (manager) {
     renderManagerInfo(manager);
+    loadExtraClaimStatus();
   } else {
     canRequestDeal = false;
     document.getElementById('managerInfo').textContent = 'Пользователь подтверждён, но профиль сотрудника недоступен.';
@@ -5592,6 +6338,151 @@ function renderManagerInfo(manager) {
   document.getElementById('status').textContent = competencies.length
     ? 'Нажмите “Получить сделку”.'
     : 'Заполните поле “Навыки” в карточке сотрудника, иначе подбор невозможен.';
+}
+function updatePrimaryButton() {
+  const button = document.getElementById('getDealButton');
+  if (!button) return;
+  if (isDealSearchRunning) {
+    button.disabled = true;
+    button.textContent = 'Ищем...';
+    return;
+  }
+  const state = extraClaimState || {};
+  const requestStatus = state.request && state.request.status;
+  if (state.limitReached && state.enabled) {
+    if (state.grantAvailable) {
+      button.disabled = !canRequestDeal;
+      button.textContent = 'Получить дополнительную заявку';
+    } else if (requestStatus === 'queued' || requestStatus === 'pending' || requestStatus === 'approved') {
+      button.disabled = true;
+      button.textContent = requestStatus === 'approved' ? 'Обновляю разрешение...' : 'Запрос на рассмотрении';
+    } else {
+      button.disabled = !canRequestDeal || !state.configured;
+      button.textContent = 'Запросить ещё 1 заявку';
+    }
+    return;
+  }
+  button.disabled = !canRequestDeal;
+  button.textContent = 'Получить сделку';
+}
+function renderExtraClaimState(state) {
+  extraClaimState = state && state.ok ? state : null;
+  const box = document.getElementById('extraClaimBox');
+  box.classList.add('hidden');
+  box.classList.remove('approved', 'rejected');
+  if (!extraClaimState || !extraClaimState.enabled || !extraClaimState.limitReached) {
+    updatePrimaryButton();
+    return;
+  }
+  const request = extraClaimState.request || {};
+  const status = request.status || '';
+  const quota = `${Number(extraClaimState.takenToday || 0)}/${Number(extraClaimState.dailyLimit || 0)}`;
+  let title = `Дневной лимит исчерпан: ${quota}`;
+  let detail = 'Можно запросить у директора офиса ещё одну заявку.';
+  if (extraClaimState.grantAvailable) {
+    title = 'Дополнительная заявка одобрена';
+    detail = 'Разрешение действует на одну успешную выдачу.';
+    box.classList.add('approved');
+  } else if (status === 'queued') {
+    title = 'Запрос сохранён';
+    detail = 'Он будет отправлен директору, когда восстановится связь с Базой.';
+  } else if (status === 'pending') {
+    title = 'Запрос на рассмотрении';
+    detail = 'Директор офиса получил запрос на одну дополнительную заявку.';
+  } else if (status === 'approved') {
+    title = 'Дополнительная заявка одобрена';
+    detail = 'Обновляем одноразовое разрешение. Нажмите обновление страницы через несколько секунд.';
+  } else if (status === 'rejected') {
+    title = 'В дополнительной заявке отказано';
+    detail = request.rejectionReason || 'Причина отказа не указана.';
+    box.classList.add('rejected');
+  }
+  if (extraClaimState.integrationUnavailable && status !== 'queued') {
+    detail += ' Статус из Базы временно не обновился.';
+  }
+  box.innerHTML = `<strong>${escapeHtml(title)}</strong><div class="meta">${escapeHtml(detail)}</div>`;
+  box.classList.remove('hidden');
+  updatePrimaryButton();
+}
+async function loadExtraClaimStatus() {
+  if (!userVerified || !currentAuth() || extraClaimStatusLoading) return;
+  extraClaimStatusLoading = true;
+  try {
+    const state = await postJson('/api/extra-claim/status', { auth: currentAuth() });
+    renderExtraClaimState(state);
+  } catch (error) {
+    // Status synchronization is optional for ordinary within-limit claims.
+    // Keep the last known state and let the main claim path re-check it.
+  } finally {
+    extraClaimStatusLoading = false;
+  }
+}
+function shouldPollExtraClaimStatus() {
+  const state = extraClaimState || {};
+  const status = state.request && state.request.status;
+  return Boolean(
+    userVerified
+    && state.enabled
+    && state.limitReached
+    && (
+      state.grantAvailable
+      || status === 'queued'
+      || status === 'pending'
+      || status === 'approved'
+    )
+  );
+}
+function openExtraClaimModal() {
+  if (!extraClaimState || !extraClaimState.limitReached || extraClaimState.grantAvailable) return;
+  document.getElementById('extraClaimModalError').textContent = '';
+  document.getElementById('extraClaimModal').classList.remove('hidden');
+  document.getElementById('extraClaimReason').focus();
+}
+function closeExtraClaimModal() {
+  if (extraClaimRequestSubmitting) return;
+  document.getElementById('extraClaimModal').classList.add('hidden');
+}
+async function submitExtraClaimRequest() {
+  if (extraClaimRequestSubmitting) return;
+  const reason = document.getElementById('extraClaimReason').value.trim();
+  const errorBox = document.getElementById('extraClaimModalError');
+  if (reason.length < 10 || reason.length > 500) {
+    errorBox.textContent = 'Напишите причину от 10 до 500 символов.';
+    return;
+  }
+  extraClaimRequestSubmitting = true;
+  const button = document.getElementById('submitExtraClaimButton');
+  button.disabled = true;
+  button.textContent = 'Отправляю...';
+  try {
+    const state = await postJson('/api/extra-claim/request', {
+      auth: currentAuth(),
+      reason
+    });
+    document.getElementById('extraClaimModal').classList.add('hidden');
+    document.getElementById('extraClaimReason').value = '';
+    renderExtraClaimState(state);
+    if (state.message) document.getElementById('status').textContent = state.message;
+  } catch (error) {
+    errorBox.textContent = error.message || 'Не удалось отправить запрос.';
+  } finally {
+    extraClaimRequestSubmitting = false;
+    button.disabled = false;
+    button.textContent = 'Отправить запрос';
+  }
+}
+function handlePrimaryAction() {
+  const state = extraClaimState || {};
+  const requestStatus = state.request && state.request.status;
+  if (
+    state.limitReached
+    && state.enabled
+    && !state.grantAvailable
+  ) {
+    if (requestStatus !== 'queued' && requestStatus !== 'pending' && requestStatus !== 'approved') openExtraClaimModal();
+    return;
+  }
+  getDeal();
 }
 async function detectUserFromServerAuth() {
   const auth = currentAuth();
@@ -5707,10 +6598,12 @@ function syncManagerId() {
   const managerId = select.value;
   document.getElementById('managerId').value = managerId;
   currentDeal = null;
+  extraClaimState = null;
   skippedDeals = [];
   document.getElementById('cards').innerHTML = '';
   document.getElementById('result').hidden = true;
   clearGreeting();
+  renderExtraClaimState(null);
   setSearching(false);
   const manager = managers.find((item) => String(item.id) === String(managerId));
   userVerified = Boolean(managerId && manager && ALLOW_UNVERIFIED_USERS);
@@ -5729,7 +6622,8 @@ function setSearching(isSearching, text) {
   progress.classList.toggle('hidden', !isSearching);
   if (button) {
     button.disabled = isSearching || !canRequestDeal;
-    button.textContent = isSearching ? 'Ищем...' : 'Получить сделку';
+    if (isSearching) button.textContent = 'Ищем...';
+    else updatePrimaryButton();
   }
   if (text) {
     progress.querySelector('.search-progress-text').textContent = text;
@@ -5786,6 +6680,21 @@ async function getDeal() {
   setSearching(false);
   if (!data.deal) {
     if (data.manager) applyAuthorizedUser({ id: data.manager.id }, data.manager);
+    if (data.limitReached) {
+      renderExtraClaimState({
+        ok: true,
+        enabled: Boolean(data.extraClaimEnabled),
+        configured: data.extraClaimConfigured === undefined
+          ? Boolean(data.extraClaimEnabled)
+          : Boolean(data.extraClaimConfigured),
+        limitReached: true,
+        takenToday: data.takenToday,
+        dailyLimit: data.dailyLimit,
+        request: data.extraClaimRequest || null,
+        grantAvailable: Boolean(data.extraClaimGrantAvailable),
+        integrationUnavailable: Boolean(data.integrationUnavailable)
+      });
+    }
     document.getElementById('status').textContent = data.reason || 'Подходящих сделок нет.';
     document.getElementById('cards').innerHTML = '';
     return;
@@ -5852,8 +6761,9 @@ async function claimSelected() {
   }
   showResult(payload);
   renderGreeting(payload.greeting);
-  if (payload.ok && currentDeal && currentDeal.dealUrl) {
+  if (payload.ok && payload.dryRun !== true && currentDeal && currentDeal.dealUrl) {
     loadAdminPanel();
+    loadExtraClaimStatus();
     if (dealWindow) {
       dealWindow.location.href = currentDeal.dealUrl;
     } else {
@@ -5865,6 +6775,7 @@ async function claimSelected() {
   if (button && !payload.ok) {
     button.disabled = false;
     button.textContent = 'Взять в работу';
+    loadExtraClaimStatus();
   }
 }
 async function rejectDeal(reason) {
@@ -6081,8 +6992,13 @@ function escapeHtml(value) {
   return String(value).replace(/[&<>"']/g, (ch) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[ch]));
 }
 document.getElementById('managerSelect').addEventListener('change', syncManagerId);
-document.getElementById('getDealButton').addEventListener('click', getDeal);
+document.getElementById('getDealButton').addEventListener('click', handlePrimaryAction);
+document.getElementById('submitExtraClaimButton').addEventListener('click', submitExtraClaimRequest);
+document.getElementById('cancelExtraClaimButton').addEventListener('click', closeExtraClaimModal);
 document.getElementById('refreshAdminButton').addEventListener('click', loadAdminPanel);
+setInterval(() => {
+  if (shouldPollExtraClaimStatus()) loadExtraClaimStatus();
+}, 15000);
 if (INSTALL_MODE) document.getElementById('status').textContent = 'Завершаю установку приложения...';
 detectBitrixUser();
 </script>
@@ -6116,6 +7032,11 @@ def main():
     threading.Thread(
         target=claim_reconciliation_loop,
         name="claim-reconciler",
+        daemon=True,
+    ).start()
+    threading.Thread(
+        target=integration_outbox_loop,
+        name="baza-integration-outbox",
         daemon=True,
     ).start()
     threading.Thread(
