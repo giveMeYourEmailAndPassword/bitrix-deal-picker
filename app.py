@@ -142,7 +142,7 @@ DEAL_ANALYSIS_CACHE_LOCK = threading.Lock()
 DEAL_HEADERS_CACHE_LOCK = threading.Lock()
 LOCAL_TZ = timezone(timedelta(hours=env_int("APP_TZ_OFFSET_HOURS", 6, -12, 14)))
 STATE_STORE = StateStore(APP_DIR, local_timezone=LOCAL_TZ, auto_initialize=False)
-APP_VERSION = "2026-08-17-fast-auto-greeting"
+APP_VERSION = "2026-08-17-proven-actor-greeting"
 # Bump whenever classifier, eligibility, source-completeness or oldest-first
 # routing semantics change. Pre-deploy tokens must not authorize post-deploy
 # decisions under a different routing policy.
@@ -174,6 +174,10 @@ GREETING_AUTO_SEND = env_bool("GREETING_AUTO_SEND", False)
 GREETING_AUTO_SEND_SUPPORTED = True
 GREETING_WORKER_POLL_SECONDS = env_float(
     "GREETING_WORKER_POLL_SECONDS", 1, 0.25, 30
+)
+GREETING_ACTOR_THREAD_LIMIT = env_int("GREETING_ACTOR_THREAD_LIMIT", 8, 1, 32)
+GREETING_ACTOR_THREAD_SLOTS = threading.BoundedSemaphore(
+    GREETING_ACTOR_THREAD_LIMIT
 )
 NEXT_DEAL_SCAN_LIMIT = env_int("NEXT_DEAL_SCAN_LIMIT", 12, 1, 50)
 NEXT_DEAL_SCAN_WORKERS = env_int("NEXT_DEAL_SCAN_WORKERS", NEXT_DEAL_SCAN_LIMIT, 1, 32)
@@ -1288,6 +1292,31 @@ def verify_bitrix_user(auth, allow_cached=True):
     return dict(verified)
 
 
+def cached_verified_actor_auth(auth, manager_id):
+    """Return a minimal in-memory OAuth copy only for the verified actor.
+
+    ``/api/claim`` verifies this token immediately before the claim.  This
+    helper deliberately performs no network request, and the returned token
+    is passed only to the short-lived daemon sender (never SQLite or logs).
+    """
+
+    token, domain = extract_auth_credentials(auth)
+    manager_id = normalize_entity_id(manager_id)
+    if not token or not domain or not manager_id:
+        return None
+    cache_key = hashlib.sha256(f"{domain}\0{token}".encode("utf-8")).hexdigest()
+    now = time.monotonic()
+    with USER_VERIFY_CACHE_LOCK:
+        cached = USER_VERIFY_CACHE.get(cache_key)
+        if (
+            not cached
+            or now - cached.get("cachedAt", 0) >= USER_VERIFY_CACHE_TTL_SECONDS
+            or str((cached.get("user") or {}).get("id") or "") != manager_id
+        ):
+            return None
+    return {"access_token": str(token), "domain": str(domain)}
+
+
 def actor_id_from_payload(payload, allow_cached=True):
     user = verify_bitrix_user(payload.get("auth"), allow_cached=allow_cached)
     if user and user.get("id"):
@@ -1474,20 +1503,25 @@ def get_openline_chat_context(session_id):
     ) or {}
     returned_session_id = normalize_entity_id(history.get("sessionId"))
     expected_session_id = normalize_entity_id(session_id)
-    chat_id = normalize_entity_id(history.get("chatId"))
+    if returned_session_id and returned_session_id != expected_session_id:
+        return None
     chats = history.get("chat") or {}
-    if not returned_session_id or returned_session_id != expected_session_id or not chat_id:
+    chat_id = normalize_entity_id(
+        history.get("chatId")
+        or (chats.get("id") if isinstance(chats, dict) else None)
+    )
+    if not expected_session_id or not chat_id or not isinstance(chats, dict):
         return None
-    # Official response shape is {"chat": {"<chatId>": {chat fields...}}}.
-    # Do not fall back to treating the map as a chat item: that used to make
-    # all binding fields silently disappear.
-    if not isinstance(chats, dict):
+    # Bitrix portals return both the older flat ``chat`` object and the newer
+    # map keyed by chat ID.  The working OAuth sender supported the flat form.
+    chat = chats.get(chat_id) or chats.get(int(chat_id)) or chats
+    if not isinstance(chat, dict):
         return None
-    chat = chats.get(chat_id) or chats.get(int(chat_id))
-    if not isinstance(chat, dict) or normalize_entity_id(chat.get("id")) != chat_id:
+    returned_chat_id = normalize_entity_id(chat.get("id"))
+    if returned_chat_id and returned_chat_id != chat_id:
         return None
     return {
-        "sessionId": returned_session_id,
+        "sessionId": returned_session_id or expected_session_id,
         "chatId": chat_id,
         "textFieldEnabled": chat.get("textFieldEnabled"),
         "messageType": chat.get("messageType"),
@@ -1505,6 +1539,22 @@ def openline_chat_is_bound_to_deal(entity_data, deal_id):
     pairs = [(parts[index].upper(), parts[index + 1]) for index in range(0, len(parts), 2)]
     deal_values = [value for entity_type, value in pairs if entity_type == "DEAL"]
     return len(deal_values) == 1 and normalize_entity_id(deal_values[0]) == normalize_entity_id(deal_id)
+
+
+def openline_chat_has_foreign_deal(entity_data, deal_id):
+    """Detect only an explicit contradictory nonzero DEAL binding."""
+
+    parts = [str(item).strip() for item in str(entity_data or "").split("|")]
+    if len(parts) % 2:
+        return False
+    expected_deal_id = normalize_entity_id(deal_id)
+    for index in range(0, len(parts), 2):
+        if parts[index].upper() != "DEAL":
+            continue
+        bound_deal_id = normalize_entity_id(parts[index + 1])
+        if bound_deal_id and bound_deal_id != expected_deal_id:
+            return True
+    return False
 
 
 def resolve_greeting_target(deal_id, manager_id, context):
@@ -1794,6 +1844,73 @@ def build_greeting_text(manager, classification):
         f"Здравствуйте! Меня зовут {manager_name}. "
         "Сейчас посмотрю ваш запрос и посчитаю для вас стоимость тура."
     )
+
+
+def validate_greeting_text_input(value):
+    text = str(value or "").strip()
+    if not text or len(text) > 2000 or "\x00" in text:
+        raise RuntimeError("greeting_text_invalid")
+    if any(ord(character) < 32 and character not in {"\n", "\r", "\t"} for character in text):
+        raise RuntimeError("greeting_text_invalid")
+    return text
+
+
+def actor_greeting_chat_context(deal_id, session_id):
+    """Resolve the same exact OpenLine chat used by the proven OAuth path."""
+
+    chat_context = get_openline_chat_context(session_id)
+    if not chat_context:
+        raise RuntimeError("chat_context_unavailable")
+    text_field_enabled = chat_context.get("textFieldEnabled")
+    if (
+        text_field_enabled is not None
+        and str(text_field_enabled).lower() not in {"true", "1", "y"}
+    ):
+        raise RuntimeError("chat_input_closed")
+    entity_type = chat_context.get("entityType")
+    entity_data = chat_context.get("entityData2")
+    if entity_type not in {None, ""} and str(entity_type).upper() != "LINES":
+        raise RuntimeError("chat_not_openline")
+    if openline_chat_has_foreign_deal(entity_data, deal_id):
+        raise RuntimeError("chat_entity_mismatch")
+    return chat_context
+
+
+def answer_openline_for_actor(auth, chat_id):
+    try:
+        return bitrix_call_for_actor(
+            auth,
+            "imopenlines.operator.answer",
+            {"CHAT_ID": str(chat_id)},
+        )
+    except Exception as exc:
+        message = str(exc or "")
+        if (
+            "ALREADY_RESPONSIBLE" in message.upper()
+            or "уже ответственный" in message.lower()
+        ):
+            return None
+        raise
+
+
+def send_chat_message_for_actor(auth, chat_id, text):
+    text = validate_greeting_text_input(text)
+    result = bitrix_call_for_actor(
+        auth,
+        "im.message.add",
+        {
+            "DIALOG_ID": f"chat{chat_id}",
+            "MESSAGE": text,
+        },
+    )
+    message_id = normalize_entity_id(result)
+    if not message_id:
+        raise RuntimeError("greeting_message_not_confirmed")
+    return {
+        "ok": True,
+        "method": "imopenlines.operator.answer + im.message.add",
+        "messageId": message_id,
+    }
 
 
 def send_greeting_message(deal_id, manager_id, text, context, auth=None, target=None):
@@ -2304,6 +2421,7 @@ GREETING_TERMINAL_PREFLIGHT_ERRORS = {
     "chat_not_openline",
     "chat_input_closed",
     "chat_entity_mismatch",
+    "greeting_text_invalid",
     "chat_not_latest_active_for_deal",
     "chat_participant_not_confirmed",
     "latest_chat_changed_before_send",
@@ -2358,6 +2476,219 @@ def get_greeting_manager_profile(manager_id):
     if not users or not isinstance(users[0], dict):
         raise RuntimeError("manager_not_active")
     return manager_profile_from_user(users[0], manager_id)
+
+
+def process_actor_greeting_outbox_job(job, worker_token, auth, manager):
+    """Deliver one reserved greeting through the manager's proven OAuth path."""
+
+    operation_key = str(job.get("operationKey") or "")
+    deal_id = normalize_entity_id(job.get("dealId"))
+    manager_id = normalize_entity_id(job.get("managerId"))
+    try:
+        token, domain = extract_auth_credentials(auth)
+        if not token or not domain:
+            raise RuntimeError("actor_auth_unavailable")
+        operation = STATE_STORE.get_claim_operation(operation_key)
+        if not operation or operation.get("status") != "succeeded":
+            raise RuntimeError("claim_operation_not_succeeded")
+        if (
+            str(operation.get("dealId") or "") != deal_id
+            or str(operation.get("managerId") or "") != manager_id
+        ):
+            raise RuntimeError("claim_identity_mismatch")
+        expected_marker = str(
+            ((operation.get("request") or {}).get("claimMarker")) or ""
+        )
+        live_deal = bitrix_call("crm.deal.get", {"id": deal_id}) or {}
+        if (
+            str(live_deal.get("ASSIGNED_BY_ID") or "") != manager_id
+            or str(live_deal.get("STAGE_ID") or "") != TARGET_STAGE
+            or not expected_marker
+            or str(live_deal.get(BITRIX_CLAIM_MARKER_FIELD) or "")
+            != expected_marker
+        ):
+            raise RuntimeError("claim_marker_mismatch")
+        if (
+            not isinstance(manager, dict)
+            or str(manager.get("id") or "") != manager_id
+            or manager.get("active") is not True
+            or manager.get("intranet") is not True
+        ):
+            raise RuntimeError("manager_not_active")
+        configured_rules = STATE_STORE.list_rules()
+        if (
+            REQUIRE_EXPLICIT_ACCESS_RULE
+            and not is_unverified_dev_mode()
+            and manager_id not in configured_rules
+        ) or not get_manager_rule(manager_id).get("enabled"):
+            raise RuntimeError("manager_access_revoked")
+
+        session_id = normalize_entity_id(job.get("sessionId"))
+        if not session_id:
+            raise RuntimeError("openline_session_not_found")
+        chat_context = actor_greeting_chat_context(deal_id, session_id)
+        direction = str(job.get("direction") or "Не определено")
+        text = validate_greeting_text_input(
+            build_greeting_text(
+                manager,
+                {"direction": direction, "confidence": "", "matched": []},
+            )
+        )
+        checked = STATE_STORE.update_greeting_outbox_check(
+            operation_key,
+            worker_token,
+            session_id=session_id,
+            direction=direction,
+            text=text,
+        )
+        if not checked.get("transitioned"):
+            return checked
+        job = checked
+
+        # This is the exact sequence used by the previous working release.
+        # Taking operator responsibility is pre-send and therefore retry-safe.
+        answer_openline_for_actor(auth, chat_context["chatId"])
+        dispatching = STATE_STORE.mark_greeting_outbox_dispatching(
+            operation_key,
+            worker_token,
+        )
+        if not dispatching.get("transitioned"):
+            return dispatching
+    except Exception as exc:
+        code = greeting_machine_error(exc, fallback="actor_greeting_preflight_failed")
+        try:
+            if code in GREETING_TERMINAL_PREFLIGHT_ERRORS:
+                final = STATE_STORE.mark_greeting_outbox_manual(
+                    operation_key,
+                    worker_token,
+                    error_code=code,
+                )
+            else:
+                final = STATE_STORE.retry_greeting_outbox_check(
+                    operation_key,
+                    worker_token,
+                    error_code=code,
+                    delay_seconds=5,
+                    max_attempts=3,
+                )
+        except Exception as state_exc:
+            sys.stderr.write(
+                f"Actor greeting preflight state update failed: {type(state_exc).__name__}\n"
+            )
+            return {"status": "checking", "errorCode": code}
+        if final.get("status") == "manual" and final.get("transitioned"):
+            append_greeting_delivery_audit(
+                final,
+                manager,
+                status="manual",
+                auto_sent=False,
+                message="Автоприветствие не отправлено: чат не прошёл проверку.",
+                error_code=code,
+            )
+        return final
+
+    try:
+        send_result = send_chat_message_for_actor(
+            auth,
+            chat_context["chatId"],
+            dispatching.get("text") or text,
+        )
+        final = STATE_STORE.mark_greeting_outbox_sent(
+            operation_key,
+            worker_token,
+            message_id=send_result.get("messageId"),
+        )
+        if final.get("transitioned"):
+            append_greeting_delivery_audit(
+                final,
+                manager,
+                status="sent",
+                auto_sent=True,
+                message="Приветствие автоматически отправлено клиенту.",
+            )
+        return final
+    except Exception as exc:
+        # Once ``dispatching`` is durable the message may already have reached
+        # Bitrix.  Never retry automatically and risk greeting the client twice.
+        code = greeting_machine_error(exc, fallback="send_result_uncertain")
+        try:
+            final = STATE_STORE.mark_greeting_outbox_uncertain(
+                operation_key,
+                worker_token,
+                error_code=code,
+            )
+        except Exception as state_exc:
+            sys.stderr.write(
+                f"Actor greeting uncertainty state update failed: {type(state_exc).__name__}\n"
+            )
+            return {"status": "dispatching", "errorCode": code}
+        if final.get("transitioned"):
+            append_greeting_delivery_audit(
+                final,
+                manager,
+                status="uncertain",
+                auto_sent=False,
+                message=(
+                    "Результат автоотправки не подтверждён. Проверьте чат перед ручной отправкой."
+                ),
+                error_code=code,
+            )
+        return final
+
+
+def _actor_greeting_thread_entry(job, worker_token, auth, manager):
+    try:
+        process_actor_greeting_outbox_job(
+            job,
+            worker_token,
+            auth,
+            manager,
+        )
+    except Exception as exc:
+        # Never include the OAuth payload or upstream response in logs.
+        sys.stderr.write(f"Actor greeting thread failed: {type(exc).__name__}\n")
+    finally:
+        GREETING_ACTOR_THREAD_SLOTS.release()
+        GREETING_WAKE_EVENT.set()
+
+
+def start_actor_greeting_delivery(operation_key, auth, manager):
+    """Reserve the exact operation and start at most one bounded daemon send."""
+
+    if not GREETING_ACTOR_THREAD_SLOTS.acquire(blocking=False):
+        return None
+    worker_token = secrets.token_hex(16)
+    try:
+        job = STATE_STORE.lease_exact_greeting_outbox(
+            operation_key,
+            worker_token,
+            lease_seconds=max(30, int(BITRIX_TIMEOUT_SECONDS * 8)),
+            max_attempts=3,
+        )
+        if not job.get("transitioned"):
+            GREETING_ACTOR_THREAD_SLOTS.release()
+            return None
+        thread = threading.Thread(
+            target=_actor_greeting_thread_entry,
+            args=(job, worker_token, auth, dict(manager or {})),
+            name="actor-greeting",
+            daemon=True,
+        )
+        thread.start()
+        return job
+    except Exception:
+        try:
+            STATE_STORE.retry_greeting_outbox_check(
+                operation_key,
+                worker_token,
+                error_code="actor_thread_start_failed",
+                delay_seconds=0,
+                max_attempts=3,
+            )
+        except Exception:
+            pass
+        GREETING_ACTOR_THREAD_SLOTS.release()
+        return None
 
 
 def process_greeting_outbox_job(job, worker_token):
@@ -2555,7 +2886,14 @@ def greeting_outbox_loop():
         GREETING_WAKE_EVENT.clear()
 
 
-def attach_greeting_to_claim(result, manager_id, deal_id, auth, operation_key):
+def attach_greeting_to_claim(
+    result,
+    manager_id,
+    deal_id,
+    auth,
+    operation_key,
+    manager_profile=None,
+):
     response = dict(result or {})
     if not (GREETING_AUTO_SEND and GREETING_AUTO_SEND_SUPPORTED):
         return response
@@ -2569,6 +2907,14 @@ def attach_greeting_to_claim(result, manager_id, deal_id, auth, operation_key):
         return response
     status = str(job.get("status") or "pending")
     if status in {"pending", "checking", "dispatching"}:
+        reserved = None
+        actor_auth = cached_verified_actor_auth(auth, manager_id)
+        if status == "pending" and actor_auth and manager_profile:
+            reserved = start_actor_greeting_delivery(
+                operation_key,
+                actor_auth,
+                manager_profile,
+            )
         response["greeting"] = {
             "ok": True,
             "status": "queued",
@@ -2576,7 +2922,10 @@ def attach_greeting_to_claim(result, manager_id, deal_id, auth, operation_key):
             "text": "",
             "message": "Приветствие отправляется в фоне.",
         }
-        GREETING_WAKE_EVENT.set()
+        if reserved is None:
+            # Handles a restart/race or a missing short-lived actor token.  The
+            # durable worker remains the fallback for still-pending jobs.
+            GREETING_WAKE_EVENT.set()
     elif status == "sent":
         response["greeting"] = {
             "ok": True,
@@ -3177,6 +3526,7 @@ def preview_claim(deal_id, manager_id, auth=None, selection_token=None):
         deal_id,
         auth,
         operation_key,
+        actor_manager,
     )
 
 

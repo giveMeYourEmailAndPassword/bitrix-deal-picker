@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from contextlib import ExitStack, contextmanager
 from datetime import datetime
@@ -3078,6 +3079,26 @@ class TestGreetingLifecycle(TemporaryStateTestCase):
         self.assertEqual(context["entityType"], "LINES")
         self.assertTrue(context["textFieldEnabled"])
 
+    def test_actor_path_accepts_the_previous_flat_chat_shape(self):
+        old_portal_history = {
+            "chatId": 1763,
+            "chat": {"id": 1763, "name": "OpenLine chat"},
+        }
+        with patch.object(app, "bitrix_call", return_value=old_portal_history):
+            context = app.actor_greeting_chat_context("100", "321")
+
+        self.assertEqual(context["sessionId"], "321")
+        self.assertEqual(context["chatId"], "1763")
+        self.assertIsNone(context["textFieldEnabled"])
+
+    def test_actor_path_allows_unbound_deal_zero_metadata(self):
+        history = self.official_history()
+        history["chat"]["1763"]["entityData2"] = "LEAD|0|DEAL|0"
+        with patch.object(app, "bitrix_call", return_value=history):
+            context = app.actor_greeting_chat_context("100", "321")
+
+        self.assertEqual(context["chatId"], "1763")
+
     def test_entity_binding_requires_one_exact_deal_pair(self):
         self.assertTrue(
             app.openline_chat_is_bound_to_deal(
@@ -3270,6 +3291,248 @@ class TestGreetingOutboxWorker(ClaimWorkflowTestCase):
             "intranet": True,
             "competencies": ["Турция"],
         }
+
+    def actor_auth(self):
+        return {
+            "access_token": "actor-oauth-secret-must-stay-in-memory",
+            "domain": "test-fake.bitrix24.test",
+        }
+
+    def test_attach_returns_without_waiting_for_actor_network_and_never_persists_token(self):
+        self.seed_greeting_outbox()
+        with patch.object(
+            app,
+            "bitrix_oauth_call",
+            return_value={"ID": self.manager_id, "NAME": "Manager"},
+        ):
+            self.assertEqual(
+                app.verify_bitrix_user(self.actor_auth(), allow_cached=False)["id"],
+                self.manager_id,
+            )
+        started = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+
+        def blocked_delivery(job, worker_token, auth, manager):
+            started.set()
+            release.wait(timeout=2)
+            finished.set()
+
+        original = {"ok": True, "auditRecorded": True, "dealId": self.deal_id}
+        try:
+            with (
+                patch.multiple(
+                    app,
+                    GREETING_AUTO_SEND=True,
+                    GREETING_AUTO_SEND_SUPPORTED=True,
+                ),
+                patch.object(
+                    app,
+                    "process_actor_greeting_outbox_job",
+                    side_effect=blocked_delivery,
+                ),
+            ):
+                before = time.monotonic()
+                response = app.attach_greeting_to_claim(
+                    original,
+                    self.manager_id,
+                    self.deal_id,
+                    self.actor_auth(),
+                    self.operation_key(),
+                    self.active_manager(),
+                )
+                elapsed = time.monotonic() - before
+
+            self.assertTrue(started.wait(timeout=1))
+            self.assertLess(elapsed, 0.5)
+            self.assertEqual(response["greeting"]["status"], "queued")
+            self.assertEqual(
+                self.store.get_greeting_outbox(self.operation_key())["status"],
+                "checking",
+            )
+            with self.store._connect() as connection:
+                database_dump = "\n".join(connection.iterdump())
+            self.assertNotIn("actor-oauth-secret-must-stay-in-memory", database_dump)
+        finally:
+            release.set()
+            finished.wait(timeout=2)
+
+    def test_actor_sender_uses_proven_methods_and_sends_only_once(self):
+        self.seed_greeting_outbox()
+        worker_token = "actor-worker"
+        job = self.store.lease_exact_greeting_outbox(
+            self.operation_key(),
+            worker_token,
+        )
+
+        def fake_bitrix(method, params=None, timeout=None):
+            if method == "crm.deal.get":
+                return self.claimed_deal()
+            if method == "imopenlines.session.history.get":
+                return self.official_history()
+            raise AssertionError(f"unexpected webhook method: {method}")
+
+        def fake_actor_call(auth, method, params=None):
+            self.assertEqual(auth, self.actor_auth())
+            if method == "imopenlines.operator.answer":
+                raise RuntimeError("Bitrix API error: ALREADY_RESPONSIBLE")
+            if method == "im.message.add":
+                return 85851
+            raise AssertionError(f"unexpected actor method: {method}")
+
+        with (
+            patch.object(app, "bitrix_call", side_effect=fake_bitrix),
+            patch.object(
+                app,
+                "bitrix_call_for_actor",
+                side_effect=fake_actor_call,
+            ) as actor_call,
+        ):
+            result = app.process_actor_greeting_outbox_job(
+                job,
+                worker_token,
+                self.actor_auth(),
+                self.active_manager(),
+            )
+            fallback = self.store.lease_greeting_outbox("fallback-worker")
+
+        self.assertEqual(result["status"], "sent")
+        self.assertEqual(result["messageId"], "85851")
+        self.assertEqual(fallback, [])
+        self.assertEqual(
+            actor_call.call_args_list,
+            [
+                call(
+                    self.actor_auth(),
+                    "imopenlines.operator.answer",
+                    {"CHAT_ID": "1763"},
+                ),
+                call(
+                    self.actor_auth(),
+                    "im.message.add",
+                    {
+                        "DIALOG_ID": "chat1763",
+                        "MESSAGE": (
+                            "Здравствуйте! Меня зовут Manager. "
+                            "Я эксперт по направлению Турция. "
+                            "Сейчас посмотрю варианты и посчитаю для вас стоимость тура."
+                        ),
+                    },
+                ),
+            ],
+        )
+
+    def test_actor_sender_rejects_an_explicit_foreign_deal_binding_without_send(self):
+        self.seed_greeting_outbox()
+        worker_token = "actor-worker"
+        job = self.store.lease_exact_greeting_outbox(
+            self.operation_key(),
+            worker_token,
+        )
+
+        def fake_bitrix(method, params=None, timeout=None):
+            if method == "crm.deal.get":
+                return self.claimed_deal()
+            if method == "imopenlines.session.history.get":
+                return self.official_history(deal_id="999")
+            raise AssertionError(f"unexpected webhook method: {method}")
+
+        with (
+            patch.object(app, "bitrix_call", side_effect=fake_bitrix),
+            patch.object(app, "bitrix_call_for_actor") as actor_call,
+        ):
+            result = app.process_actor_greeting_outbox_job(
+                job,
+                worker_token,
+                self.actor_auth(),
+                self.active_manager(),
+            )
+
+        self.assertEqual(result["status"], "manual")
+        self.assertEqual(result["errorCode"], "chat_entity_mismatch")
+        actor_call.assert_not_called()
+        self.assertEqual(
+            self.store.get_greeting_outbox(self.operation_key())["status"],
+            "manual",
+        )
+
+    def test_actor_history_timeout_stays_pending_for_bounded_pre_send_retry(self):
+        self.seed_greeting_outbox()
+        worker_token = "actor-worker"
+        job = self.store.lease_exact_greeting_outbox(
+            self.operation_key(),
+            worker_token,
+        )
+
+        def fake_bitrix(method, params=None, timeout=None):
+            if method == "crm.deal.get":
+                return self.claimed_deal()
+            if method == "imopenlines.session.history.get":
+                raise TimeoutError("history timed out")
+            raise AssertionError(f"unexpected webhook method: {method}")
+
+        with (
+            patch.object(app, "bitrix_call", side_effect=fake_bitrix),
+            patch.object(app, "bitrix_call_for_actor") as actor_call,
+        ):
+            result = app.process_actor_greeting_outbox_job(
+                job,
+                worker_token,
+                self.actor_auth(),
+                self.active_manager(),
+            )
+
+        self.assertEqual(result["status"], "pending")
+        self.assertEqual(result["errorCode"], "actor_greeting_preflight_failed")
+        self.assertEqual(result["attemptCount"], 1)
+        self.assertIsNotNone(result["nextAttemptAt"])
+        actor_call.assert_not_called()
+
+    def test_actor_message_timeout_is_uncertain_and_never_retried(self):
+        self.seed_greeting_outbox()
+        worker_token = "actor-worker"
+        job = self.store.lease_exact_greeting_outbox(
+            self.operation_key(),
+            worker_token,
+        )
+
+        def fake_bitrix(method, params=None, timeout=None):
+            if method == "crm.deal.get":
+                return self.claimed_deal()
+            if method == "imopenlines.session.history.get":
+                return self.official_history()
+            raise AssertionError(f"unexpected webhook method: {method}")
+
+        def fake_actor_call(auth, method, params=None):
+            if method == "imopenlines.operator.answer":
+                return True
+            if method == "im.message.add":
+                raise TimeoutError("response lost after dispatch")
+            raise AssertionError(f"unexpected actor method: {method}")
+
+        with (
+            patch.object(app, "bitrix_call", side_effect=fake_bitrix),
+            patch.object(
+                app,
+                "bitrix_call_for_actor",
+                side_effect=fake_actor_call,
+            ) as actor_call,
+        ):
+            result = app.process_actor_greeting_outbox_job(
+                job,
+                worker_token,
+                self.actor_auth(),
+                self.active_manager(),
+            )
+            fallback = self.store.lease_greeting_outbox("fallback-worker")
+
+        self.assertEqual(result["status"], "uncertain")
+        self.assertEqual(result["errorCode"], "send_result_uncertain")
+        self.assertEqual(fallback, [])
+        self.assertEqual(
+            [item.args[1] for item in actor_call.call_args_list],
+            ["imopenlines.operator.answer", "im.message.add"],
+        )
 
     def test_successful_claim_queues_greeting_without_synchronous_chat_work(self):
         side_effect = self.claim_side_effect(

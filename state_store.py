@@ -1581,6 +1581,93 @@ class StateStore:
                 leased.append(self._greeting_outbox_row(leased_row))
             return leased
 
+    def lease_exact_greeting_outbox(
+        self,
+        operation_key: Any,
+        worker_token: Any,
+        *,
+        lease_seconds: int = 60,
+        max_attempts: int = 3,
+        now: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        """Atomically reserve one exact pre-send job for an in-request actor.
+
+        The regular worker leases the oldest eligible job.  A freshly
+        authenticated claim must instead reserve only its own operation so
+        the manager's short-lived OAuth token can never be applied to another
+        manager or deal.
+        """
+
+        self._ensure_ready()
+        operation_key = str(operation_key or "").strip()
+        worker_token = str(worker_token or "").strip()
+        if not operation_key or not worker_token or len(worker_token) > 200:
+            raise ValueError("operation_key and worker_token are required")
+        lease_seconds = max(1, min(3600, int(lease_seconds)))
+        max_attempts = max(1, min(100, int(max_attempts)))
+        now_dt = self._outbox_datetime(now)
+        now_iso = self._outbox_time(now_dt)
+        expires_iso = self._outbox_time(now_dt + timedelta(seconds=lease_seconds))
+        with self._transaction(immediate=True) as connection:
+            row = connection.execute(
+                "SELECT * FROM greeting_outbox WHERE operation_key = ?",
+                (operation_key,),
+            ).fetchone()
+            if not row:
+                raise StateStoreError(f"greeting outbox job {operation_key!r} not found")
+            eligible = bool(
+                int(row["attempt_count"]) < max_attempts
+                and (
+                    (
+                        row["status"] == "pending"
+                        and (
+                            row["next_attempt_at"] is None
+                            or row["next_attempt_at"] <= now_iso
+                        )
+                    )
+                    or (
+                        row["status"] == "checking"
+                        and row["lease_expires_at"] is not None
+                        and row["lease_expires_at"] <= now_iso
+                    )
+                )
+            )
+            if not eligible:
+                return self._greeting_outbox_row(row, transitioned=False)
+            cursor = connection.execute(
+                """
+                UPDATE greeting_outbox SET
+                    status='checking', attempt_count=attempt_count + 1,
+                    lease_token=?, leased_at=?, lease_expires_at=?,
+                    next_attempt_at=NULL, error_code='', updated_at=?
+                WHERE operation_key=? AND attempt_count < ? AND (
+                    (status='pending' AND (
+                        next_attempt_at IS NULL OR next_attempt_at <= ?
+                    )) OR
+                    (status='checking' AND lease_expires_at IS NOT NULL
+                        AND lease_expires_at <= ?)
+                )
+                """,
+                (
+                    worker_token,
+                    now_iso,
+                    expires_iso,
+                    now_iso,
+                    operation_key,
+                    max_attempts,
+                    now_iso,
+                    now_iso,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM greeting_outbox WHERE operation_key = ?",
+                (operation_key,),
+            ).fetchone()
+            return self._greeting_outbox_row(
+                row,
+                transitioned=cursor.rowcount == 1,
+            )
+
     def update_greeting_outbox_check(
         self,
         operation_key: Any,
