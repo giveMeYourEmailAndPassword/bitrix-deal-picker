@@ -141,7 +141,7 @@ DEAL_ANALYSIS_CACHE_LOCK = threading.Lock()
 DEAL_HEADERS_CACHE_LOCK = threading.Lock()
 LOCAL_TZ = timezone(timedelta(hours=env_int("APP_TZ_OFFSET_HOURS", 6, -12, 14)))
 STATE_STORE = StateStore(APP_DIR, local_timezone=LOCAL_TZ, auto_initialize=False)
-APP_VERSION = "2026-08-17-bitrix-network-retry"
+APP_VERSION = "2026-08-17-bitrix-auth-cache-hotfix"
 # Bump whenever classifier, eligibility, source-completeness or oldest-first
 # routing semantics change. Pre-deploy tokens must not authorize post-deploy
 # decisions under a different routing policy.
@@ -224,7 +224,7 @@ USER_VERIFY_CACHE_LOCK = threading.Lock()
 SEARCH_SEMAPHORE = threading.BoundedSemaphore(MAX_CONCURRENT_SEARCHES)
 READINESS_CACHE_LOCK = threading.Lock()
 READINESS_CACHE = {"checkedAt": 0.0, "state": None}
-USER_VERIFY_CACHE_TTL_SECONDS = env_float("USER_VERIFY_CACHE_TTL_SECONDS", 60, 5, 300)
+USER_VERIFY_CACHE_TTL_SECONDS = env_float("USER_VERIFY_CACHE_TTL_SECONDS", 300, 5, 300)
 SELECTION_TOKEN_TTL_SECONDS = env_int("SELECTION_TOKEN_TTL_SECONDS", 1800, 60, 86400)
 SEARCH_CURSOR_TTL_SECONDS = env_int("SEARCH_CURSOR_TTL_SECONDS", 120, 30, 900)
 BITRIX_CLAIM_MARKER_FIELD = os.environ.get("BITRIX_CLAIM_MARKER_FIELD", "").strip().upper()
@@ -3633,7 +3633,12 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(result, status)
                 return
             if parsed.path == "/api/claim":
-                manager_id = actor_id_from_payload(payload, allow_cached=False)
+                # The page and search have already verified this exact OAuth
+                # token + portal pair. Reuse that short-lived server-side
+                # identity here so a transient Bitrix OAuth timeout cannot
+                # block a signed claim after the manager has selected a deal.
+                # Manager IDs supplied by the browser remain ignored.
+                manager_id = actor_id_from_payload(payload, allow_cached=True)
                 if not manager_id:
                     self.send_json({"ok": False, "message": "Не удалось подтвердить пользователя Битрикс."}, 401)
                     return
@@ -3647,7 +3652,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(result, status)
                 return
             if parsed.path == "/api/reject":
-                manager_id = actor_id_from_payload(payload, allow_cached=False)
+                manager_id = actor_id_from_payload(payload, allow_cached=True)
                 if not manager_id:
                     self.send_json({"ok": False, "message": "Не удалось подтвердить пользователя Битрикс."}, 401)
                     return
