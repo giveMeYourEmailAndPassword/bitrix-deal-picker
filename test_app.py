@@ -821,6 +821,21 @@ class TestReadiness(TemporaryStateTestCase):
         self.assertFalse(result["storage"]["ok"])
         self.assertNotIn("corrupt database", result["errors"])
 
+    def test_corrupt_autoclose_boundary_returns_controlled_not_ready(self):
+        with (
+            self._ready_patches(),
+            patch.object(
+                self.store,
+                "get_lost_deal_autoclose_boundary",
+                side_effect=RuntimeError("secret database detail"),
+            ),
+        ):
+            result = app.readiness_state(force=True)
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["lostDealAutoclose"]["armed"])
+        rendered = json.dumps(result, ensure_ascii=False)
+        self.assertNotIn("secret database detail", rendered)
+
     def test_missing_public_url_and_origins_fail_readiness(self):
         with self._ready_patches(PUBLIC_APP_URL="", RAW_APP_ALLOWED_ORIGINS=set(), APP_ALLOWED_ORIGINS=set()):
             result = app.readiness_state(force=True)
@@ -3854,6 +3869,456 @@ class TestSafeConfigurationAndMinimization(TemporaryStateTestCase):
             result = app.readiness_state(force=True)
         self.assertFalse(result["ok"])
         self.assertTrue(any("BITRIX_CLAIM_MARKER_FIELD" in item for item in result["errors"]))
+
+
+class TestLostDealAutoclose(TemporaryStateTestCase):
+    REMOTE_TIME = "2099-01-01T10:01:00+00:00"
+
+    @staticmethod
+    def transition():
+        return {
+            "transitionId": "9001",
+            "dealId": "7001",
+            "fromSemantic": "P",
+            "toSemantic": "F",
+            "fromCategoryId": "0",
+            "toCategoryId": "0",
+            "fromStageId": "NEW",
+            "toStageId": "LOSE",
+            "transitionTime": "2099-01-01T10:00:01+00:00",
+        }
+
+    @staticmethod
+    def snapshot(**changes):
+        value = {
+            "chatId": "8101",
+            "sessionId": "8201",
+            "lastMessageId": "8301",
+            "historyMessageCount": 12,
+            "latestMessageAt": "2099-01-01T09:59:50+00:00",
+            "historySignature": "a" * 64,
+            "activityId": "8401",
+            "unreadId": "19",
+            "counter": 1,
+            "userCounter": 2,
+            "isNew": False,
+            "entityData1": "Y|DEAL|7001|N|N|8201|0|0|0|0",
+            "entityData2": "LEAD|0|COMPANY|0|CONTACT|0|DEAL|7001",
+        }
+        value.update(changes)
+        return value
+
+    def arm(self, baseline=9000):
+        return self.store.arm_lost_deal_autoclose(
+            "2099-01-01T10:00:00+00:00", baseline
+        )
+
+    def test_first_poll_only_arms_remote_boundary_and_never_processes(self):
+        payload = {
+            "result": {"items": []},
+            "time": {"date_finish": "2099-01-01T10:00:00+00:00"},
+        }
+        rows = [{"ID": "9000", "CREATED_TIME": "2099-01-01T09:59:59+00:00"}]
+        with (
+            patch.object(app, "bitrix_stagehistory_page", return_value=(payload, rows)),
+            patch.object(app, "process_lost_deal_transition") as process,
+        ):
+            result = app.poll_lost_deal_autoclose_once()
+
+        self.assertTrue(result["armed"])
+        self.assertEqual(result["processed"], 0)
+        process.assert_not_called()
+        boundary = self.store.get_lost_deal_autoclose_boundary()
+        self.assertEqual(boundary["baselineHistoryId"], 9000)
+        self.assertEqual(boundary["scanAfterHistoryId"], 9000)
+
+    def _exact_transition(self, previous_stage="NEW", closed="Y"):
+        deal = {
+            "ID": "7001",
+            "CATEGORY_ID": "0",
+            "STAGE_ID": "LOSE",
+            "STAGE_SEMANTIC_ID": "F",
+            "CLOSED": closed,
+            "MOVED_TIME": "2099-01-01T10:00:00+00:00",
+        }
+        history = [
+            {
+                "id": "9001",
+                "dealId": "7001",
+                "categoryId": "0",
+                "stageId": "LOSE",
+                "createdAt": datetime.fromisoformat("2099-01-01T10:00:01+00:00"),
+            },
+            {
+                "id": "9000",
+                "dealId": "7001",
+                "categoryId": "0",
+                "stageId": previous_stage,
+                "createdAt": datetime.fromisoformat("2099-01-01T09:00:00+00:00"),
+            },
+        ]
+
+        def call_side_effect(method, params=None, timeout=None):
+            if method == "crm.deal.get":
+                return deal
+            if method == "crm.status.list":
+                return [
+                    {"ENTITY_ID": "DEAL_STAGE", "STATUS_ID": "NEW", "SEMANTICS": ""},
+                    {"ENTITY_ID": "DEAL_STAGE", "STATUS_ID": "WON", "SEMANTICS": "S"},
+                    {"ENTITY_ID": "DEAL_STAGE", "STATUS_ID": "LOSE", "SEMANTICS": "F"},
+                    {"ENTITY_ID": "DEAL_STAGE", "STATUS_ID": "LOSE_2", "SEMANTICS": "F"},
+                ]
+            raise AssertionError(method)
+
+        return call_side_effect, history
+
+    def test_exact_history_and_blank_status_semantics_prove_p_to_f(self):
+        call_side_effect, history = self._exact_transition()
+        with (
+            patch.object(app, "bitrix_call", side_effect=call_side_effect),
+            patch.object(app, "read_deal_stage_history", return_value=({}, history)),
+        ):
+            result = app.exact_failed_transition("7001", "9001")
+        self.assertEqual(result["fromSemantic"], "P")
+        self.assertEqual(result["toSemantic"], "F")
+
+    def test_s_to_f_is_also_an_exact_close_candidate(self):
+        call_side_effect, history = self._exact_transition(previous_stage="WON")
+        with (
+            patch.object(app, "bitrix_call", side_effect=call_side_effect),
+            patch.object(app, "read_deal_stage_history", return_value=({}, history)),
+        ):
+            result = app.exact_failed_transition("7001", "9001")
+        self.assertEqual(result["fromSemantic"], "S")
+        self.assertEqual(result["toSemantic"], "F")
+
+    def test_f_to_f_never_becomes_close_candidate(self):
+        call_side_effect, history = self._exact_transition(previous_stage="LOSE_2")
+        with (
+            patch.object(app, "bitrix_call", side_effect=call_side_effect),
+            patch.object(app, "read_deal_stage_history", return_value=({}, history)),
+            patch.object(app, "read_single_active_deal_chat_snapshot") as chat_read,
+        ):
+            with self.assertRaisesRegex(app.LostDealCloseGuardError, "not_non_f_to_f"):
+                app.process_lost_deal_transition(
+                    "7001", "9001", datetime.fromisoformat(self.REMOTE_TIME)
+                )
+        chat_read.assert_not_called()
+        self.assertIsNone(self.store.get_lost_deal_close_operation("9001"))
+
+    def test_failed_semantic_without_closed_flag_never_closes(self):
+        call_side_effect, history = self._exact_transition(closed="N")
+        with (
+            patch.object(app, "bitrix_call", side_effect=call_side_effect),
+            patch.object(app, "read_deal_stage_history", return_value=({}, history)),
+            patch.object(app, "read_single_active_deal_chat_snapshot") as chat_read,
+        ):
+            with self.assertRaisesRegex(app.LostDealCloseGuardError, "deal_not_closed"):
+                app.process_lost_deal_transition(
+                    "7001", "9001", datetime.fromisoformat(self.REMOTE_TIME)
+                )
+        chat_read.assert_not_called()
+
+    def test_finish_is_idempotent_and_dispatch_identity_is_durable(self):
+        snapshot = self.snapshot()
+
+        def finish_side_effect(method, params):
+            operation = self.store.get_lost_deal_close_operation("9001")
+            self.assertEqual(operation["status"], "dispatching")
+            self.assertEqual(operation["chatId"], "8101")
+            self.assertEqual(operation["sessionId"], "8201")
+            self.assertEqual(operation["activityId"], "8401")
+            return True
+
+        finish = MagicMock(side_effect=finish_side_effect)
+        with (
+            patch.object(app, "DRY_RUN", False),
+            patch.object(app, "exact_failed_transition", return_value=self.transition()) as exact,
+            patch.object(app, "read_single_active_deal_chat_snapshot", return_value=snapshot),
+            patch.object(app, "selected_chat_is_confirmed_inactive", return_value=True),
+            patch.object(app, "bitrix_call", finish),
+        ):
+            first = app.process_lost_deal_transition(
+                "7001", "9001", datetime.fromisoformat(self.REMOTE_TIME)
+            )
+            second = app.process_lost_deal_transition(
+                "7001", "9001", datetime.fromisoformat(self.REMOTE_TIME)
+            )
+        self.assertEqual(first, "closed")
+        self.assertEqual(second, "closed")
+        finish.assert_called_once_with(
+            "imopenlines.operator.another.finish", {"CHAT_ID": "8101"}
+        )
+        operation = self.store.get_lost_deal_close_operation("9001")
+        self.assertEqual(operation["status"], "closed")
+        self.assertEqual(operation["sessionId"], "8201")
+        self.assertEqual(operation["activityId"], "8401")
+        self.assertEqual(exact.call_count, 2)
+
+    def test_dry_run_never_calls_finish_and_is_terminal(self):
+        finish = MagicMock()
+        with (
+            patch.object(app, "DRY_RUN", True),
+            patch.object(app, "exact_failed_transition", return_value=self.transition()),
+            patch.object(app, "read_single_active_deal_chat_snapshot", return_value=self.snapshot()),
+            patch.object(app, "bitrix_call", finish),
+        ):
+            result = app.process_lost_deal_transition(
+                "7001", "9001", datetime.fromisoformat(self.REMOTE_TIME)
+            )
+        self.assertEqual(result, "dry_run")
+        finish.assert_not_called()
+        self.assertEqual(
+            self.store.get_lost_deal_close_operation("9001")["status"], "dry_run"
+        )
+
+    def test_finish_timeout_is_uncertain_and_is_never_sent_again(self):
+        finish = MagicMock(side_effect=TimeoutError("ambiguous"))
+        with (
+            patch.object(app, "DRY_RUN", False),
+            patch.object(app, "exact_failed_transition", return_value=self.transition()),
+            patch.object(app, "read_single_active_deal_chat_snapshot", return_value=self.snapshot()),
+            patch.object(app, "selected_chat_is_confirmed_inactive", return_value=False),
+            patch.object(app, "bitrix_call", finish),
+        ):
+            first = app.process_lost_deal_transition(
+                "7001", "9001", datetime.fromisoformat(self.REMOTE_TIME)
+            )
+            second = app.process_lost_deal_transition(
+                "7001", "9001", datetime.fromisoformat(self.REMOTE_TIME)
+            )
+        self.assertEqual(first, "uncertain")
+        self.assertEqual(second, "uncertain")
+        self.assertEqual(finish.call_count, 1)
+        self.assertEqual(
+            self.store.get_lost_deal_close_operation("9001")["status"], "uncertain"
+        )
+
+    def test_final_chat_change_aborts_before_dispatch(self):
+        first = self.snapshot()
+        changed = self.snapshot(lastMessageId="8302", historySignature="b" * 64)
+        finish = MagicMock()
+        with (
+            patch.object(app, "DRY_RUN", False),
+            patch.object(app, "exact_failed_transition", return_value=self.transition()),
+            patch.object(
+                app,
+                "read_single_active_deal_chat_snapshot",
+                side_effect=[first, changed],
+            ),
+            patch.object(app, "bitrix_call", finish),
+        ):
+            result = app.process_lost_deal_transition(
+                "7001", "9001", datetime.fromisoformat(self.REMOTE_TIME)
+            )
+        self.assertEqual(result, "chat_changed_before_finish")
+        finish.assert_not_called()
+        self.assertEqual(
+            self.store.get_lost_deal_close_operation("9001")["status"], "skipped"
+        )
+
+    def test_multiple_active_chats_fail_closed_before_dialog_read(self):
+        with patch.object(
+            app,
+            "bitrix_call",
+            return_value=[{"CHAT_ID": "8101"}, {"CHAT_ID": "8102"}],
+        ) as call_method:
+            with self.assertRaisesRegex(
+                app.LostDealCloseGuardError, "multiple_active_chats"
+            ):
+                app.read_single_active_deal_chat_snapshot("7001")
+        call_method.assert_called_once()
+
+    def test_message_after_failed_transition_is_terminal_skip(self):
+        late = self.snapshot(latestMessageAt="2099-01-01T10:00:02+00:00")
+        with (
+            patch.object(app, "DRY_RUN", False),
+            patch.object(app, "exact_failed_transition", return_value=self.transition()),
+            patch.object(app, "read_single_active_deal_chat_snapshot", return_value=late),
+            patch.object(app, "bitrix_call") as finish,
+        ):
+            result = app.process_lost_deal_transition(
+                "7001", "9001", datetime.fromisoformat(self.REMOTE_TIME)
+            )
+        self.assertEqual(result, "message_after_failed_transition")
+        finish.assert_not_called()
+
+    def test_message_in_same_second_as_failed_transition_is_terminal_skip(self):
+        same_second = self.snapshot(
+            latestMessageAt=self.transition()["transitionTime"]
+        )
+        with (
+            patch.object(app, "DRY_RUN", False),
+            patch.object(app, "exact_failed_transition", return_value=self.transition()),
+            patch.object(
+                app,
+                "read_single_active_deal_chat_snapshot",
+                return_value=same_second,
+            ),
+            patch.object(app, "bitrix_call") as finish,
+        ):
+            result = app.process_lost_deal_transition(
+                "7001", "9001", datetime.fromisoformat(self.REMOTE_TIME)
+            )
+        self.assertEqual(result, "message_after_failed_transition")
+        finish.assert_not_called()
+
+    def test_grace_period_keeps_transition_undiscovered_for_next_poll(self):
+        with (
+            patch.object(app, "exact_failed_transition", return_value=self.transition()),
+            patch.object(app, "read_single_active_deal_chat_snapshot") as chat_read,
+        ):
+            with self.assertRaises(app.LostDealTransitionNotMature):
+                app.process_lost_deal_transition(
+                    "7001",
+                    "9001",
+                    datetime.fromisoformat("2099-01-01T10:00:10+00:00"),
+                )
+        chat_read.assert_not_called()
+        self.assertIsNone(self.store.get_lost_deal_close_operation("9001"))
+
+    def test_permanent_preflight_error_exhausts_without_dispatch(self):
+        with (
+            patch.object(app, "DRY_RUN", False),
+            patch.object(app, "LOST_DEAL_MAX_PREFLIGHT_ATTEMPTS", 3),
+            patch.object(app, "exact_failed_transition", return_value=self.transition()),
+            patch.object(
+                app,
+                "read_single_active_deal_chat_snapshot",
+                side_effect=RuntimeError("permanent"),
+            ),
+            patch.object(app, "bitrix_call") as finish,
+        ):
+            for _ in range(2):
+                with self.assertRaises(RuntimeError):
+                    app.process_lost_deal_transition(
+                        "7001", "9001", datetime.fromisoformat(self.REMOTE_TIME)
+                    )
+            result = app.process_lost_deal_transition(
+                "7001", "9001", datetime.fromisoformat(self.REMOTE_TIME)
+            )
+        self.assertEqual(result, "pre_dispatch_attempts_exhausted")
+        finish.assert_not_called()
+        operation = self.store.get_lost_deal_close_operation("9001")
+        self.assertEqual(operation["status"], "skipped")
+        self.assertEqual(operation["attemptCount"], 3)
+
+    def test_post_confirm_requires_exact_completed_activity_and_no_reverse_active_row(self):
+        operation = {
+            "dealId": "7001",
+            "chatId": "8101",
+            "sessionId": "8201",
+            "activityId": "8401",
+        }
+        completed = {
+            "ID": "8401",
+            "OWNER_TYPE_ID": "2",
+            "OWNER_ID": "7001",
+            "PROVIDER_ID": "IMOPENLINES_SESSION",
+            "ASSOCIATED_ENTITY_ID": "8201",
+            "COMPLETED": "Y",
+            "STATUS": "2",
+        }
+        with (
+            patch.object(app, "active_chat_rows_for_deal", return_value=[]),
+            patch.object(
+                app,
+                "_history_identity",
+                return_value={"chatId": "8101", "sessionId": "8201"},
+            ),
+            patch.object(app, "bitrix_call", return_value=completed),
+            patch.object(app, "active_openline_session_activities", return_value=[]),
+        ):
+            self.assertTrue(app.selected_chat_is_confirmed_inactive(operation))
+        with (
+            patch.object(app, "active_chat_rows_for_deal", return_value=[]),
+            patch.object(
+                app,
+                "_history_identity",
+                return_value={"chatId": "8101", "sessionId": "8201"},
+            ),
+            patch.object(app, "bitrix_call", return_value={**completed, "COMPLETED": "N"}),
+        ):
+            self.assertFalse(app.selected_chat_is_confirmed_inactive(operation))
+
+    def test_transient_preflight_failure_does_not_advance_discovery_cursor(self):
+        self.arm()
+        payload = {
+            "result": {"items": []},
+            "time": {
+                "date_start": self.REMOTE_TIME,
+                "date_finish": self.REMOTE_TIME,
+            },
+        }
+        rows = [
+            {
+                "ID": "9001",
+                "OWNER_ID": "7001",
+                "CATEGORY_ID": "0",
+                "STAGE_ID": "LOSE",
+                "CREATED_TIME": "2099-01-01T10:00:01+00:00",
+            }
+        ]
+        process = MagicMock(side_effect=[RuntimeError("temporary"), "dry_run"])
+        with (
+            patch.object(app, "bitrix_stagehistory_page", return_value=(payload, rows)),
+            patch.object(app, "semantic_for_stage", return_value="F"),
+            patch.object(app, "process_lost_deal_transition", process),
+        ):
+            first = app.poll_lost_deal_autoclose_once()
+            self.assertFalse(first["scanAdvanced"])
+            self.assertEqual(
+                self.store.get_lost_deal_autoclose_boundary()["scanAfterHistoryId"],
+                9000,
+            )
+            second = app.poll_lost_deal_autoclose_once()
+        self.assertTrue(second["scanAdvanced"])
+        self.assertEqual(
+            self.store.get_lost_deal_autoclose_boundary()["scanAfterHistoryId"],
+            9001,
+        )
+
+    def test_in_progress_claim_prevents_cursor_advance_after_worker_crash(self):
+        self.arm()
+        claim = self.store.claim_lost_deal_close_transition(self.transition())
+        self.assertTrue(claim["claimed"])
+        payload = {
+            "result": {"items": []},
+            "time": {"date_finish": self.REMOTE_TIME},
+        }
+        rows = [{"ID": "9001", "OWNER_ID": "7001", "CATEGORY_ID": "0", "STAGE_ID": "LOSE"}]
+        with (
+            patch.object(app, "bitrix_stagehistory_page", return_value=(payload, rows)),
+            patch.object(app, "semantic_for_stage", return_value="F"),
+            patch.object(app, "exact_failed_transition", return_value=self.transition()),
+        ):
+            result = app.poll_lost_deal_autoclose_once()
+        self.assertFalse(result["scanAdvanced"])
+        self.assertEqual(
+            self.store.get_lost_deal_autoclose_boundary()["scanAfterHistoryId"],
+            9000,
+        )
+
+    def test_main_respects_autoclose_kill_switch(self):
+        with (
+            patch.object(app.sys, "argv", ["app.py"]),
+            patch.object(app, "BoundedThreadingHTTPServer"),
+            patch.object(app.threading, "Thread") as thread,
+            patch.object(app, "LOST_DEAL_AUTOCLOSE_ENABLED", False),
+        ):
+            app.main()
+        names = [item.kwargs.get("name") for item in thread.call_args_list]
+        self.assertNotIn("lost-deal-autoclose", names)
+
+        with (
+            patch.object(app.sys, "argv", ["app.py"]),
+            patch.object(app, "BoundedThreadingHTTPServer"),
+            patch.object(app.threading, "Thread") as thread,
+            patch.object(app, "LOST_DEAL_AUTOCLOSE_ENABLED", True),
+        ):
+            app.main()
+        names = [item.kwargs.get("name") for item in thread.call_args_list]
+        self.assertIn("lost-deal-autoclose", names)
 
 
 if __name__ == "__main__":

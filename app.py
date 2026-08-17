@@ -138,11 +138,12 @@ MANAGERS_FILE = APP_DIR / "managers.json"
 DATA_LOCK = threading.Lock()
 GREETING_LOCK = threading.Lock()
 GREETING_WAKE_EVENT = threading.Event()
+LOST_DEAL_AUTOCLOSE_WAKE_EVENT = threading.Event()
 DEAL_ANALYSIS_CACHE_LOCK = threading.Lock()
 DEAL_HEADERS_CACHE_LOCK = threading.Lock()
 LOCAL_TZ = timezone(timedelta(hours=env_int("APP_TZ_OFFSET_HOURS", 6, -12, 14)))
 STATE_STORE = StateStore(APP_DIR, local_timezone=LOCAL_TZ, auto_initialize=False)
-APP_VERSION = "2026-08-17-proven-actor-greeting"
+APP_VERSION = "2026-08-18-lost-deal-chat-autoclose"
 # Bump whenever classifier, eligibility, source-completeness or oldest-first
 # routing semantics change. Pre-deploy tokens must not authorize post-deploy
 # decisions under a different routing policy.
@@ -160,6 +161,25 @@ PORTAL_USERS_CACHE = {}
 PORTAL_USERS_CACHE_TTL_SECONDS = env_float("PORTAL_USERS_CACHE_TTL_SECONDS", 300, 5, 3600)
 CACHE_MAX_ENTRIES = env_int("CACHE_MAX_ENTRIES", 500, 50, 5000)
 DRY_RUN = env_bool("DRY_RUN", True)
+LOST_DEAL_AUTOCLOSE_ENABLED = env_bool("LOST_DEAL_AUTOCLOSE_ENABLED", True)
+LOST_DEAL_CLOSE_LEASE_SECONDS = env_int(
+    "LOST_DEAL_CLOSE_LEASE_SECONDS", 120, 30, 900
+)
+LOST_DEAL_HISTORY_MOVE_TOLERANCE_SECONDS = env_int(
+    "LOST_DEAL_HISTORY_MOVE_TOLERANCE_SECONDS", 5, 1, 5
+)
+LOST_DEAL_AUTOCLOSE_POLL_SECONDS = env_float(
+    "LOST_DEAL_AUTOCLOSE_POLL_SECONDS", 15, 5, 300
+)
+MAX_LOST_DEAL_STAGE_HISTORY_ROWS = env_int(
+    "MAX_LOST_DEAL_STAGE_HISTORY_ROWS", 5000, 100, 20000
+)
+LOST_DEAL_AUTOCLOSE_GRACE_SECONDS = env_int(
+    "LOST_DEAL_AUTOCLOSE_GRACE_SECONDS", 15, 5, 120
+)
+LOST_DEAL_MAX_PREFLIGHT_ATTEMPTS = env_int(
+    "LOST_DEAL_MAX_PREFLIGHT_ATTEMPTS", 5, 1, 20
+)
 PUBLIC_APP_URL = os.environ.get("PUBLIC_APP_URL", "").strip().rstrip("/")
 ADMIN_USER_IDS = {
     item.strip()
@@ -1180,6 +1200,626 @@ def bitrix_list_all(method, params=None, max_items=1000, timeout=None):
         except (TypeError, ValueError) as exc:
             raise RuntimeError(f"Bitrix вернул некорректный курсор для {method}") from exc
     return items
+
+
+class LostDealCloseGuardError(RuntimeError):
+    """A safe, expected reason why a failed deal must not close a chat."""
+
+    def __init__(self, code):
+        self.code = str(code or "guard_failed")
+        super().__init__(self.code)
+
+
+class LostDealTransitionNotMature(RuntimeError):
+    pass
+
+
+def _safe_bitrix_time(payload, key):
+    value = ((payload or {}).get("time") or {}).get(key)
+    return parse_source_message_time(value)
+
+
+def bitrix_stagehistory_page(params):
+    payload = bitrix_call_full("crm.stagehistory.list", params)
+    result = payload.get("result")
+    if not isinstance(result, dict) or not isinstance(result.get("items"), list):
+        raise RuntimeError("Bitrix вернул неожиданный формат истории стадий")
+    rows = result["items"]
+    if any(not isinstance(row, dict) for row in rows):
+        raise RuntimeError("Bitrix вернул повреждённую историю стадий")
+    return payload, rows
+
+
+def normalize_deal_category_id(value):
+    value = str(value if value is not None else "").strip()
+    return value if re.fullmatch(r"\d{1,19}", value) else ""
+
+
+def deal_stage_entity_id(category_id):
+    category_id = normalize_deal_category_id(category_id)
+    if not category_id:
+        raise RuntimeError("Bitrix вернул некорректную воронку сделки")
+    return "DEAL_STAGE" if category_id == "0" else f"DEAL_STAGE_{category_id}"
+
+
+def load_deal_stage_semantics(category_id, cache=None):
+    category_id = normalize_deal_category_id(category_id)
+    if not category_id:
+        raise RuntimeError("Bitrix вернул некорректную воронку сделки")
+    cache = cache if cache is not None else {}
+    if category_id in cache:
+        return cache[category_id]
+    entity_id = deal_stage_entity_id(category_id)
+    rows = bitrix_call(
+        "crm.status.list",
+        {
+            "filter[ENTITY_ID]": entity_id,
+            "select[]": ["ENTITY_ID", "STATUS_ID", "SEMANTICS"],
+        },
+    ) or []
+    if not isinstance(rows, list) or len(rows) > 500:
+        raise RuntimeError("Bitrix вернул неожиданный справочник стадий")
+    semantics = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            raise RuntimeError("Bitrix вернул повреждённый справочник стадий")
+        if str(row.get("ENTITY_ID") or entity_id).upper() != entity_id:
+            continue
+        stage_id = str(row.get("STATUS_ID") or "").strip()
+        raw_semantic = str(row.get("SEMANTICS") or "").strip().upper()
+        semantic = "P" if not raw_semantic else raw_semantic
+        if not stage_id or semantic not in {"P", "S", "F"}:
+            raise RuntimeError("Bitrix вернул некорректную семантику стадии")
+        if stage_id in semantics and semantics[stage_id] != semantic:
+            raise RuntimeError("Bitrix вернул неоднозначную семантику стадии")
+        semantics[stage_id] = semantic
+    if not semantics:
+        raise RuntimeError("Bitrix не вернул справочник стадий")
+    cache[category_id] = semantics
+    return semantics
+
+
+def semantic_for_stage(category_id, stage_id, cache=None):
+    stage_id = str(stage_id or "").strip()
+    semantic = load_deal_stage_semantics(category_id, cache).get(stage_id)
+    if semantic not in {"P", "S", "F"}:
+        raise RuntimeError("Стадия сделки отсутствует в справочнике Bitrix")
+    return semantic
+
+
+def read_deal_stage_history(deal_id):
+    payload, rows = bitrix_stagehistory_page(
+        {
+            "entityTypeId": 2,
+            "order[ID]": "DESC",
+            "filter[OWNER_ID]": str(deal_id),
+            "select[]": [
+                "ID", "OWNER_ID", "CATEGORY_ID", "STAGE_ID", "CREATED_TIME"
+            ],
+            "start": 0,
+        }
+    )
+    normalized = []
+    for row in rows:
+        row_id = normalize_entity_id(row.get("ID"))
+        owner_id = normalize_entity_id(row.get("OWNER_ID"))
+        category_id = normalize_deal_category_id(row.get("CATEGORY_ID"))
+        stage_id = str(row.get("STAGE_ID") or "").strip()
+        created = parse_source_message_time(row.get("CREATED_TIME"))
+        if not row_id or owner_id != str(deal_id) or not category_id or not stage_id or not created:
+            raise RuntimeError("Bitrix вернул неполную историю стадий")
+        normalized.append(
+            {
+                "id": row_id,
+                "dealId": owner_id,
+                "categoryId": category_id,
+                "stageId": stage_id,
+                "createdAt": created,
+            }
+        )
+    normalized.sort(key=lambda item: int(item["id"]), reverse=True)
+    return payload, normalized
+
+
+def exact_failed_transition(deal_id, expected_transition_id):
+    deal_id = normalize_entity_id(deal_id)
+    expected_transition_id = normalize_entity_id(expected_transition_id)
+    if not deal_id or not expected_transition_id:
+        raise LostDealCloseGuardError("invalid_transition_identity")
+    deal = bitrix_call("crm.deal.get", {"id": deal_id}) or {}
+    if not isinstance(deal, dict) or normalize_entity_id(deal.get("ID")) != deal_id:
+        raise RuntimeError("Bitrix не вернул сделку для проверки стадии")
+    category_id = normalize_deal_category_id(deal.get("CATEGORY_ID"))
+    stage_id = str(deal.get("STAGE_ID") or "").strip()
+    live_semantic = str(deal.get("STAGE_SEMANTIC_ID") or "").strip().upper()
+    closed = str(deal.get("CLOSED") or "").strip().upper()
+    moved_time = parse_source_message_time(deal.get("MOVED_TIME"))
+    if not category_id or not stage_id or live_semantic not in {"P", "S", "F"}:
+        raise RuntimeError("Bitrix не вернул полную текущую стадию сделки")
+    if live_semantic != "F":
+        raise LostDealCloseGuardError("deal_no_longer_failed")
+    if closed != "Y":
+        raise LostDealCloseGuardError("deal_not_closed")
+    _, history = read_deal_stage_history(deal_id)
+    if len(history) < 2:
+        raise LostDealCloseGuardError("stage_history_incomplete")
+    latest, previous = history[0], history[1]
+    if latest["id"] != expected_transition_id:
+        raise LostDealCloseGuardError("transition_not_latest")
+    if latest["categoryId"] != category_id or latest["stageId"] != stage_id:
+        raise LostDealCloseGuardError("history_not_current_stage")
+    if moved_time is None or abs((latest["createdAt"] - moved_time).total_seconds()) > LOST_DEAL_HISTORY_MOVE_TOLERANCE_SECONDS:
+        raise LostDealCloseGuardError("history_move_time_mismatch")
+    semantic_cache = {}
+    mapped_live = semantic_for_stage(category_id, stage_id, semantic_cache)
+    from_semantic = semantic_for_stage(
+        previous["categoryId"], previous["stageId"], semantic_cache
+    )
+    if mapped_live != "F" or mapped_live != live_semantic:
+        raise LostDealCloseGuardError("current_semantic_mismatch")
+    if from_semantic not in {"P", "S"}:
+        raise LostDealCloseGuardError("not_non_f_to_f")
+    return {
+        "transitionId": latest["id"],
+        "dealId": deal_id,
+        "fromSemantic": from_semantic,
+        "toSemantic": "F",
+        "fromCategoryId": previous["categoryId"],
+        "toCategoryId": latest["categoryId"],
+        "fromStageId": previous["stageId"],
+        "toStageId": latest["stageId"],
+        "transitionTime": latest["createdAt"].isoformat(),
+    }
+
+
+def active_chat_rows_for_deal(deal_id):
+    value = bitrix_call(
+        "imopenlines.crm.chat.get",
+        {"CRM_ENTITY_TYPE": "DEAL", "CRM_ENTITY": str(deal_id), "ACTIVE_ONLY": "Y"},
+    )
+    values = value if isinstance(value, list) else list(value.values()) if isinstance(value, dict) else None
+    if values is None or any(not isinstance(item, dict) for item in values):
+        raise RuntimeError("Bitrix вернул неожиданный список активных чатов")
+    rows = []
+    for item in values:
+        chat_id = normalize_entity_id(item.get("CHAT_ID"))
+        if not chat_id:
+            raise RuntimeError("Bitrix вернул активный чат без ID")
+        rows.append({"chatId": chat_id})
+    return rows
+
+
+def _history_identity(parameter, identifier):
+    history = bitrix_call(
+        "imopenlines.session.history.get",
+        {parameter: str(identifier)},
+    ) or {}
+    if not isinstance(history, dict):
+        raise RuntimeError("Bitrix вернул неожиданный формат сессии")
+    chat_id = normalize_entity_id(history.get("chatId") or history.get("CHAT_ID"))
+    session_id = normalize_entity_id(history.get("sessionId") or history.get("SESSION_ID"))
+    messages = history.get("message") or {}
+    if not isinstance(messages, (dict, list)):
+        raise RuntimeError("Bitrix вернул неожиданный формат сообщений сессии")
+    if len(messages) > MAX_OPENLINE_MESSAGES_PER_SESSION:
+        raise RuntimeError("История открытой линии превышает безопасный лимит")
+    entries = list(messages.items()) if isinstance(messages, dict) else list(enumerate(messages))
+    identity_rows = []
+    for fallback_id, message in entries:
+        if not isinstance(message, dict):
+            raise RuntimeError("Bitrix вернул повреждённое сообщение сессии")
+        message_id = normalize_entity_id(
+            message.get("id") or message.get("ID") or fallback_id
+        )
+        message_time = parse_source_message_time(
+            message.get("date") or message.get("DATE")
+        )
+        if not message_id or message_time is None:
+            raise RuntimeError("Bitrix не дал надёжную идентичность истории сессии")
+        sender_id = str(
+            message.get("senderid") or message.get("senderId") or message.get("SENDER_ID") or ""
+        ).strip()
+        identity_rows.append((int(message_id), sender_id, message_time.isoformat()))
+    identity_rows.sort()
+    identity_material = json.dumps(identity_rows, separators=(",", ":"))
+    return {
+        "chatId": chat_id,
+        "sessionId": session_id,
+        "messageCount": len(messages),
+        "lastMessageId": str(identity_rows[-1][0]) if identity_rows else "",
+        "latestMessageAt": (
+            max(parse_source_message_time(item[2]) for item in identity_rows)
+            if identity_rows
+            else None
+        ),
+        "historySignature": hashlib.sha256(identity_material.encode("utf-8")).hexdigest(),
+    }
+
+
+def _entity_data_session_id(value):
+    parts = [str(item).strip() for item in str(value or "").split("|")]
+    return normalize_entity_id(parts[5]) if len(parts) > 5 else ""
+
+
+def active_openline_session_activities(session_id):
+    payload = bitrix_call_full(
+        "crm.activity.list",
+        {
+            "order[ID]": "ASC",
+            "filter[OWNER_TYPE_ID]": 2,
+            "filter[PROVIDER_ID]": "IMOPENLINES_SESSION",
+            "filter[ASSOCIATED_ENTITY_ID]": str(session_id),
+            "filter[COMPLETED]": "N",
+            "select[]": [
+                "ID", "OWNER_TYPE_ID", "OWNER_ID", "PROVIDER_ID",
+                "ASSOCIATED_ENTITY_ID", "COMPLETED", "STATUS",
+            ],
+            "start": 0,
+        },
+    )
+    rows = payload.get("result") or []
+    if not isinstance(rows, list) or int(payload.get("total") or len(rows)) > 50:
+        raise RuntimeError("Bitrix вернул неполный реестр активной сессии")
+    if any(not isinstance(row, dict) for row in rows):
+        raise RuntimeError("Bitrix вернул повреждённый реестр активной сессии")
+    return rows
+
+
+def exact_openline_activity(deal_id, session_id):
+    rows = active_openline_session_activities(session_id)
+    if len(rows) != 1:
+        raise LostDealCloseGuardError("session_activity_not_unique")
+    row = rows[0]
+    activity_id = normalize_entity_id(row.get("ID"))
+    if not (
+        activity_id
+        and str(row.get("OWNER_TYPE_ID") or "") == "2"
+        and normalize_entity_id(row.get("OWNER_ID")) == str(deal_id)
+        and str(row.get("PROVIDER_ID") or "") == "IMOPENLINES_SESSION"
+        and normalize_entity_id(row.get("ASSOCIATED_ENTITY_ID")) == str(session_id)
+        and str(row.get("COMPLETED") or "").upper() == "N"
+    ):
+        raise LostDealCloseGuardError("session_activity_binding_mismatch")
+    return activity_id
+
+
+def read_single_active_deal_chat_snapshot(deal_id):
+    rows = active_chat_rows_for_deal(deal_id)
+    if not rows:
+        raise LostDealCloseGuardError("no_active_chat")
+    if len(rows) != 1:
+        raise LostDealCloseGuardError("multiple_active_chats")
+    chat_id = rows[0]["chatId"]
+    dialog = bitrix_call("imopenlines.dialog.get", {"CHAT_ID": chat_id}) or {}
+    if not isinstance(dialog, dict):
+        raise RuntimeError("Bitrix вернул неожиданный формат диалога")
+    if normalize_entity_id(dialog.get("id")) != chat_id:
+        raise LostDealCloseGuardError("dialog_id_mismatch")
+    if str(dialog.get("type") or "").strip().lower() != "lines":
+        raise LostDealCloseGuardError("dialog_not_openline")
+    entity_data_2 = str(dialog.get("entity_data_2") or "")
+    if not openline_chat_is_bound_to_deal(entity_data_2, deal_id):
+        raise LostDealCloseGuardError("dialog_deal_binding_mismatch")
+    by_chat = _history_identity("CHAT_ID", chat_id)
+    session_id = by_chat["sessionId"]
+    if by_chat["chatId"] != chat_id or not session_id:
+        raise LostDealCloseGuardError("chat_history_identity_mismatch")
+    by_session = _history_identity("SESSION_ID", session_id)
+    if by_session["chatId"] != chat_id or by_session["sessionId"] != session_id:
+        raise LostDealCloseGuardError("session_history_identity_mismatch")
+    for key in (
+        "messageCount", "lastMessageId", "latestMessageAt", "historySignature"
+    ):
+        if by_session[key] != by_chat[key]:
+            raise LostDealCloseGuardError("history_changed_during_check")
+    embedded_session = _entity_data_session_id(dialog.get("entity_data_1"))
+    if embedded_session and embedded_session != session_id:
+        raise LostDealCloseGuardError("dialog_session_mismatch")
+    last_message_id = normalize_entity_id(dialog.get("last_message_id"))
+    if (
+        not last_message_id
+        or not by_chat["lastMessageId"]
+        or last_message_id != by_chat["lastMessageId"]
+    ):
+        raise LostDealCloseGuardError("dialog_history_message_mismatch")
+    activity_id = exact_openline_activity(deal_id, session_id)
+    if active_chat_rows_for_deal(deal_id) != [{"chatId": chat_id}]:
+        raise LostDealCloseGuardError("active_chat_changed_during_check")
+    late_by_chat = _history_identity("CHAT_ID", chat_id)
+    late_by_session = _history_identity("SESSION_ID", session_id)
+    if late_by_chat != by_chat or late_by_session != by_session:
+        raise LostDealCloseGuardError("history_changed_during_check")
+    late_dialog = bitrix_call("imopenlines.dialog.get", {"CHAT_ID": chat_id}) or {}
+    if not isinstance(late_dialog, dict):
+        raise RuntimeError("Bitrix вернул неожиданный формат финального диалога")
+    guarded_dialog_fields = (
+        "id", "type", "entity_data_1", "entity_data_2", "last_message_id",
+        "unread_id", "counter", "user_counter", "is_new",
+    )
+    if any(late_dialog.get(key) != dialog.get(key) for key in guarded_dialog_fields):
+        raise LostDealCloseGuardError("dialog_changed_during_check")
+    return {
+        "chatId": chat_id,
+        "sessionId": session_id,
+        "lastMessageId": last_message_id,
+        "historyMessageCount": by_chat["messageCount"],
+        "latestMessageAt": (
+            by_chat["latestMessageAt"].isoformat() if by_chat["latestMessageAt"] else ""
+        ),
+        "historySignature": by_chat["historySignature"],
+        "activityId": activity_id,
+        "unreadId": str(dialog.get("unread_id") or "0"),
+        "counter": int(dialog.get("counter") or 0),
+        "userCounter": int(dialog.get("user_counter") or 0),
+        "isNew": bool(
+            dialog.get("is_new") is True
+            or str(dialog.get("is_new") or "").upper() in {"Y", "1", "TRUE"}
+        ),
+        "entityData1": str(dialog.get("entity_data_1") or ""),
+        "entityData2": entity_data_2,
+    }
+
+
+def _same_transition(left, right):
+    keys = (
+        "transitionId", "dealId", "fromSemantic", "toSemantic",
+        "fromCategoryId", "toCategoryId", "fromStageId", "toStageId",
+        "transitionTime",
+    )
+    return all(str(left.get(key)) == str(right.get(key)) for key in keys)
+
+
+def selected_chat_is_confirmed_inactive(operation):
+    chat_id = str(operation.get("chatId") or "")
+    session_id = str(operation.get("sessionId") or "")
+    if not chat_id or not session_id:
+        return False
+    if chat_id in {row["chatId"] for row in active_chat_rows_for_deal(operation["dealId"])}:
+        return False
+    history = _history_identity("SESSION_ID", session_id)
+    if history["sessionId"] != session_id or history["chatId"] != chat_id:
+        return False
+    activity_id = str(operation.get("activityId") or "")
+    activity = bitrix_call("crm.activity.get", {"id": activity_id}) or {}
+    if not isinstance(activity, dict):
+        return False
+    if not (
+        normalize_entity_id(activity.get("ID")) == activity_id
+        and str(activity.get("OWNER_TYPE_ID") or "") == "2"
+        and normalize_entity_id(activity.get("OWNER_ID")) == str(operation.get("dealId"))
+        and str(activity.get("PROVIDER_ID") or "") == "IMOPENLINES_SESSION"
+        and normalize_entity_id(activity.get("ASSOCIATED_ENTITY_ID")) == session_id
+        and str(activity.get("COMPLETED") or "").upper() == "Y"
+        and str(activity.get("STATUS") or "") == "2"
+    ):
+        return False
+    return active_openline_session_activities(session_id) == []
+
+
+def reconcile_lost_deal_close_operations():
+    reconciled = 0
+    for operation in STATE_STORE.list_lost_deal_close_reconciliation(limit=100):
+        try:
+            if selected_chat_is_confirmed_inactive(operation):
+                STATE_STORE.mark_lost_deal_close_reconciled(operation["transitionId"])
+                reconciled += 1
+        except Exception:
+            continue
+    return reconciled
+
+
+def process_lost_deal_transition(deal_id, transition_id, observed_at=None):
+    existing = STATE_STORE.get_lost_deal_close_operation(transition_id)
+    if existing and existing.get("status") not in {"checking", "retryable"}:
+        return existing.get("status") or "already_processed"
+    transition = exact_failed_transition(deal_id, transition_id)
+    transition_time = parse_source_message_time(transition["transitionTime"])
+    observed_at = observed_at or datetime.now(timezone.utc)
+    if transition_time is None or (
+        observed_at - transition_time
+    ).total_seconds() < LOST_DEAL_AUTOCLOSE_GRACE_SECONDS:
+        raise LostDealTransitionNotMature("transition_grace_period")
+    claim = STATE_STORE.claim_lost_deal_close_transition(
+        transition,
+        lease_seconds=LOST_DEAL_CLOSE_LEASE_SECONDS,
+    )
+    if not claim.get("claimed"):
+        if claim.get("status") in {"checking", "retryable"}:
+            raise LostDealTransitionNotMature("transition_check_in_progress")
+        return claim.get("status") or "already_processed"
+    lease_token = claim["leaseToken"]
+    try:
+        first_snapshot = read_single_active_deal_chat_snapshot(deal_id)
+        latest_message_at = parse_source_message_time(first_snapshot["latestMessageAt"])
+        # Bitrix message timestamps can have only second precision.  Equality
+        # is therefore ambiguous: the message may have arrived just after the
+        # stage change but been rounded to the same second.  Fail closed.
+        if latest_message_at is not None and latest_message_at >= transition_time:
+            raise LostDealCloseGuardError("message_after_failed_transition")
+        final_transition = exact_failed_transition(deal_id, transition_id)
+        if not _same_transition(transition, final_transition):
+            raise LostDealCloseGuardError("transition_changed_before_finish")
+        final_snapshot = read_single_active_deal_chat_snapshot(deal_id)
+        if final_snapshot != first_snapshot:
+            raise LostDealCloseGuardError("chat_changed_before_finish")
+        if DRY_RUN:
+            STATE_STORE.finalize_lost_deal_close_check(
+                transition_id,
+                lease_token,
+                status="dry_run",
+                outcome_code="dry_run_verified",
+                chat_id=final_snapshot["chatId"],
+            )
+            return "dry_run"
+        dispatch = STATE_STORE.mark_lost_deal_close_dispatching(
+            transition_id,
+            lease_token,
+            final_snapshot["chatId"],
+            final_snapshot["sessionId"],
+            final_snapshot["lastMessageId"],
+            final_snapshot["historyMessageCount"],
+            final_snapshot["historySignature"],
+            final_snapshot["activityId"],
+        )
+    except LostDealCloseGuardError as exc:
+        STATE_STORE.finalize_lost_deal_close_check(
+            transition_id,
+            lease_token,
+            status="skipped",
+            outcome_code=exc.code,
+        )
+        return exc.code
+    except Exception:
+        if int(claim.get("attemptCount") or 1) >= LOST_DEAL_MAX_PREFLIGHT_ATTEMPTS:
+            STATE_STORE.finalize_lost_deal_close_check(
+                transition_id,
+                lease_token,
+                status="skipped",
+                outcome_code="pre_dispatch_attempts_exhausted",
+            )
+            return "pre_dispatch_attempts_exhausted"
+        STATE_STORE.mark_lost_deal_close_retryable(
+            transition_id, lease_token, "pre_dispatch_read_failed"
+        )
+        raise
+
+    try:
+        acknowledged = bitrix_call(
+            "imopenlines.operator.another.finish",
+            {"CHAT_ID": dispatch["chatId"]},
+        ) is True
+    except Exception:
+        STATE_STORE.mark_lost_deal_close_uncertain(
+            transition_id, "finish_result_uncertain"
+        )
+        operation = STATE_STORE.get_lost_deal_close_operation(transition_id)
+        try:
+            if selected_chat_is_confirmed_inactive(operation):
+                STATE_STORE.mark_lost_deal_close_reconciled(transition_id)
+                return "closed_reconciled"
+        except Exception:
+            pass
+        return "uncertain"
+    if not acknowledged:
+        STATE_STORE.mark_lost_deal_close_uncertain(
+            transition_id, "finish_not_acknowledged"
+        )
+        return "uncertain"
+    operation = STATE_STORE.get_lost_deal_close_operation(transition_id)
+    try:
+        confirmed = selected_chat_is_confirmed_inactive(operation)
+    except Exception:
+        confirmed = False
+    if confirmed:
+        STATE_STORE.mark_lost_deal_close_closed(transition_id)
+        return "closed"
+    STATE_STORE.mark_lost_deal_close_uncertain(
+        transition_id, "finish_ack_unconfirmed"
+    )
+    return "uncertain"
+
+
+def arm_lost_deal_autoclose_from_bitrix():
+    payload, rows = bitrix_stagehistory_page(
+        {
+            "entityTypeId": 2,
+            "order[ID]": "DESC",
+            "select[]": ["ID", "CREATED_TIME"],
+            "start": 0,
+        }
+    )
+    valid_ids = [
+        int(row_id)
+        for row in rows
+        if (row_id := normalize_entity_id(row.get("ID")))
+    ]
+    if not valid_ids:
+        raise RuntimeError("Bitrix не дал удалённую границу истории стадий")
+    baseline_id = max(valid_ids)
+    remote_time = _safe_bitrix_time(payload, "date_finish")
+    if remote_time is None:
+        raise RuntimeError("Bitrix не дал серверное время для безопасной активации")
+    return STATE_STORE.arm_lost_deal_autoclose(remote_time, baseline_id)
+
+
+def poll_lost_deal_autoclose_once():
+    boundary = STATE_STORE.get_lost_deal_autoclose_boundary()
+    if boundary is None:
+        arm_lost_deal_autoclose_from_bitrix()
+        return {"armed": True, "processed": 0, "reconciled": 0}
+    reconciled = reconcile_lost_deal_close_operations()
+    start = 0
+    scanned = 0
+    processed = 0
+    had_errors = False
+    max_scanned_history_id = int(boundary["scanAfterHistoryId"])
+    semantic_cache = {}
+    while True:
+        payload, rows = bitrix_stagehistory_page(
+            {
+                "entityTypeId": 2,
+                "order[ID]": "ASC",
+                "filter[>ID]": int(boundary["scanAfterHistoryId"]),
+                "select[]": ["ID", "OWNER_ID", "CATEGORY_ID", "STAGE_ID", "CREATED_TIME"],
+                "start": start,
+            }
+        )
+        observed_at = _safe_bitrix_time(payload, "date_finish")
+        if observed_at is None:
+            raise RuntimeError("Bitrix не дал серверное время опроса")
+        scanned += len(rows)
+        if scanned > MAX_LOST_DEAL_STAGE_HISTORY_ROWS:
+            raise RuntimeError("История стадий превысила безопасный лимит опроса")
+        for row in rows:
+            transition_id = normalize_entity_id(row.get("ID"))
+            deal_id = normalize_entity_id(row.get("OWNER_ID"))
+            category_id = normalize_deal_category_id(row.get("CATEGORY_ID"))
+            stage_id = str(row.get("STAGE_ID") or "").strip()
+            if not transition_id or not deal_id or not category_id or not stage_id:
+                had_errors = True
+                continue
+            max_scanned_history_id = max(max_scanned_history_id, int(transition_id))
+            if int(transition_id) <= int(boundary["baselineHistoryId"]):
+                continue
+            try:
+                if semantic_for_stage(category_id, stage_id, semantic_cache) != "F":
+                    continue
+                process_lost_deal_transition(deal_id, transition_id, observed_at)
+                processed += 1
+            except LostDealCloseGuardError:
+                # The row itself was read successfully; a later/current state
+                # proved it is not an eligible exact P/S -> F transition.
+                processed += 1
+            except LostDealTransitionNotMature:
+                had_errors = True
+            except Exception:
+                had_errors = True
+        next_value = payload.get("next")
+        if next_value is None:
+            break
+        try:
+            start = int(next_value)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("Bitrix вернул некорректный курсор истории стадий") from exc
+    if not had_errors:
+        STATE_STORE.advance_lost_deal_autoclose_history_id(max_scanned_history_id)
+    return {
+        "armed": False,
+        "processed": processed,
+        "reconciled": reconciled,
+        "scanAdvanced": bool(not had_errors),
+    }
+
+
+def lost_deal_autoclose_loop():
+    while True:
+        try:
+            if LOST_DEAL_AUTOCLOSE_ENABLED and readiness_state().get("ok"):
+                poll_lost_deal_autoclose_once()
+        except Exception as exc:
+            sys.stderr.write(f"Lost-deal auto-close worker error: {type(exc).__name__}\n")
+        LOST_DEAL_AUTOCLOSE_WAKE_EVENT.wait(LOST_DEAL_AUTOCLOSE_POLL_SECONDS)
+        LOST_DEAL_AUTOCLOSE_WAKE_EVENT.clear()
 
 
 def bitrix_batch(commands):
@@ -4162,11 +4802,26 @@ def _compute_readiness_state():
     migration_state = (storage_state.get("migration") or {}).get("state")
     if REQUIRE_LEGACY_MIGRATION and migration_state != "completed":
         errors.append("Ожидается обязательная миграция legacy JSON")
+    lost_deal_autoclose_armed = False
+    if storage_state.get("ok"):
+        try:
+            lost_deal_autoclose_armed = (
+                STATE_STORE.get_lost_deal_autoclose_boundary() is not None
+            )
+        except Exception as exc:
+            errors.append("Граница автозавершения диалогов повреждена")
+            sys.stderr.write(
+                f"Lost-deal auto-close readiness error: {type(exc).__name__}\n"
+            )
     return {
         "ok": not errors,
         "version": APP_VERSION,
         "errors": errors,
         "dryRun": DRY_RUN,
+        "lostDealAutoclose": {
+            "enabled": bool(LOST_DEAL_AUTOCLOSE_ENABLED),
+            "armed": bool(lost_deal_autoclose_armed),
+        },
         "greetingAutoSend": bool(
             GREETING_AUTO_SEND and GREETING_AUTO_SEND_SUPPORTED and not DRY_RUN
         ),
@@ -5273,6 +5928,12 @@ def main():
         name="greeting-outbox",
         daemon=True,
     ).start()
+    if LOST_DEAL_AUTOCLOSE_ENABLED:
+        threading.Thread(
+            target=lost_deal_autoclose_loop,
+            name="lost-deal-autoclose",
+            daemon=True,
+        ).start()
     print(f"Открыть тест: http://{host}:{port}")
     server.serve_forever()
 
