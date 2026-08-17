@@ -143,7 +143,7 @@ DEAL_ANALYSIS_CACHE_LOCK = threading.Lock()
 DEAL_HEADERS_CACHE_LOCK = threading.Lock()
 LOCAL_TZ = timezone(timedelta(hours=env_int("APP_TZ_OFFSET_HOURS", 6, -12, 14)))
 STATE_STORE = StateStore(APP_DIR, local_timezone=LOCAL_TZ, auto_initialize=False)
-APP_VERSION = "2026-08-18-lost-deal-chat-autoclose"
+APP_VERSION = "2026-08-18-lost-deal-chat-autoclose-activity-fix"
 # Bump whenever classifier, eligibility, source-completeness or oldest-first
 # routing semantics change. Pre-deploy tokens must not authorize post-deploy
 # decisions under a different routing policy.
@@ -1441,7 +1441,7 @@ def _entity_data_session_id(value):
     return normalize_entity_id(parts[5]) if len(parts) > 5 else ""
 
 
-def active_openline_session_activities(session_id):
+def openline_session_activities(session_id):
     payload = bitrix_call_full(
         "crm.activity.list",
         {
@@ -1449,7 +1449,6 @@ def active_openline_session_activities(session_id):
             "filter[OWNER_TYPE_ID]": 2,
             "filter[PROVIDER_ID]": "IMOPENLINES_SESSION",
             "filter[ASSOCIATED_ENTITY_ID]": str(session_id),
-            "filter[COMPLETED]": "N",
             "select[]": [
                 "ID", "OWNER_TYPE_ID", "OWNER_ID", "PROVIDER_ID",
                 "ASSOCIATED_ENTITY_ID", "COMPLETED", "STATUS",
@@ -1466,18 +1465,20 @@ def active_openline_session_activities(session_id):
 
 
 def exact_openline_activity(deal_id, session_id):
-    rows = active_openline_session_activities(session_id)
+    rows = openline_session_activities(session_id)
     if len(rows) != 1:
         raise LostDealCloseGuardError("session_activity_not_unique")
     row = rows[0]
     activity_id = normalize_entity_id(row.get("ID"))
+    completed = str(row.get("COMPLETED") or "").upper()
+    status = str(row.get("STATUS") or "")
     if not (
         activity_id
         and str(row.get("OWNER_TYPE_ID") or "") == "2"
         and normalize_entity_id(row.get("OWNER_ID")) == str(deal_id)
         and str(row.get("PROVIDER_ID") or "") == "IMOPENLINES_SESSION"
         and normalize_entity_id(row.get("ASSOCIATED_ENTITY_ID")) == str(session_id)
-        and str(row.get("COMPLETED") or "").upper() == "N"
+        and (completed, status) in {("N", "1"), ("Y", "2"), ("Y", "3")}
     ):
         raise LostDealCloseGuardError("session_activity_binding_mismatch")
     return activity_id
@@ -1590,10 +1591,22 @@ def selected_chat_is_confirmed_inactive(operation):
         and str(activity.get("PROVIDER_ID") or "") == "IMOPENLINES_SESSION"
         and normalize_entity_id(activity.get("ASSOCIATED_ENTITY_ID")) == session_id
         and str(activity.get("COMPLETED") or "").upper() == "Y"
-        and str(activity.get("STATUS") or "") == "2"
+        and str(activity.get("STATUS") or "") in {"2", "3"}
     ):
         return False
-    return active_openline_session_activities(session_id) == []
+    rows = openline_session_activities(session_id)
+    if len(rows) != 1:
+        return False
+    listed = rows[0]
+    return (
+        normalize_entity_id(listed.get("ID")) == activity_id
+        and str(listed.get("OWNER_TYPE_ID") or "") == "2"
+        and normalize_entity_id(listed.get("OWNER_ID")) == str(operation.get("dealId"))
+        and str(listed.get("PROVIDER_ID") or "") == "IMOPENLINES_SESSION"
+        and normalize_entity_id(listed.get("ASSOCIATED_ENTITY_ID")) == session_id
+        and str(listed.get("COMPLETED") or "").upper() == "Y"
+        and str(listed.get("STATUS") or "") in {"2", "3"}
+    )
 
 
 def reconcile_lost_deal_close_operations():

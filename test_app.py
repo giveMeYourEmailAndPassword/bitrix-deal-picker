@@ -4129,6 +4129,90 @@ class TestLostDealAutoclose(TemporaryStateTestCase):
                 app.read_single_active_deal_chat_snapshot("7001")
         call_method.assert_called_once()
 
+    def test_automatically_completed_activity_is_valid_preflight_binding(self):
+        automatically_completed = {
+            "ID": "8401",
+            "OWNER_TYPE_ID": "2",
+            "OWNER_ID": "7001",
+            "PROVIDER_ID": "IMOPENLINES_SESSION",
+            "ASSOCIATED_ENTITY_ID": "8201",
+            "COMPLETED": "Y",
+            "STATUS": "3",
+        }
+        with patch.object(
+            app,
+            "bitrix_call_full",
+            return_value={"result": [automatically_completed], "total": 1},
+        ) as activity_list:
+            result = app.exact_openline_activity("7001", "8201")
+
+        self.assertEqual(result, "8401")
+        params = activity_list.call_args.args[1]
+        self.assertNotIn("filter[COMPLETED]", params)
+
+    def test_unexpected_activity_completion_pair_fails_closed(self):
+        inconsistent = {
+            "ID": "8401",
+            "OWNER_TYPE_ID": "2",
+            "OWNER_ID": "7001",
+            "PROVIDER_ID": "IMOPENLINES_SESSION",
+            "ASSOCIATED_ENTITY_ID": "8201",
+            "COMPLETED": "N",
+            "STATUS": "3",
+        }
+        with patch.object(
+            app,
+            "bitrix_call_full",
+            return_value={"result": [inconsistent], "total": 1},
+        ):
+            with self.assertRaisesRegex(
+                app.LostDealCloseGuardError, "session_activity_binding_mismatch"
+            ):
+                app.exact_openline_activity("7001", "8201")
+
+    def test_activity_auto_completion_between_snapshots_still_dispatches_once(self):
+        pending = {
+            "ID": "8401",
+            "OWNER_TYPE_ID": "2",
+            "OWNER_ID": "7001",
+            "PROVIDER_ID": "IMOPENLINES_SESSION",
+            "ASSOCIATED_ENTITY_ID": "8201",
+            "COMPLETED": "N",
+            "STATUS": "1",
+        }
+        automatically_completed = {
+            **pending,
+            "COMPLETED": "Y",
+            "STATUS": "3",
+        }
+        activity_payloads = iter(
+            [
+                {"result": [pending], "total": 1},
+                {"result": [automatically_completed], "total": 1},
+            ]
+        )
+
+        def read_snapshot(_deal_id):
+            activity_id = app.exact_openline_activity("7001", "8201")
+            return self.snapshot(activityId=activity_id)
+
+        with (
+            patch.object(app, "DRY_RUN", False),
+            patch.object(app, "exact_failed_transition", return_value=self.transition()),
+            patch.object(app, "bitrix_call_full", side_effect=lambda *args: next(activity_payloads)),
+            patch.object(app, "read_single_active_deal_chat_snapshot", side_effect=read_snapshot),
+            patch.object(app, "selected_chat_is_confirmed_inactive", return_value=True),
+            patch.object(app, "bitrix_call", return_value=True) as finish,
+        ):
+            result = app.process_lost_deal_transition(
+                "7001", "9001", datetime.fromisoformat(self.REMOTE_TIME)
+            )
+
+        self.assertEqual(result, "closed")
+        finish.assert_called_once_with(
+            "imopenlines.operator.another.finish", {"CHAT_ID": "8101"}
+        )
+
     def test_message_after_failed_transition_is_terminal_skip(self):
         late = self.snapshot(latestMessageAt="2099-01-01T10:00:02+00:00")
         with (
@@ -4227,7 +4311,7 @@ class TestLostDealAutoclose(TemporaryStateTestCase):
                 return_value={"chatId": "8101", "sessionId": "8201"},
             ),
             patch.object(app, "bitrix_call", return_value=completed),
-            patch.object(app, "active_openline_session_activities", return_value=[]),
+            patch.object(app, "openline_session_activities", return_value=[completed]),
         ):
             self.assertTrue(app.selected_chat_is_confirmed_inactive(operation))
         with (
@@ -4240,6 +4324,38 @@ class TestLostDealAutoclose(TemporaryStateTestCase):
             patch.object(app, "bitrix_call", return_value={**completed, "COMPLETED": "N"}),
         ):
             self.assertFalse(app.selected_chat_is_confirmed_inactive(operation))
+
+    def test_post_confirm_accepts_automatically_completed_activity(self):
+        operation = {
+            "dealId": "7001",
+            "chatId": "8101",
+            "sessionId": "8201",
+            "activityId": "8401",
+        }
+        automatically_completed = {
+            "ID": "8401",
+            "OWNER_TYPE_ID": "2",
+            "OWNER_ID": "7001",
+            "PROVIDER_ID": "IMOPENLINES_SESSION",
+            "ASSOCIATED_ENTITY_ID": "8201",
+            "COMPLETED": "Y",
+            "STATUS": "3",
+        }
+        with (
+            patch.object(app, "active_chat_rows_for_deal", return_value=[]),
+            patch.object(
+                app,
+                "_history_identity",
+                return_value={"chatId": "8101", "sessionId": "8201"},
+            ),
+            patch.object(app, "bitrix_call", return_value=automatically_completed),
+            patch.object(
+                app,
+                "openline_session_activities",
+                return_value=[automatically_completed],
+            ),
+        ):
+            self.assertTrue(app.selected_chat_is_confirmed_inactive(operation))
 
     def test_transient_preflight_failure_does_not_advance_discovery_cursor(self):
         self.arm()
