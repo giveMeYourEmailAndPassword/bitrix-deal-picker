@@ -247,6 +247,26 @@ class TestOAuthDomainAllowlist(unittest.TestCase):
 
 
 class TestBrowserBootstrapSafety(unittest.TestCase):
+    def run_rendered_post_json(self, scenario):
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("Node.js is unavailable for the browser behavior check")
+        rendered = app.render_index_html(initial_auth={}, nonce="fixed-nonce")
+        marker = '<script nonce="fixed-nonce">'
+        inline_script = rendered.rsplit(marker, 1)[1].split("</script>", 1)[0]
+        start = inline_script.index("function apiUrl(path)")
+        end = inline_script.index("async function loadManagers()", start)
+        script = inline_script[start:end] + "\n" + scenario
+        completed = subprocess.run(
+            [node],
+            input=script,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+        return json.loads(completed.stdout)
+
     def test_json_for_script_neutralizes_script_breakout(self):
         encoded = app.json_for_script({"token": "</script><script>alert(1)</script>&"})
         self.assertNotIn("</script", encoded.lower())
@@ -304,6 +324,150 @@ class TestBrowserBootstrapSafety(unittest.TestCase):
             check=False,
         )
         self.assertEqual(checked.returncode, 0, checked.stderr or checked.stdout)
+
+    def test_next_deal_retries_one_fetch_rejection_then_returns_success(self):
+        result = self.run_rendered_post_json(
+            """
+let fetchCalls = 0;
+global.fetch = async () => {
+  fetchCalls += 1;
+  if (fetchCalls === 1) throw new TypeError('Load failed');
+  return {
+    ok: true,
+    text: async () => JSON.stringify({ok: true, attempt: fetchCalls})
+  };
+};
+(async () => {
+  const data = await postJson('/api/next-deal', {managerId: '42'});
+  process.stdout.write(JSON.stringify({fetchCalls, data}));
+})().catch((error) => {
+  process.stderr.write(error.stack || String(error));
+  process.exitCode = 1;
+});
+"""
+        )
+        self.assertEqual(result["fetchCalls"], 2)
+        self.assertEqual(result["data"], {"ok": True, "attempt": 2})
+
+    def test_next_deal_two_fetch_rejections_show_safe_russian_error(self):
+        result = self.run_rendered_post_json(
+            """
+let fetchCalls = 0;
+global.fetch = async () => {
+  fetchCalls += 1;
+  throw new TypeError('Load failed');
+};
+(async () => {
+  try {
+    await postJson('/api/next-deal', {managerId: '42'});
+    process.stdout.write(JSON.stringify({fetchCalls, threw: false}));
+  } catch (error) {
+    process.stdout.write(JSON.stringify({fetchCalls, threw: true, message: error.message}));
+  }
+})().catch((error) => {
+  process.stderr.write(error.stack || String(error));
+  process.exitCode = 1;
+});
+"""
+        )
+        self.assertEqual(result["fetchCalls"], 2)
+        self.assertTrue(result["threw"])
+        self.assertEqual(
+            result["message"],
+            "Соединение с сервисом прервалось. Проверьте интернет и повторите поиск.",
+        )
+        self.assertNotIn("Load failed", result["message"])
+
+    def test_next_deal_retries_when_reading_response_body_is_interrupted(self):
+        result = self.run_rendered_post_json(
+            """
+let fetchCalls = 0;
+let textCalls = 0;
+global.fetch = async () => {
+  fetchCalls += 1;
+  const currentAttempt = fetchCalls;
+  return {
+    ok: true,
+    text: async () => {
+      textCalls += 1;
+      if (currentAttempt === 1) throw new TypeError('Load failed');
+      return JSON.stringify({ok: true, attempt: currentAttempt});
+    }
+  };
+};
+(async () => {
+  const data = await postJson('/api/next-deal', {managerId: '42'});
+  process.stdout.write(JSON.stringify({fetchCalls, textCalls, data}));
+})().catch((error) => {
+  process.stderr.write(error.stack || String(error));
+  process.exitCode = 1;
+});
+"""
+        )
+        self.assertEqual(result["fetchCalls"], 2)
+        self.assertEqual(result["textCalls"], 2)
+        self.assertEqual(result["data"], {"ok": True, "attempt": 2})
+
+    def test_next_deal_does_not_retry_a_readable_http_error(self):
+        result = self.run_rendered_post_json(
+            """
+let fetchCalls = 0;
+global.fetch = async () => {
+  fetchCalls += 1;
+  return {
+    ok: false,
+    text: async () => JSON.stringify({message: 'Дневной лимит уже достигнут.'})
+  };
+};
+(async () => {
+  try {
+    await postJson('/api/next-deal', {managerId: '42'});
+    process.stdout.write(JSON.stringify({fetchCalls, threw: false}));
+  } catch (error) {
+    process.stdout.write(JSON.stringify({fetchCalls, threw: true, message: error.message}));
+  }
+})().catch((error) => {
+  process.stderr.write(error.stack || String(error));
+  process.exitCode = 1;
+});
+"""
+        )
+        self.assertEqual(result["fetchCalls"], 1)
+        self.assertTrue(result["threw"])
+        self.assertEqual(result["message"], "Дневной лимит уже достигнут.")
+
+    def test_next_deal_does_not_retry_http_503_with_interrupted_body(self):
+        result = self.run_rendered_post_json(
+            """
+let fetchCalls = 0;
+global.fetch = async () => {
+  fetchCalls += 1;
+  return {
+    ok: false,
+    status: 503,
+    text: async () => { throw new TypeError('Load failed'); }
+  };
+};
+(async () => {
+  try {
+    await postJson('/api/next-deal', {managerId: '42'});
+    process.stdout.write(JSON.stringify({fetchCalls, threw: false}));
+  } catch (error) {
+    process.stdout.write(JSON.stringify({fetchCalls, threw: true, message: error.message}));
+  }
+})().catch((error) => {
+  process.stderr.write(error.stack || String(error));
+  process.exitCode = 1;
+});
+"""
+        )
+        self.assertEqual(result["fetchCalls"], 1)
+        self.assertTrue(result["threw"])
+        self.assertEqual(
+            result["message"],
+            "Сервис поиска временно недоступен. Подождите минуту и повторите поиск.",
+        )
+        self.assertNotIn("Load failed", result["message"])
 
 
 class TestSelectionTokens(unittest.TestCase):

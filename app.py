@@ -141,7 +141,7 @@ DEAL_ANALYSIS_CACHE_LOCK = threading.Lock()
 DEAL_HEADERS_CACHE_LOCK = threading.Lock()
 LOCAL_TZ = timezone(timedelta(hours=env_int("APP_TZ_OFFSET_HOURS", 6, -12, 14)))
 STATE_STORE = StateStore(APP_DIR, local_timezone=LOCAL_TZ, auto_initialize=False)
-APP_VERSION = "2026-08-17-bitrix-install-mode-fix"
+APP_VERSION = "2026-08-17-bitrix-network-retry"
 # Bump whenever classifier, eligibility, source-completeness or oldest-first
 # routing semantics change. Pre-deploy tokens must not authorize post-deploy
 # decisions under a different routing policy.
@@ -3855,25 +3855,52 @@ function currentAuth() {
     : null;
 }
 async function postJson(url, payload) {
-  const response = await fetch(apiUrl(url), {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload || {})
-  });
-  const text = await response.text();
-  let data;
-  try {
-    data = JSON.parse(text);
-  } catch (error) {
-    if (url === '/api/next-deal') {
-      throw new Error('Сервис поиска временно недоступен. Подождите минуту и повторите поиск.');
+  const endpoint = apiUrl(url);
+  const body = JSON.stringify(payload || {});
+  const attempts = url === '/api/next-deal' ? 2 : 1;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    let response;
+    let text;
+    try {
+      response = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body
+      });
+    } catch (error) {
+      if (attempt + 1 < attempts) continue;
+      if (url === '/api/next-deal') {
+        throw new Error('Соединение с сервисом прервалось. Проверьте интернет и повторите поиск.');
+      }
+      throw error;
     }
-    throw new Error(`Сервер временно недоступен для ${url}. Обновите приложение и попробуйте ещё раз.`);
+    try {
+      text = await response.text();
+    } catch (error) {
+      if (response.ok === true && attempt + 1 < attempts) continue;
+      if (url === '/api/next-deal') {
+        throw new Error(
+          response.ok === true
+            ? 'Соединение с сервисом прервалось. Проверьте интернет и повторите поиск.'
+            : 'Сервис поиска временно недоступен. Подождите минуту и повторите поиск.'
+        );
+      }
+      throw error;
+    }
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch (error) {
+      if (url === '/api/next-deal') {
+        throw new Error('Сервис поиска временно недоступен. Подождите минуту и повторите поиск.');
+      }
+      throw new Error(`Сервер временно недоступен для ${url}. Обновите приложение и попробуйте ещё раз.`);
+    }
+    if (!response.ok) {
+      throw new Error(data.message || data.reason || data.error || 'Ошибка запроса');
+    }
+    return data;
   }
-  if (!response.ok) {
-    throw new Error(data.message || data.reason || data.error || 'Ошибка запроса');
-  }
-  return data;
 }
 async function loadManagers() {
   if (!ALLOW_UNVERIFIED_USERS) return false;
