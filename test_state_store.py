@@ -1114,6 +1114,27 @@ class TestGreetingOutbox(StateStoreTestCase):
         self.assertEqual(job["attemptCount"], 1)
         self.assertNotIn("leaseToken", job)
 
+    def test_exact_lease_reserves_only_the_requested_operation(self):
+        store = self.make_store()
+        self.create_job(store, operation_key="greeting-a")
+        self.create_job(store, operation_key="greeting-b")
+
+        leased = store.lease_exact_greeting_outbox(
+            "greeting-b",
+            "actor-worker",
+        )
+
+        self.assertTrue(leased["transitioned"])
+        self.assertEqual(leased["operationKey"], "greeting-b")
+        self.assertEqual(leased["status"], "checking")
+        self.assertEqual(store.get_greeting_outbox("greeting-a")["status"], "pending")
+        repeated = store.lease_exact_greeting_outbox(
+            "greeting-b",
+            "other-worker",
+        )
+        self.assertFalse(repeated["transitioned"])
+        self.assertEqual(repeated["attemptCount"], 1)
+
     def test_stale_checking_lease_has_exactly_one_safe_new_owner(self):
         store = self.make_store(busy_timeout_ms=30_000)
         job = self.create_job(store)
