@@ -207,6 +207,82 @@ class TestStrictIdentityAndAuthorization(unittest.TestCase):
         webhook_call.assert_not_called()
 
 
+class TestVerifiedUserCache(unittest.TestCase):
+    def setUp(self):
+        app.USER_VERIFY_CACHE.clear()
+
+    def tearDown(self):
+        app.USER_VERIFY_CACHE.clear()
+
+    def test_verified_token_is_reused_without_a_second_oauth_call(self):
+        auth = {"AUTH_ID": "token-a", "DOMAIN": "test-fake.bitrix24.test"}
+        upstream_user = {
+            "ID": "42",
+            "NAME": "Verified",
+            "ACTIVE": True,
+            "UF_DEPARTMENT": [1],
+        }
+        with (
+            patch.object(app, "USER_VERIFY_CACHE_TTL_SECONDS", 300),
+            patch.object(app.time, "monotonic", side_effect=[100.0, 101.0]),
+            patch.object(app, "bitrix_oauth_call", return_value=upstream_user) as oauth_call,
+        ):
+            first = app.verify_bitrix_user(auth, allow_cached=False)
+            second = app.verify_bitrix_user(auth, allow_cached=True)
+
+        self.assertEqual(first["id"], "42")
+        self.assertEqual(second["id"], "42")
+        oauth_call.assert_called_once()
+
+    def test_cache_is_bound_to_the_exact_oauth_token(self):
+        auth_a = {"AUTH_ID": "token-a", "DOMAIN": "test-fake.bitrix24.test"}
+        auth_b = {"AUTH_ID": "token-b", "DOMAIN": "test-fake.bitrix24.test"}
+        with patch.object(app.time, "monotonic", return_value=100.0):
+            with patch.object(
+                app,
+                "bitrix_oauth_call",
+                return_value={"ID": "42", "NAME": "Verified"},
+            ):
+                self.assertEqual(
+                    app.verify_bitrix_user(auth_a, allow_cached=False)["id"],
+                    "42",
+                )
+            with patch.object(
+                app,
+                "bitrix_oauth_call",
+                side_effect=RuntimeError("upstream unavailable"),
+            ) as oauth_call:
+                self.assertIsNone(app.verify_bitrix_user(auth_b, allow_cached=True))
+
+        self.assertEqual(oauth_call.call_count, 2)
+
+    def test_expired_cache_fails_closed_when_oauth_is_unavailable(self):
+        auth = {"AUTH_ID": "token-a", "DOMAIN": "test-fake.bitrix24.test"}
+        with (
+            patch.object(app, "USER_VERIFY_CACHE_TTL_SECONDS", 300),
+            patch.object(app.time, "monotonic", return_value=100.0),
+            patch.object(
+                app,
+                "bitrix_oauth_call",
+                return_value={"ID": "42", "NAME": "Verified"},
+            ),
+        ):
+            self.assertEqual(app.verify_bitrix_user(auth, allow_cached=False)["id"], "42")
+
+        with (
+            patch.object(app, "USER_VERIFY_CACHE_TTL_SECONDS", 300),
+            patch.object(app.time, "monotonic", return_value=401.0),
+            patch.object(
+                app,
+                "bitrix_oauth_call",
+                side_effect=RuntimeError("upstream unavailable"),
+            ) as oauth_call,
+        ):
+            self.assertIsNone(app.verify_bitrix_user(auth, allow_cached=True))
+
+        self.assertEqual(oauth_call.call_count, 2)
+
+
 class TestOAuthDomainAllowlist(unittest.TestCase):
     def test_exact_configured_domain_is_allowed(self):
         self.assertEqual(
@@ -815,6 +891,45 @@ class TestReadiness(TemporaryStateTestCase):
 
 
 class TestHttpBoundary(unittest.TestCase):
+    def test_manager_action_cache_policy_keeps_search_fresh(self):
+        cases = (
+            ("/api/next-deal", False, "get_next_deal_for_manager", {"deal": None}),
+            ("/api/claim", True, "preview_claim", {"ok": True}),
+            ("/api/reject", True, "record_rejection", {"ok": True}),
+        )
+        for path, allow_cached, operation_name, operation_result in cases:
+            with self.subTest(path=path):
+                payload = {
+                    "auth": {
+                        "AUTH_ID": "verified-token",
+                        "DOMAIN": "test-fake.bitrix24.test",
+                    },
+                    "managerId": "999",
+                    "dealId": "100",
+                    "selectionToken": "signed-selection",
+                }
+                handler = HandlerHarness.make("POST", path, payload)
+                with (
+                    patch.object(app, "rate_limit_allowed", return_value=True),
+                    patch.object(app, "readiness_state", return_value={"ok": True}),
+                    patch.object(app, "actor_id_from_payload", return_value="42") as actor,
+                    patch.object(app, operation_name, return_value=dict(operation_result)),
+                ):
+                    handler.do_POST()
+
+                self.assertEqual(HandlerHarness.status(handler), 200)
+                actor.assert_called_once_with(payload, allow_cached=allow_cached)
+
+    def test_admin_and_current_user_checks_remain_fresh(self):
+        auth = {"AUTH_ID": "verified-token", "DOMAIN": "test-fake.bitrix24.test"}
+        with patch.object(app, "verify_bitrix_user", return_value=None) as verify:
+            app.current_user_state({"auth": auth})
+            verify.assert_called_once_with(auth, allow_cached=False)
+
+        with patch.object(app, "verify_bitrix_user", return_value=None) as verify:
+            app.require_admin({"auth": auth})
+            verify.assert_called_once_with(auth, allow_cached=False)
+
     def test_access_log_does_not_persist_full_client_ip(self):
         handler = HandlerHarness.make("GET", "/api/health")
         handler.client_address = ("203.0.113.42", 12345)
