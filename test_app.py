@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -287,6 +288,22 @@ class TestBrowserBootstrapSafety(unittest.TestCase):
         self.assertEqual(app.extract_auth_credentials(malformed_auth), (None, None))
         rendered = app.render_index_html(initial_auth=malformed_auth, nonce="fixed-nonce")
         self.assertNotIn("must-not-be-rendered", rendered)
+
+    def test_rendered_inline_javascript_is_syntactically_valid(self):
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("Node.js is unavailable for the browser syntax check")
+        rendered = app.render_index_html(initial_auth={}, nonce="fixed-nonce")
+        marker = '<script nonce="fixed-nonce">'
+        script = rendered.rsplit(marker, 1)[1].split("</script>", 1)[0]
+        checked = subprocess.run(
+            [node, "--check"],
+            input=script,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(checked.returncode, 0, checked.stderr or checked.stdout)
 
 
 class TestSelectionTokens(unittest.TestCase):
