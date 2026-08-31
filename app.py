@@ -285,6 +285,7 @@ INTEGRATION_OUTBOX_INTERVAL_SECONDS = env_float(
 INTEGRATION_OUTBOX_BATCH_SIZE = env_int(
     "INTEGRATION_OUTBOX_BATCH_SIZE", 20, 1, 200
 )
+LIMIT_FREE_DATES = {"2026-08-31"}
 
 REJECT_REASONS = {
     "not_my_country": "Не моя страна",
@@ -924,8 +925,9 @@ def local_date():
     return local_now().date().isoformat()
 
 
-def is_limit_free_day():
-    return local_now().weekday() == 6
+def is_limit_free_day(now=None):
+    now = now or local_now()
+    return now.weekday() == 6 or now.date().isoformat() in LIMIT_FREE_DATES
 
 
 def parse_hhmm(value, fallback):
@@ -948,7 +950,7 @@ def is_limit_free_time(now=None):
 
 def is_limit_bypassed_now(now=None):
     now = now or local_now()
-    return now.weekday() == 6 or is_limit_free_time(now)
+    return is_limit_free_day(now) or is_limit_free_time(now)
 
 
 def entry_date(entry):
