@@ -40,6 +40,8 @@ _TEST_ENV = {
     "DRY_RUN": "1",
     "BITRIX_CLAIM_MARKER_FIELD": "UF_CRM_TEST_CLAIM_MARKER",
     "GREETING_AUTO_SEND": "0",
+    "CLAIM_EVENT_EXPORT_ENABLED": "0",
+    "EXTRA_CLAIM_REQUESTS_ENABLED": "0",
     "ALLOW_UNVERIFIED_USERS": "0",
     "HOST": "127.0.0.1",
     "APP_TZ_OFFSET_HOURS": "6",
@@ -902,6 +904,31 @@ class TestReadiness(TemporaryStateTestCase):
             result = app.readiness_state(force=True)
         self.assertFalse(result["ok"])
         self.assertTrue(any("app_events" in error for error in result["errors"]))
+
+    def test_claim_event_export_with_valid_baza_config_is_ready_without_extra_requests(self):
+        with self._ready_patches(
+            CLAIM_EVENT_EXPORT_ENABLED=True,
+            EXTRA_CLAIM_REQUESTS_ENABLED=False,
+            BAZA_API_BASE_URL="https://baza.example.test",
+            BAZA_HMAC_KEY_ID="picker-v1",
+            BAZA_HMAC_SECRET="s" * 32,
+        ):
+            result = app.readiness_state(force=True)
+        self.assertTrue(result["ok"], result["errors"])
+
+    def test_claim_event_export_requires_complete_baza_config(self):
+        with self._ready_patches(
+            CLAIM_EVENT_EXPORT_ENABLED=True,
+            EXTRA_CLAIM_REQUESTS_ENABLED=False,
+            BAZA_API_BASE_URL="",
+            BAZA_HMAC_KEY_ID="",
+            BAZA_HMAC_SECRET="",
+        ):
+            result = app.readiness_state(force=True)
+        self.assertFalse(result["ok"])
+        self.assertTrue(any("BAZA_API_BASE_URL" in error for error in result["errors"]))
+        self.assertTrue(any("BAZA_HMAC_KEY_ID" in error for error in result["errors"]))
+        self.assertTrue(any("BAZA_HMAC_SECRET" in error for error in result["errors"]))
 
     def test_production_cannot_disable_explicit_manager_rules(self):
         with self._ready_patches(REQUIRE_EXPLICIT_ACCESS_RULE=False):
@@ -4208,6 +4235,10 @@ class TestGreetingOutboxWorker(ClaimWorkflowTestCase):
 
 
 class TestSafeConfigurationAndMinimization(TemporaryStateTestCase):
+    def test_claim_event_export_defaults_off(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(app.env_bool("CLAIM_EVENT_EXPORT_ENABLED", False))
+
     def test_unknown_dry_run_boolean_keeps_safe_default_and_marks_readiness_error(self):
         original = set(app.INVALID_ENV_VALUES)
         try:
@@ -4370,6 +4401,95 @@ class TestBazaExtraClaimIntegration(TemporaryStateTestCase):
         expected = app.hmac.new(b"s" * 32, canonical, app.hashlib.sha256).hexdigest()
         self.assertEqual(headers["X-Krugosvet-Key-Id"], "picker-v1")
         self.assertEqual(headers["X-Krugosvet-Signature"], expected)
+
+    def test_claim_event_export_does_not_enable_or_deliver_extra_claim_requests(self):
+        self.add_taken_claim()
+        request = self.store.create_extra_claim_request(
+            "42",
+            "2026-08-17",
+            "Запрос должен остаться локальным",
+            taken_today_snapshot=1,
+            daily_limit_snapshot=1,
+        )
+        calls = []
+
+        def fake_baza(path, _payload, timeout=None):
+            calls.append(path)
+            return {"ok": True}
+
+        with (
+            patch.multiple(
+                app,
+                CLAIM_EVENT_EXPORT_ENABLED=True,
+                EXTRA_CLAIM_REQUESTS_ENABLED=False,
+                BAZA_API_BASE_URL="https://baza.example.test",
+                BAZA_HMAC_KEY_ID="picker-v1",
+                BAZA_HMAC_SECRET="s" * 32,
+            ),
+            patch.object(app, "baza_post", side_effect=fake_baza),
+        ):
+            summary = app.flush_integration_outbox(limit=10)
+            denied = app.request_extra_claim("42", "Клиент ждёт срочный ответ")
+            extra_state = app.extra_claim_limit_state("42", refresh=False)
+
+        self.assertTrue(summary["enabled"])
+        self.assertEqual(summary["sent"], 1)
+        self.assertEqual(calls, ["/integrations/deal-picker/v1/claim-events"])
+        self.assertEqual(denied["_httpStatus"], 403)
+        self.assertFalse(extra_state["enabled"])
+        self.assertFalse(extra_state["configured"])
+        pending = self.store.list_outbox(delivered=False)
+        self.assertEqual([item["kind"] for item in pending], ["extra_claim_request"])
+        self.assertEqual(
+            pending[0]["dedupeKey"], f"extra-claim-request:{request['requestKey']}"
+        )
+
+    def test_baza_credentials_alone_do_not_enable_outbox_delivery(self):
+        self.add_taken_claim()
+        with (
+            patch.multiple(
+                app,
+                CLAIM_EVENT_EXPORT_ENABLED=False,
+                EXTRA_CLAIM_REQUESTS_ENABLED=False,
+                BAZA_API_BASE_URL="https://baza.example.test",
+                BAZA_HMAC_KEY_ID="picker-v1",
+                BAZA_HMAC_SECRET="s" * 32,
+            ),
+            patch.object(app, "baza_post") as baza_post,
+        ):
+            self.assertTrue(app.baza_integration_configured())
+            summary = app.flush_integration_outbox(limit=1)
+
+        self.assertFalse(summary["enabled"])
+        self.assertEqual(summary["sent"], 0)
+        baza_post.assert_not_called()
+        self.assertEqual(len(self.store.list_outbox(delivered=False)), 1)
+
+    def test_extra_claim_flag_keeps_claim_event_delivery_backward_compatible(self):
+        self.add_taken_claim()
+        calls = []
+
+        def fake_baza(path, _payload, timeout=None):
+            calls.append(path)
+            return {"ok": True}
+
+        with (
+            patch.multiple(
+                app,
+                CLAIM_EVENT_EXPORT_ENABLED=False,
+                EXTRA_CLAIM_REQUESTS_ENABLED=True,
+                BAZA_API_BASE_URL="https://baza.example.test",
+                BAZA_HMAC_KEY_ID="picker-v1",
+                BAZA_HMAC_SECRET="s" * 32,
+            ),
+            patch.object(app, "baza_post", side_effect=fake_baza),
+        ):
+            summary = app.flush_integration_outbox(
+                limit=1, kinds={"claim_event"}
+            )
+
+        self.assertEqual(summary["sent"], 1)
+        self.assertEqual(calls, ["/integrations/deal-picker/v1/claim-events"])
 
     def test_baza_outage_is_not_contacted_for_within_limit_state(self):
         with (
