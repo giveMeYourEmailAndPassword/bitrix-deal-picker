@@ -271,6 +271,7 @@ CLAIM_RECONCILE_INTERVAL_SECONDS = env_float(
     "CLAIM_RECONCILE_INTERVAL_SECONDS", 60, 30, 3600
 )
 CLAIM_RECONCILE_BATCH_SIZE = env_int("CLAIM_RECONCILE_BATCH_SIZE", 100, 1, 1000)
+CLAIM_EVENT_EXPORT_ENABLED = env_bool("CLAIM_EVENT_EXPORT_ENABLED", False)
 EXTRA_CLAIM_REQUESTS_ENABLED = env_bool("EXTRA_CLAIM_REQUESTS_ENABLED", False)
 BAZA_API_BASE_URL = os.environ.get("BAZA_API_BASE_URL", "").strip().rstrip("/")
 BAZA_HMAC_SECRET = os.environ.get("BAZA_HMAC_SECRET", "")
@@ -506,14 +507,36 @@ def baza_base_url_valid():
         return False
 
 
+def baza_integration_enabled():
+    return bool(CLAIM_EVENT_EXPORT_ENABLED or EXTRA_CLAIM_REQUESTS_ENABLED)
+
+
 def baza_integration_configured():
     return bool(
-        EXTRA_CLAIM_REQUESTS_ENABLED
-        and baza_base_url_valid()
+        baza_base_url_valid()
         and BAZA_HMAC_KEY_ID
         and len(BAZA_HMAC_SECRET.encode("utf-8")) >= 32
         and "REPLACE" not in BAZA_HMAC_SECRET.upper()
     )
+
+
+def claim_event_delivery_enabled():
+    # Extra-claim grants are consumed by a claim event. Keep the historical
+    # EXTRA=1 behaviour even when the independent export switch is left off.
+    return bool(CLAIM_EVENT_EXPORT_ENABLED or EXTRA_CLAIM_REQUESTS_ENABLED)
+
+
+def enabled_integration_outbox_kinds():
+    kinds = set()
+    if claim_event_delivery_enabled():
+        kinds.add("claim_event")
+    if EXTRA_CLAIM_REQUESTS_ENABLED:
+        kinds.add("extra_claim_request")
+    return kinds
+
+
+def extra_claim_requests_configured():
+    return bool(EXTRA_CLAIM_REQUESTS_ENABLED and baza_integration_configured())
 
 
 def canonical_json_bytes(payload):
@@ -1252,12 +1275,20 @@ def _deliver_integration_outbox_item(item):
 def flush_integration_outbox(limit=None, *, kinds=None, dedupe_key=None):
     """Deliver a bounded durable batch without affecting Bitrix availability."""
 
-    summary = {"enabled": baza_integration_configured(), "sent": 0, "retried": 0, "dead": 0}
+    delivery_kinds = enabled_integration_outbox_kinds()
+    if kinds is not None:
+        delivery_kinds &= {str(kind) for kind in kinds}
+    summary = {
+        "enabled": bool(delivery_kinds and baza_integration_configured()),
+        "sent": 0,
+        "retried": 0,
+        "dead": 0,
+    }
     if not summary["enabled"]:
         return summary
     for item in STATE_STORE.list_due_outbox(
         limit=limit or INTEGRATION_OUTBOX_BATCH_SIZE,
-        kinds=kinds,
+        kinds=delivery_kinds,
         dedupe_key=dedupe_key,
     ):
         try:
@@ -1366,7 +1397,7 @@ def extra_claim_limit_state(manager_id, *, refresh=False):
     integration_unavailable = False
     local_state = STATE_STORE.get_extra_claim_state(manager_id, today)
     if refresh and limit_reached and EXTRA_CLAIM_REQUESTS_ENABLED:
-        if not baza_integration_configured():
+        if not extra_claim_requests_configured():
             integration_unavailable = True
         else:
             try:
@@ -1386,7 +1417,7 @@ def extra_claim_limit_state(manager_id, *, refresh=False):
     return {
         "ok": True,
         "enabled": bool(EXTRA_CLAIM_REQUESTS_ENABLED),
-        "configured": bool(baza_integration_configured()),
+        "configured": bool(extra_claim_requests_configured()),
         "businessDate": today,
         "takenToday": taken_today,
         "dailyLimit": limit,
@@ -1406,7 +1437,7 @@ def request_extra_claim(manager_id, reason):
             "message": "Запросы дополнительных заявок пока не включены.",
             "_httpStatus": 403,
         }
-    if not baza_integration_configured():
+    if not extra_claim_requests_configured():
         return {
             "ok": False,
             "message": "Связь с Базой ещё не настроена. Обратитесь к администратору.",
@@ -5542,7 +5573,7 @@ def _compute_readiness_state():
         errors.append("Не задан разрешённый домен Bitrix24")
     if CLAIM_STATS_SOURCE != "app_events":
         errors.append("CLAIM_STATS_SOURCE поддерживает только точный режим app_events")
-    if EXTRA_CLAIM_REQUESTS_ENABLED:
+    if baza_integration_enabled():
         if not baza_base_url_valid():
             errors.append("BAZA_API_BASE_URL должен быть корректным HTTPS URL")
         if not BAZA_HMAC_KEY_ID:
