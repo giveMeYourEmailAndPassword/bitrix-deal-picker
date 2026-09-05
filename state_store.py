@@ -53,6 +53,10 @@ class IdempotencyConflictError(StateStoreError):
     """Raised when an operation key is reused for another deal or manager."""
 
 
+class DealAlreadyClaimedError(IdempotencyConflictError):
+    """A successful allocation permanently excludes a deal from automatic issuance."""
+
+
 class ExtraClaimGrantUnavailableError(StateStoreError):
     """Raised when an over-limit operation cannot reserve a one-use grant."""
 
@@ -400,6 +404,8 @@ class StateStore:
 
                 CREATE INDEX IF NOT EXISTS idx_claim_events_manager_date
                     ON claim_events(manager_id, event_date);
+                CREATE INDEX IF NOT EXISTS idx_claim_events_deal
+                    ON claim_events(deal_id, operation_key);
                 CREATE INDEX IF NOT EXISTS idx_reject_events_manager_date
                     ON reject_events(manager_id, event_date);
                 CREATE INDEX IF NOT EXISTS idx_greeting_events_deal
@@ -3246,6 +3252,55 @@ class StateStore:
             result["created"] = created
         return result
 
+    def list_claimed_deal_ids(self) -> set[str]:
+        """Include legacy successful claims without rewriting their audit history."""
+        self._ensure_ready()
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT deal_id FROM claim_events UNION "
+                "SELECT deal_id FROM claim_operations WHERE status='succeeded'"
+            ).fetchall()
+        return {str(row["deal_id"]) for row in rows}
+
+    def deal_was_claimed(self, deal_id: Any, *, except_operation_key: str = "") -> bool:
+        self._ensure_ready()
+        with self._connect() as connection:
+            return self._deal_was_claimed(connection, str(deal_id), except_operation_key)
+
+    @staticmethod
+    def _deal_was_claimed(connection: sqlite3.Connection, deal_id: str, operation_key: str) -> bool:
+        return bool(connection.execute(
+            "SELECT 1 FROM claim_events WHERE deal_id=? "
+            "AND (operation_key IS NULL OR operation_key != ?) "
+            "UNION ALL SELECT 1 FROM claim_operations WHERE deal_id=? "
+            "AND operation_key != ? AND status='succeeded' LIMIT 1",
+            (deal_id, operation_key, deal_id, operation_key),
+        ).fetchone())
+
+    def _assert_deal_available_for_claim(
+        self, connection: sqlite3.Connection, deal_id: str, operation_key: str,
+        *, confirmed_recovery: bool = False,
+    ) -> None:
+        # This runs inside the same BEGIN IMMEDIATE transaction as reservation.
+        # A process-local lock cannot protect different service instances.
+        if not confirmed_recovery and self._deal_was_claimed(connection, deal_id, operation_key):
+            raise DealAlreadyClaimedError("deal was already allocated successfully")
+        rows = connection.execute(
+            "SELECT * FROM claim_operations WHERE deal_id=? AND operation_key != ? "
+            "AND status IN ('pending','failed')",
+            (deal_id, operation_key),
+        ).fetchall()
+        if self._filter_unresolved_claim_rows(rows, limit=1):
+            raise IdempotencyConflictError("another deal lifecycle requires reconciliation")
+
+    def get_claim_by_operation_key(self, operation_key: Any) -> Optional[Dict[str, Any]]:
+        self._ensure_ready()
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM claim_events WHERE operation_key=?", (str(operation_key),)
+            ).fetchone()
+        return self._claim_row(row) if row else None
+
     def begin_claim_operation(
         self,
         deal_id: Any,
@@ -3285,16 +3340,37 @@ class StateStore:
                         f"operation key {operation_key!r} belongs to another deal or manager"
                     )
                 if retry_failed and row["status"] == "failed":
+                    original_request = json.loads(row["request_json"] or "{}")
+                    confirmed_recovery = bool(
+                        request
+                        and (request.get("recovery") or request.get("maintenanceRecovery"))
+                        and original_request.get("claimMarker")
+                        and request.get("claimMarker") == original_request.get("claimMarker")
+                    )
+                    self._assert_deal_available_for_claim(
+                        connection, deal_id, operation_key, confirmed_recovery=confirmed_recovery,
+                    )
                     extra_grant = None
                     if require_extra_grant:
                         extra_grant = self._reserve_extra_claim_grant_in_connection(
                             connection, manager_id, business_date, operation_key, now
                         )
-                    request_json = (
-                        _json_dumps(self._prepare_operation_request(request))
-                        if request is not None
-                        else row["request_json"]
-                    )
+                    if request is not None:
+                        prepared_request = dict(request)
+                        # Public operation DTOs omit the private greeting target.
+                        # Exact audit recovery keeps that existing frozen target;
+                        # it must neither lose an accepted greeting nor create one
+                        # for an old claim that never requested a greeting.
+                        if (
+                            (prepared_request.get("recovery") or prepared_request.get("maintenanceRecovery"))
+                            and prepared_request.get("claimMarker") == original_request.get("claimMarker")
+                            and prepared_request.get("greetingRequested") is True
+                            and original_request.get("greetingRequested") is True
+                        ):
+                            prepared_request["greetingContext"] = original_request.get("greetingContext")
+                        request_json = _json_dumps(self._prepare_operation_request(prepared_request))
+                    else:
+                        request_json = row["request_json"]
                     try:
                         attempt_history = json.loads(row["attempt_history_json"])
                     except (TypeError, json.JSONDecodeError):
@@ -3341,6 +3417,7 @@ class StateStore:
                 operation = self._operation_row(row, created=False)
                 operation["retried"] = False
                 return operation
+            self._assert_deal_available_for_claim(connection, deal_id, operation_key)
             connection.execute(
                 """
                 INSERT INTO claim_operations(
@@ -3440,6 +3517,7 @@ class StateStore:
                 operation = self._operation_row(row, created=False)
                 operation["reassigned"] = False
                 return operation
+            self._assert_deal_available_for_claim(connection, deal_id, operation_key)
             if row["extra_claim_grant_id"]:
                 held_grant = connection.execute(
                     "SELECT * FROM extra_claim_grants WHERE grant_id=?",
@@ -3523,12 +3601,11 @@ class StateStore:
         deal_id: Any,
         claim_marker: Any,
     ) -> Optional[Dict[str, Any]]:
-        """Find resolved evidence that authorizes replacing an old marker.
+        """Recognize a resolved historical marker for recovery checks.
 
-        A source-stage deal may legitimately re-enter the picker after an
-        earlier completed claim.  Only a marker recorded on a succeeded local
-        operation proves that lifecycle; unknown/non-terminal markers must be
-        preserved for investigation rather than overwritten.
+        Recognition never authorizes a new automatic allocation. Lifetime claim
+        exclusion applies separately; unknown/non-terminal markers remain intact
+        for investigation.
         """
 
         self._ensure_ready()
@@ -3645,6 +3722,10 @@ class StateStore:
 
             if claim is None:
                 raise ValueError("a pending claim operation requires a claim event")
+            self._assert_deal_available_for_claim(
+                connection, row["deal_id"], operation_key,
+                confirmed_recovery=bool(recovered and expected_claim_marker),
+            )
             claim_payload = dict(claim)
             supplied_manager_id = str(
                 claim_payload.get("managerId") or claim_payload.get("manager_id") or ""

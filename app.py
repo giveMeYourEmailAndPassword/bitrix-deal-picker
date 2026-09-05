@@ -24,6 +24,7 @@ from pathlib import Path
 import baza_bridge
 
 from state_store import (
+    DealAlreadyClaimedError,
     ExtraClaimGrantReconciliationRequiredError,
     ExtraClaimGrantUnavailableError,
     IdempotencyConflictError,
@@ -157,7 +158,7 @@ APP_VERSION = (
 # Bump whenever classifier, eligibility, source-completeness or oldest-first
 # routing semantics change. Pre-deploy tokens must not authorize post-deploy
 # decisions under a different routing policy.
-ROUTING_POLICY_VERSION = "2026-08-17-routing-v3-extra-claims"
+ROUTING_POLICY_VERSION = "2026-09-06-routing-v4-no-reissue"
 
 SOURCE_STAGES = {
     "UC_ZJ55BR": "Необработанные ЛИДЫ",
@@ -3694,10 +3695,12 @@ def _get_next_deal_for_manager(manager_id, continuation_token=None):
 
     rejected_keys = STATE_STORE.list_rejection_semantic_keys(manager_id)
     unresolved_deal_ids = STATE_STORE.list_unresolved_claim_deal_ids()
+    claimed_deal_ids = STATE_STORE.list_claimed_deal_ids()
     headers = [
         header
         for header in list_allowed_deal_headers()
         if str(header.get("ID") or "") not in unresolved_deal_ids
+        if str(header.get("ID") or "") not in claimed_deal_ids
         if rejection_semantic_key(manager_id, header.get("ID"), deal_version(header))
         not in rejected_keys
     ]
@@ -3727,6 +3730,9 @@ def _get_next_deal_for_manager(manager_id, continuation_token=None):
 
     for header in batch_headers:
         header_id = str(header.get("ID") or "")
+        # Another process may have completed a claim during the history scan.
+        if STATE_STORE.deal_was_claimed(header_id):
+            continue
         if header_id in errors or header_id not in analyzed:
             return {
                 "manager": manager,
@@ -4160,6 +4166,15 @@ def process_greeting_outbox_job(job, worker_token):
             return checked
         job = checked
         target = resolve_greeting_target(deal_id, manager_id, context)
+        # Target discovery/join can take several REST round trips. A manual CRM
+        # reassignment during that work must not dispatch as the old manager.
+        latest_deal = bitrix_call("crm.deal.get", {"id": deal_id}) or {}
+        if (
+            str(latest_deal.get("ASSIGNED_BY_ID") or "") != manager_id
+            or str(latest_deal.get("STAGE_ID") or "") != TARGET_STAGE
+            or str(latest_deal.get(BITRIX_CLAIM_MARKER_FIELD) or "") != expected_marker
+        ):
+            raise RuntimeError("claim_marker_mismatch")
     except Exception as exc:
         code = greeting_machine_error(exc)
         try:
@@ -4291,6 +4306,32 @@ def greeting_outbox_loop():
         GREETING_WAKE_EVENT.clear()
 
 
+def public_claim_greeting(job):
+    """Format only public greeting fields without scheduling or sending work."""
+    if not job:
+        return {
+            "ok": True, "status": "manual", "autoSent": False, "text": "",
+            "message": "Сделка взята, но у неё не найден подтверждённый OpenLine-чат. Напишите клиенту вручную.",
+        }
+    status = str(job.get("status") or "pending")
+    if status in {"pending", "checking", "dispatching"}:
+        return {
+            "ok": True, "status": "queued", "autoSent": False, "text": "",
+            "message": "Приветствие отправляется в фоне.",
+        }
+    if status == "sent":
+        return {
+            "ok": True, "status": "sent", "autoSent": True,
+            "text": job.get("text") or "",
+            "message": "Приветствие автоматически отправлено клиенту.",
+        }
+    return {
+        "ok": True, "status": status, "autoSent": False,
+        "text": job.get("text") or "",
+        "message": "Автоприветствие не подтверждено. Проверьте чат сделки.",
+    }
+
+
 def attach_greeting_to_claim(
     result,
     manager_id,
@@ -4320,33 +4361,11 @@ def attach_greeting_to_claim(
                 actor_auth,
                 manager_profile,
             )
-        response["greeting"] = {
-            "ok": True,
-            "status": "queued",
-            "autoSent": False,
-            "text": "",
-            "message": "Приветствие отправляется в фоне.",
-        }
         if reserved is None:
             # Handles a restart/race or a missing short-lived actor token.  The
             # durable worker remains the fallback for still-pending jobs.
             GREETING_WAKE_EVENT.set()
-    elif status == "sent":
-        response["greeting"] = {
-            "ok": True,
-            "status": "sent",
-            "autoSent": True,
-            "text": job.get("text") or "",
-            "message": "Приветствие автоматически отправлено клиенту.",
-        }
-    else:
-        response["greeting"] = {
-            "ok": True,
-            "status": status,
-            "autoSent": False,
-            "text": job.get("text") or "",
-            "message": "Автоприветствие не подтверждено. Проверьте чат сделки.",
-        }
+    response["greeting"] = public_claim_greeting(job)
     return response
 
 
@@ -4362,6 +4381,16 @@ def claim_operation_is_stale(operation, now=None):
     if current.tzinfo is None:
         current = current.replace(tzinfo=timezone.utc)
     return (current.astimezone(timezone.utc) - updated_at.astimezone(timezone.utc)).total_seconds() > CLAIM_OPERATION_PENDING_TTL_SECONDS
+
+
+def already_claimed_response():
+    return {
+        "ok": False,
+        "selectionStale": True,
+        "code": "deal_already_claimed",
+        "message": "Эта заявка уже была закреплена за менеджером и повторно не выдаётся.",
+        "_httpStatus": 409,
+    }
 
 
 def preview_claim(deal_id, manager_id, auth=None, selection_token=None, *, send_greeting=True):
@@ -4430,6 +4459,8 @@ def preview_claim(deal_id, manager_id, auth=None, selection_token=None, *, send_
                 "_httpStatus": 409,
             }
         existing_operation = STATE_STORE.get_claim_operation(operation_key)
+        if not existing_operation and STATE_STORE.deal_was_claimed(deal_id):
+            return already_claimed_response()
         existing_attempt_timestamp = claim_operation_attempt_timestamp(existing_operation)
         if existing_operation:
             if existing_operation.get("status") == "succeeded":
@@ -4594,6 +4625,8 @@ def preview_claim(deal_id, manager_id, auth=None, selection_token=None, *, send_
                         "STAGE_NAME": TARGET_STAGE_NAME,
                     },
                     "message": "Сделка уже была назначена менеджеру; журнал восстановлен.",
+                    "operationKey": operation_key,
+                    "claimedAt": recovery_claim_timestamp,
                 }
                 try:
                     finalized_operation = STATE_STORE.finalize_claim_operation(
@@ -4683,8 +4716,8 @@ def preview_claim(deal_id, manager_id, auth=None, selection_token=None, *, send_
             ):
                 # Never overwrite an unknown marker. It may be the only
                 # surviving evidence after a Volume restore or partial remote
-                # update. A marker from a succeeded older lifecycle is the
-                # only safe exception for an intentional requeue.
+                # update. Recognized historical markers still face the lifetime
+                # exclusion below; recognition alone cannot authorize reissue.
                 return {
                     "ok": False,
                     "message": (
@@ -4703,6 +4736,9 @@ def preview_claim(deal_id, manager_id, auth=None, selection_token=None, *, send_
                     "currentStage": current_stage,
                     "_httpStatus": 409,
                 }
+
+        if success_result is None and STATE_STORE.deal_was_claimed(deal_id, except_operation_key=operation_key):
+            return already_claimed_response()
 
         if success_result is None and DRY_RUN:
             return {
@@ -4824,6 +4860,8 @@ def preview_claim(deal_id, manager_id, auth=None, selection_token=None, *, send_
                         require_extra_grant=requires_extra_grant,
                         business_date=claim_business_date,
                     )
+            except DealAlreadyClaimedError:
+                return already_claimed_response()
             except IdempotencyConflictError:
                 return {
                     "recoveryPending": True,
@@ -5005,6 +5043,8 @@ def preview_claim(deal_id, manager_id, auth=None, selection_token=None, *, send_
                 "ok": True,
                 "dryRun": False,
                 "dealId": deal_id,
+                "operationKey": operation_key,
+                "claimedAt": claim_operation_attempt_timestamp(operation) or local_now().isoformat(),
                 "auditRecorded": True,
                 "updated": {
                     "ASSIGNED_BY_ID": manager_id,
@@ -5018,7 +5058,7 @@ def preview_claim(deal_id, manager_id, auth=None, selection_token=None, *, send_
             try:
                 finalized_operation = STATE_STORE.finalize_claim_operation(
                     operation_key,
-                    claim=claim_log_entry(manager_id, verified_deal),
+                    claim=claim_log_entry(manager_id, verified_deal, timestamp=success_result["claimedAt"]),
                     result=success_result,
                     expected_claim_marker=attempt_marker,
                     app_version=APP_VERSION,
@@ -5042,6 +5082,13 @@ def preview_claim(deal_id, manager_id, auth=None, selection_token=None, *, send_
                     "Сделка взята, но журнал временно не записался. Сообщите администратору."
                 )
 
+    # Old succeeded journal rows predate the additive response identity. Resolve
+    # their original event time; reopening/replaying a claim must not repin a chat.
+    success_result.setdefault("operationKey", operation_key)
+    if not success_result.get("claimedAt"):
+        previous_claim = STATE_STORE.get_claim_by_operation_key(operation_key)
+        if previous_claim:
+            success_result["claimedAt"] = previous_claim["timestamp"]
     if suppress_replay_greeting or not send_greeting:
         return success_result
     return attach_greeting_to_claim(
@@ -5772,11 +5819,26 @@ def baza_picker_action(action, payload):
         return {"ok": False, "error": "invalid_actor", "message": "Не подтверждён менеджер Битрикс."}, 400
     # Only the authenticated Baza backend supplies bitrixUserId. Client managerId,
     # auth, user fields and arbitrary request parameters cannot select an actor.
-    command = {key: payload.get(key) for key in ("dealId", "selectionToken", "continuationToken", "reason")}
-    for key, maximum in (("dealId", 20), ("selectionToken", 4096), ("continuationToken", 4096), ("reason", 500)):
+    command = {key: payload.get(key) for key in ("dealId", "selectionToken", "continuationToken", "reason", "operationKey")}
+    for key, maximum in (("dealId", 20), ("selectionToken", 4096), ("continuationToken", 4096), ("reason", 500), ("operationKey", 512)):
         value = command[key]
         if value is not None and (not isinstance(value, str) or len(value) > maximum):
             return {"ok": False, "error": "invalid_payload", "message": "Некорректные параметры заявки."}, 400
+    if action == "greeting-status":
+        operation_key = command["operationKey"]
+        if not operation_key or not operation_key.strip():
+            return {"ok": False, "error": "invalid_payload"}, 400
+        operation = STATE_STORE.get_claim_operation(operation_key)
+        if (
+            not operation
+            or str(operation.get("managerId") or "") != manager_id
+            or operation.get("status") != "succeeded"
+        ):
+            return {"ok": False, "error": "not_found"}, 404
+        return {
+            "ok": True,
+            "greeting": public_claim_greeting(STATE_STORE.get_greeting_outbox(operation_key)),
+        }, 200
     if action == "status":
         manager = get_manager_profile(manager_id)
         if not manager or manager.get("active") is not True or manager.get("intranet") is not True:
@@ -5806,7 +5868,7 @@ def baza_picker_action(action, payload):
         if action == "next":
             result = get_next_deal_for_manager(manager_id, command["continuationToken"])
         else:
-            result = preview_claim(command["dealId"], manager_id, selection_token=command["selectionToken"], send_greeting=False)
+            result = preview_claim(command["dealId"], manager_id, selection_token=command["selectionToken"])
     elif action == "reject":
         result = record_rejection(manager_id, {key: command[key] for key in ("dealId", "selectionToken", "reason")})
         return result, 200 if result.get("ok") else 400

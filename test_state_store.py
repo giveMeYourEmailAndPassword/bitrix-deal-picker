@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from state_store import (
+    DealAlreadyClaimedError,
     ExtraClaimGrantReconciliationRequiredError,
     ExtraClaimGrantUnavailableError,
     ExtraClaimRequestAssociationConflictError,
@@ -996,6 +997,41 @@ class TestClaimOperations(StateStoreTestCase):
         self.assertEqual(sum(1 for result in results if result["created"]), 1)
         self.assertEqual(len(store.list_claim_operations()), 1)
 
+    def test_different_instances_cannot_reserve_different_lifecycles_of_one_deal(self):
+        stores = [self.make_store(busy_timeout_ms=30_000) for _ in range(2)]
+
+        def begin(index):
+            try:
+                return stores[index % 2].begin_claim_operation(
+                    "100", str(index), operation_key=f"lifecycle-{index}"
+                )
+            except IdempotencyConflictError:
+                return None
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=12) as pool:
+            results = list(pool.map(begin, range(24)))
+        self.assertEqual(sum(result is not None for result in results), 1)
+        operation = stores[0].list_claim_operations()[0]
+        stores[1].finalize_claim_operation(operation["operationKey"], claim={})
+        for store in stores:
+            with self.assertRaises(DealAlreadyClaimedError):
+                store.begin_claim_operation("100", "new-manager", operation_key="new-version")
+        self.assertEqual(stores[0].list_claimed_deal_ids(), {"100"})
+
+    def test_legacy_claim_blocks_new_allocation_and_failed_retry_without_spending_a_grant(self):
+        store = self.make_store()
+        store.begin_claim_operation("100", "1001", operation_key="failed-attempt")
+        store.fail_claim_operation("failed-attempt", "proven no write")
+        store.append_claim({"dealId": "100", "managerId": "previous-manager"})
+        with self.assertRaises(DealAlreadyClaimedError):
+            store.begin_claim_operation("100", "1001", operation_key="new-version", require_extra_grant=True, business_date="2026-09-06")
+        with self.assertRaises(DealAlreadyClaimedError):
+            store.retry_failed_claim_operation("100", "1001", operation_key="failed-attempt")
+        with self.assertRaises(DealAlreadyClaimedError):
+            store.reassign_failed_claim_operation("100", "1002", operation_key="failed-attempt")
+        self.assertEqual(store.get_claim_operation("failed-attempt")["status"], "failed")
+        self.assertEqual(len(store.list_claims()), 1)
+
     def test_concurrent_failed_retry_transitions_exactly_once(self):
         store = self.make_store(busy_timeout_ms=30_000)
         store.begin_claim_operation("100", "1001", operation_key="retry-race")
@@ -1576,9 +1612,9 @@ class TestGreetingOutbox(StateStoreTestCase):
         },
     }
 
-    def create_job(self, store, operation_key="greeting-op"):
+    def create_job(self, store, operation_key="greeting-op", deal_id="700"):
         started = store.begin_claim_operation(
-            "700",
+            deal_id,
             "1001",
             operation_key=operation_key,
             request=self.REQUEST,
@@ -1586,7 +1622,7 @@ class TestGreetingOutbox(StateStoreTestCase):
         self.assertNotIn("greetingContext", started["request"])
         finalized = store.finalize_claim_operation(
             operation_key,
-            claim={"managerId": "1001", "dealId": "700"},
+            claim={"managerId": "1001", "dealId": deal_id},
             expected_claim_marker="claim:greeting",
         )
         self.assertTrue(finalized["greetingQueued"])
@@ -1735,7 +1771,7 @@ class TestGreetingOutbox(StateStoreTestCase):
     def test_exact_lease_reserves_only_the_requested_operation(self):
         store = self.make_store()
         self.create_job(store, operation_key="greeting-a")
-        self.create_job(store, operation_key="greeting-b")
+        self.create_job(store, operation_key="greeting-b", deal_id="701")
 
         leased = store.lease_exact_greeting_outbox(
             "greeting-b",
