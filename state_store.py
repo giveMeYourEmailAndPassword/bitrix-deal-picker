@@ -329,6 +329,15 @@ class StateStore:
                     dead_letter_at TEXT
                 );
 
+                CREATE TABLE IF NOT EXISTS baza_bridge_nonces (
+                    key_id TEXT NOT NULL,
+                    nonce TEXT NOT NULL,
+                    expires_at INTEGER NOT NULL,
+                    PRIMARY KEY (key_id, nonce)
+                );
+                CREATE INDEX IF NOT EXISTS idx_baza_bridge_nonce_expiry
+                    ON baza_bridge_nonces(expires_at);
+
                 CREATE TABLE IF NOT EXISTS greeting_outbox (
                     operation_key TEXT PRIMARY KEY
                         REFERENCES claim_operations(operation_key),
@@ -629,6 +638,19 @@ class StateStore:
             raise StateStoreNotReadyError(str(self._initialization_error)) from self._initialization_error
         if not self._initialized:
             raise StateStoreNotReadyError("state store initialization is gated by application readiness")
+
+    def consume_bridge_nonce(self, key_id: str, nonce: str, *, now: int, expires_at: int) -> bool:
+        """Reserve a signed request once across concurrent processes and restarts."""
+        self._ensure_ready()
+        if not key_id or not nonce or expires_at <= now:
+            raise ValueError("invalid bridge nonce")
+        with self._transaction(immediate=True) as connection:
+            connection.execute("DELETE FROM baza_bridge_nonces WHERE expires_at < ?", (now,))
+            cursor = connection.execute(
+                "INSERT OR IGNORE INTO baza_bridge_nonces(key_id, nonce, expires_at) VALUES (?, ?, ?)",
+                (key_id, nonce, expires_at),
+            )
+            return cursor.rowcount == 1
 
     def _migration_marker_from_connection(
         self,
