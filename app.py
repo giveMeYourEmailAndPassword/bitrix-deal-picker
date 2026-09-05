@@ -21,6 +21,8 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import baza_bridge
+
 from state_store import (
     ExtraClaimGrantReconciliationRequiredError,
     ExtraClaimGrantUnavailableError,
@@ -276,6 +278,7 @@ EXTRA_CLAIM_REQUESTS_ENABLED = env_bool("EXTRA_CLAIM_REQUESTS_ENABLED", False)
 BAZA_API_BASE_URL = os.environ.get("BAZA_API_BASE_URL", "").strip().rstrip("/")
 BAZA_HMAC_SECRET = os.environ.get("BAZA_HMAC_SECRET", "")
 BAZA_HMAC_KEY_ID = os.environ.get("BAZA_HMAC_KEY_ID", "").strip()
+BAZA_PICKER_BRIDGE_SECRET = os.environ.get("BAZA_PICKER_BRIDGE_SECRET", "")
 BAZA_TIMEOUT_SECONDS = env_float("BAZA_TIMEOUT_SECONDS", 5, 1, 30)
 BAZA_MAX_RESPONSE_BYTES = env_int(
     "BAZA_MAX_RESPONSE_BYTES", 1024 * 1024, 4096, 5 * 1024 * 1024
@@ -4361,7 +4364,7 @@ def claim_operation_is_stale(operation, now=None):
     return (current.astimezone(timezone.utc) - updated_at.astimezone(timezone.utc)).total_seconds() > CLAIM_OPERATION_PENDING_TTL_SECONDS
 
 
-def preview_claim(deal_id, manager_id, auth=None, selection_token=None):
+def preview_claim(deal_id, manager_id, auth=None, selection_token=None, *, send_greeting=True):
     deal_id = normalize_entity_id(deal_id)
     manager_id = normalize_entity_id(manager_id)
     if not deal_id or not manager_id:
@@ -4369,6 +4372,7 @@ def preview_claim(deal_id, manager_id, auth=None, selection_token=None):
     selection = decode_selection_token(selection_token, deal_id, manager_id)
     if not selection:
         return {
+            "selectionStale": True,
             "ok": False,
             "message": "Выбор сделки устарел или не принадлежит этому пользователю. Получите сделку заново.",
             "_httpStatus": 403,
@@ -4378,10 +4382,11 @@ def preview_claim(deal_id, manager_id, auth=None, selection_token=None):
     operation_key = claim_operation_key(deal_id, selection_version)
     semantic_rejection = rejection_semantic_key(manager_id, deal_id, selection_version)
     greeting_snapshot = None
-    if GREETING_AUTO_SEND and GREETING_AUTO_SEND_SUPPORTED and not DRY_RUN:
+    if send_greeting and GREETING_AUTO_SEND and GREETING_AUTO_SEND_SUPPORTED and not DRY_RUN:
         greeting_snapshot = cached_greeting_context(deal_id, selection_version)
     if STATE_STORE.get_rejection_by_semantic_key(semantic_rejection):
         return {
+            "selectionStale": True,
             "ok": False,
             "message": "По этой версии сделки уже сохранён отказ. Получите другую заявку.",
             "_httpStatus": 409,
@@ -4402,6 +4407,7 @@ def preview_claim(deal_id, manager_id, auth=None, selection_token=None):
         # fast-path check above and this critical section.
         if STATE_STORE.get_rejection_by_semantic_key(semantic_rejection):
             return {
+                "selectionStale": True,
                 "ok": False,
                 "message": "По этой версии сделки уже сохранён отказ. Получите другую заявку.",
                 "_httpStatus": 409,
@@ -4429,6 +4435,7 @@ def preview_claim(deal_id, manager_id, auth=None, selection_token=None):
             if existing_operation.get("status") == "succeeded":
                 if existing_operation.get("managerId") != manager_id:
                     return {
+                        "selectionStale": True,
                         "ok": False,
                         "message": "Эту сделку уже взял другой менеджер.",
                         "_httpStatus": 409,
@@ -4445,6 +4452,7 @@ def preview_claim(deal_id, manager_id, auth=None, selection_token=None):
                 )
                 if not replay_marker_matches:
                     return {
+                        "selectionStale": True,
                         "ok": False,
                         "message": "Сделка изменилась после прошлого взятия. Получите её заново.",
                         "_httpStatus": 409,
@@ -4491,6 +4499,7 @@ def preview_claim(deal_id, manager_id, auth=None, selection_token=None):
                 access.get("rule"),
             ):
                 return {
+                    "selectionStale": True,
                     "ok": False,
                     "message": (
                         "Навыки или правила доступа изменились после выбора сделки. "
@@ -4501,6 +4510,7 @@ def preview_claim(deal_id, manager_id, auth=None, selection_token=None):
             if existing_operation and existing_operation.get("status") == "pending":
                 if not claim_operation_is_stale(existing_operation):
                     return {
+                        "recoveryPending": True,
                         "ok": False,
                         "message": "Сделка уже обрабатывается. Подождите несколько секунд и обновите страницу.",
                         "_httpStatus": 409,
@@ -4515,12 +4525,13 @@ def preview_claim(deal_id, manager_id, auth=None, selection_token=None):
         if success_result is None:
             deal = bitrix_call("crm.deal.get", {"id": deal_id})
             if not deal:
-                return {"ok": False, "message": "Сделка не найдена.", "_httpStatus": 404}
+                return {"selectionStale": True, "ok": False, "message": "Сделка не найдена.", "_httpStatus": 404}
             if (
                 str(deal.get("STAGE_ID") or "") in SOURCE_STAGES
                 and deal_version(deal) != selection_version
             ):
                 return {
+                    "selectionStale": True,
                     "ok": False,
                     "message": "Сделка изменилась после выбора. Получите её заново.",
                     "_httpStatus": 409,
@@ -4551,6 +4562,9 @@ def preview_claim(deal_id, manager_id, auth=None, selection_token=None):
                     or claim_operation_attempt_timestamp(existing_operation)
                 )
                 recovery_request = dict(existing_operation.get("request") or {})
+                if not send_greeting:
+                    recovery_request.pop("greetingRequested", None)
+                    recovery_request.pop("greetingContext", None)
                 recovery_request.update(
                     {"recovery": True, "claimMarker": expected_existing_marker}
                 )
@@ -4562,6 +4576,7 @@ def preview_claim(deal_id, manager_id, auth=None, selection_token=None):
                 )
                 if not operation.get("retried"):
                     return {
+                        "recoveryPending": True,
                         "ok": False,
                         "message": "Сделка уже обрабатывается. Повторите через несколько секунд.",
                         "_httpStatus": 409,
@@ -4608,12 +4623,14 @@ def preview_claim(deal_id, manager_id, auth=None, selection_token=None):
                     )
                     sys.stderr.write(f"Claim audit recovery failed: {type(exc).__name__}\n")
                     return {
+                        "recoveryPending": True,
                         "ok": False,
                         "message": "Сделка уже назначена, но журнал не восстановился. Сообщите администратору.",
                         "_httpStatus": 503,
                     }
                 if original_operation_manager != manager_id:
                     return {
+                        "selectionStale": True,
                         "ok": False,
                         "message": "Эту сделку уже взял другой менеджер.",
                         "_httpStatus": 409,
@@ -4679,6 +4696,7 @@ def preview_claim(deal_id, manager_id, auth=None, selection_token=None):
                 }
             elif current_stage not in SOURCE_STAGES:
                 return {
+                    "selectionStale": True,
                     "ok": False,
                     "dryRun": DRY_RUN,
                     "message": "Сделка уже ушла из доступной стадии. Получите другую сделку.",
@@ -4757,6 +4775,9 @@ def preview_claim(deal_id, manager_id, auth=None, selection_token=None):
                         "_httpStatus": 409,
                     }
             request_context = dict((existing_operation or {}).get("request") or {})
+            if not send_greeting:
+                request_context.pop("greetingRequested", None)
+                request_context.pop("greetingContext", None)
             request_context.update({
                 "dealId": deal_id,
                 "managerId": manager_id,
@@ -4805,6 +4826,7 @@ def preview_claim(deal_id, manager_id, auth=None, selection_token=None):
                     )
             except IdempotencyConflictError:
                 return {
+                    "recoveryPending": True,
                     "ok": False,
                     "message": "Эту сделку уже обрабатывает другой менеджер.",
                     "_httpStatus": 409,
@@ -4839,6 +4861,7 @@ def preview_claim(deal_id, manager_id, auth=None, selection_token=None):
                 if operation.get("status") == "succeeded":
                     if str(operation.get("managerId") or "") != manager_id:
                         return {
+                            "selectionStale": True,
                             "ok": False,
                             "message": "Эту сделку уже взял другой менеджер.",
                             "_httpStatus": 409,
@@ -4853,6 +4876,7 @@ def preview_claim(deal_id, manager_id, auth=None, selection_token=None):
                         != expected_race_marker
                     ):
                         return {
+                            "selectionStale": True,
                             "ok": False,
                             "message": "Сделка изменилась во время обработки. Получите её заново.",
                             "_httpStatus": 409,
@@ -4861,6 +4885,7 @@ def preview_claim(deal_id, manager_id, auth=None, selection_token=None):
                     success_result.update({"ok": True, "idempotentReplay": True})
                 else:
                     return {
+                        "recoveryPending": True,
                         "ok": False,
                         "message": "Сделка уже обрабатывается. Повторите через несколько секунд.",
                         "_httpStatus": 409,
@@ -4874,6 +4899,7 @@ def preview_claim(deal_id, manager_id, auth=None, selection_token=None):
             if not live_deal or str(live_deal.get("STAGE_ID") or "") not in SOURCE_STAGES:
                 fail_claim_operation_safely(operation_key, "stage_changed_before_update")
                 return {
+                    "selectionStale": True,
                     "ok": False,
                     "message": "Сделка изменилась до назначения. Получите другую сделку.",
                     "_httpStatus": 409,
@@ -4912,6 +4938,7 @@ def preview_claim(deal_id, manager_id, auth=None, selection_token=None):
                     {"remoteUpdated": False},
                 )
                 return {
+                    "selectionStale": True,
                     "ok": False,
                     "message": "Сделка изменилась до назначения. Получите её заново.",
                     "_httpStatus": 409,
@@ -5015,7 +5042,7 @@ def preview_claim(deal_id, manager_id, auth=None, selection_token=None):
                     "Сделка взята, но журнал временно не записался. Сообщите администратору."
                 )
 
-    if suppress_replay_greeting:
+    if suppress_replay_greeting or not send_greeting:
         return success_result
     return attach_greeting_to_claim(
         success_result,
@@ -5193,7 +5220,7 @@ def record_rejection(manager_id, payload):
     selection_token = payload.get("selectionToken")
     selection = decode_selection_token(selection_token, deal_id, manager_id)
     if not selection:
-        return {"ok": False, "message": "Выбор сделки устарел. Получите сделку заново."}
+        return {"selectionStale": True, "ok": False, "message": "Выбор сделки устарел. Получите сделку заново."}
     selection_version = str(selection.get("version") or "")
     semantic_key = rejection_semantic_key(manager_id, deal_id, selection_version)
     operation_key = claim_operation_key(deal_id, selection_version)
@@ -5222,6 +5249,7 @@ def record_rejection(manager_id, payload):
         ]
         if conflicting_deal_operations:
             return {
+                "recoveryPending": True,
                 "ok": False,
                 "message": (
                     "Предыдущая операция по этой сделке ещё сверяется с Bitrix24. "
@@ -5250,6 +5278,7 @@ def record_rejection(manager_id, payload):
             current_rule,
         ):
             return {
+                "selectionStale": True,
                 "ok": False,
                 "message": "Навыки или правила доступа изменились. Получите заявку заново.",
             }
@@ -5261,14 +5290,15 @@ def record_rejection(manager_id, payload):
             or claim_result.get("remoteUpdateUncertain")
         ):
             return {
+                "recoveryPending": True,
                 "ok": False,
                 "message": "Сделка уже находится в процессе взятия и не может быть одновременно отклонена.",
             }
         deal = bitrix_call("crm.deal.get", {"id": deal_id}) or {}
         if str(deal.get("STAGE_ID") or "") not in SOURCE_STAGES:
-            return {"ok": False, "message": "Сделка уже ушла из доступной стадии."}
+            return {"selectionStale": True, "ok": False, "message": "Сделка уже ушла из доступной стадии."}
         if deal_version(deal) != selection_version:
-            return {"ok": False, "message": "Сделка изменилась после выбора. Получите её заново."}
+            return {"selectionStale": True, "ok": False, "message": "Сделка изменилась после выбора. Получите её заново."}
         cached_deal = None
         with DEAL_ANALYSIS_CACHE_LOCK:
             cached = DEAL_ANALYSIS_CACHE.get(deal_id)
@@ -5735,6 +5765,59 @@ def readiness_state(*, force=False):
         return state
 
 
+def baza_picker_action(action, payload):
+    """Use the existing allocator as the trusted Baza actor, never browser OAuth."""
+    manager_id = normalize_entity_id(payload.get("bitrixUserId"))
+    if not manager_id:
+        return {"ok": False, "error": "invalid_actor", "message": "Не подтверждён менеджер Битрикс."}, 400
+    # Only the authenticated Baza backend supplies bitrixUserId. Client managerId,
+    # auth, user fields and arbitrary request parameters cannot select an actor.
+    command = {key: payload.get(key) for key in ("dealId", "selectionToken", "continuationToken", "reason")}
+    for key, maximum in (("dealId", 20), ("selectionToken", 4096), ("continuationToken", 4096), ("reason", 500)):
+        value = command[key]
+        if value is not None and (not isinstance(value, str) or len(value) > maximum):
+            return {"ok": False, "error": "invalid_payload", "message": "Некорректные параметры заявки."}, 400
+    if action == "status":
+        manager = get_manager_profile(manager_id)
+        if not manager or manager.get("active") is not True or manager.get("intranet") is not True:
+            return {"ok": False, "message": "Выдача доступна только активному сотруднику Битрикс."}, 403
+        extra = extra_claim_limit_state(manager_id, refresh=True)
+        return {
+            "ok": True,
+            "manager": manager,
+            "access": check_manager_access(manager_id),
+            "stats": {"takenToday": extra.get("takenToday"), "dailyLimit": extra.get("dailyLimit"), "businessDate": extra.get("businessDate")},
+            "extra": extra,
+            "dryRun": bool(DRY_RUN),
+        }, 200
+    if action in {"next", "claim"}:
+        extra = extra_claim_limit_state(manager_id, refresh=True) if EXTRA_CLAIM_REQUESTS_ENABLED else {"enabled": False}
+        # Same fail-closed transport guard as the existing /api/next-deal and
+        # /api/claim routes. The allocator still rechecks allowance under its lock.
+        if extra.get("enabled") and extra.get("limitReached") and extra.get("integrationUnavailable"):
+            message = "Не удалось подтвердить дополнительное разрешение в Базе. Ничего не изменено; повторите позже."
+            result = {
+                "ok": False, "message": message, "reason": message, "deal": None,
+                "limitReached": True, "takenToday": extra.get("takenToday"), "dailyLimit": extra.get("dailyLimit"),
+                "extraClaimEnabled": True, "extraClaimConfigured": bool(extra.get("configured")),
+                "extraClaimRequest": extra.get("request"), "extraClaimGrantAvailable": False, "integrationUnavailable": True,
+            }
+            return result, 503 if action == "claim" else 200
+        if action == "next":
+            result = get_next_deal_for_manager(manager_id, command["continuationToken"])
+        else:
+            result = preview_claim(command["dealId"], manager_id, selection_token=command["selectionToken"], send_greeting=False)
+    elif action == "reject":
+        result = record_rejection(manager_id, {key: command[key] for key in ("dealId", "selectionToken", "reason")})
+        return result, 200 if result.get("ok") else 400
+    elif action == "extra-request":
+        result = request_extra_claim(manager_id, command["reason"])
+    else:
+        return {"ok": False, "error": "not_found"}, 404
+    result = dict(result)
+    return result, int(result.pop("_httpStatus", 200))
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "KrugosvetDealPicker/1"
 
@@ -5872,6 +5955,9 @@ class Handler(BaseHTTPRequestHandler):
         parsed = safe_urlparse(self.path)
         if parsed is None:
             self.send_json({"ok": False, "message": "Некорректный URL запроса"}, 400)
+            return
+        if parsed.path.startswith(baza_bridge.PATH_PREFIX):
+            self.handle_baza_bridge(parsed)
             return
         if parsed.path in {"/", "/install"}:
             try:
@@ -6063,6 +6149,54 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 return
             self.send_json({"ok": False, "message": "Внутренняя ошибка сервиса"}, 500)
+
+    def handle_baza_bridge(self, parsed):
+        action = parsed.path[len(baza_bridge.PATH_PREFIX):]
+        if action not in baza_bridge.ACTIONS or parsed.query or parsed.fragment:
+            self.send_json({"ok": False, "error": "not_found"}, 404)
+            return
+        # This endpoint is server-to-server. It never accepts browser origins or
+        # Bitrix OAuth, and cannot be enabled by ALLOW_UNVERIFIED_USERS/DRY_RUN.
+        if self.headers.get("Origin"):
+            self.send_json({"ok": False, "error": "browser_request_denied"}, 403)
+            return
+        if not baza_bridge.configured(BAZA_PICKER_BRIDGE_SECRET):
+            self.send_json({"ok": False, "error": "bridge_not_configured"}, 503)
+            return
+        if not rate_limit_allowed(self.client_key()):
+            self.send_json({"ok": False, "error": "rate_limited"}, 429)
+            return
+        try:
+            if self.headers.get("Transfer-Encoding"):
+                raise baza_bridge.BridgeError("invalid_body", 400)
+            length = self.headers.get("Content-Length", "")
+            if not re.fullmatch(r"[0-9]{1,6}", length):
+                raise baza_bridge.BridgeError("invalid_body", 400)
+            if int(length) > baza_bridge.MAX_BODY_BYTES:
+                raise baza_bridge.BridgeError("body_too_large", 413)
+            content_type = str(self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+            if content_type != "application/json":
+                raise baza_bridge.BridgeError("json_required", 415)
+            raw = self.rfile.read(int(length))
+            if len(raw) != int(length):
+                raise baza_bridge.BridgeError("invalid_body", 400)
+            payload = baza_bridge.authenticate(parsed.path, raw, self.headers, BAZA_PICKER_BRIDGE_SECRET, STATE_STORE)
+            if not readiness_state().get("ok"):
+                self.send_json({"ok": False, "error": "service_not_ready"}, 503)
+                return
+            result, status = baza_picker_action(action, payload)
+            self.send_json(result, status)
+        except baza_bridge.BridgeError as exc:
+            self.send_json({"ok": False, "error": exc.code}, exc.status)
+        except PermissionError:
+            self.send_json({"ok": False, "error": "access_denied"}, 403)
+        except Exception as exc:
+            sys.stderr.write(f"Baza bridge {action}: {type(exc).__name__}\n")
+            self.send_json({
+                "ok": False, "error": "picker_unavailable",
+                "message": "Выдача заявок временно недоступна. Повторите позже.",
+                **({"recoveryPending": True} if action == "claim" else {}),
+            }, 503)
 
     def log_message(self, fmt, *args):
         # Railway already has request correlation at the edge.  Persisting a

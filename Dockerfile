@@ -20,11 +20,11 @@ WORKDIR /app
 
 # Runtime code only. Tests, secrets and local state are excluded by
 # .dockerignore; state.sqlite3 and legacy JSON belong on the Volume.
-COPY --chown=root:root app.py state_store.py ./
+COPY --chown=root:root app.py state_store.py baza_bridge.py ./
 COPY --chown=root:root managers.json ./seed-managers.json
 COPY --chown=root:root entrypoint.sh /usr/local/bin/bitrix-entrypoint
 
-RUN chmod 0444 /app/app.py /app/state_store.py /app/seed-managers.json \
+RUN chmod 0444 /app/app.py /app/state_store.py /app/baza_bridge.py /app/seed-managers.json \
     && chmod 0555 /usr/local/bin/bitrix-entrypoint \
     && install -d -o bitrix -g bitrix -m 0750 /data
 
