@@ -1488,7 +1488,7 @@ class TestClaimWorkflow(ClaimWorkflowTestCase):
         self.assertEqual(operation["status"], "failed")
         self.assertTrue(operation["result"]["recoveryRequired"])
 
-    def test_resolved_old_marker_allows_an_intentional_new_lifecycle(self):
+    def test_resolved_old_marker_never_allows_automatic_reissue_from_source_stage(self):
         old_version = "old-version"
         old_key = app.claim_operation_key(self.deal_id, old_version)
         old_marker = app.claim_attempt_marker(
@@ -1529,12 +1529,32 @@ class TestClaimWorkflow(ClaimWorkflowTestCase):
                 selection_token=self.token(),
             )
 
-        self.assertTrue(result["ok"])
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "deal_already_claimed")
+        self.assertTrue(result["selectionStale"])
         self.assertEqual(
             [item.args[0] for item in bitrix_call.call_args_list].count("crm.deal.update"),
-            1,
+            0,
         )
-        self.assertEqual(self.store.get_claim_operation(self.operation_key())["status"], "succeeded")
+        self.assertIsNone(self.store.get_claim_operation(self.operation_key()))
+        self.assertEqual(self.store.count_claims(self.manager_id), 1)
+
+    def test_claim_rechecks_durable_success_after_another_instance_finishes_during_crm_read(self):
+        other = StateStore(self.store.data_dir)
+        previous_key = "claim:100:other-instance"
+
+        def read_and_finish(method, params=None, timeout=None):
+            self.assertEqual(method, "crm.deal.get")
+            other.begin_claim_operation(self.deal_id, "other-manager", operation_key=previous_key)
+            other.finalize_claim_operation(previous_key, claim={})
+            return self.source_deal()
+
+        with self.common_claim_context(), patch.object(app, "bitrix_call", side_effect=read_and_finish) as bitrix:
+            result = app.preview_claim(self.deal_id, self.manager_id, selection_token=self.token())
+        self.assertEqual(result["code"], "deal_already_claimed")
+        self.assertFalse(result["ok"])
+        self.assertEqual([call.args[0] for call in bitrix.call_args_list], ["crm.deal.get"])
+        self.assertIsNone(self.store.get_claim_operation(self.operation_key()))
 
     def test_dry_run_never_updates_crm_or_writes_claim_event(self):
         token = self.token()
@@ -3076,6 +3096,27 @@ class TestSearchContinuation(TemporaryStateTestCase):
 
         self.assertEqual(result["deal"]["id"], "2")
 
+    def test_previously_claimed_source_deal_is_not_offered_after_a_cache_refresh(self):
+        headers = [
+            {"ID": "1", "STAGE_ID": next(iter(app.SOURCE_STAGES)), "DATE_MODIFY": "v2"},
+            {"ID": "2", "STAGE_ID": next(iter(app.SOURCE_STAGES)), "DATE_MODIFY": "v1"},
+        ]
+        self.store.append_claim({"dealId": "1", "managerId": "previous-manager"})
+        manager = {"id": "42", "active": True, "intranet": True, "competencies": ["Турция"]}
+
+        def analyze(batch):
+            self.assertEqual([item["ID"] for item in batch], ["2"])
+            return {"2": self._deal(headers[1], "Турция")}, {}
+
+        with (
+            patch.object(app, "get_manager_profile", return_value=manager),
+            patch.object(app, "check_manager_access", return_value={"ok": True, "rule": {}}),
+            patch.object(app, "list_allowed_deal_headers", return_value=headers),
+            patch.object(app, "analyze_deal_headers", side_effect=analyze),
+        ):
+            result = app._get_next_deal_for_manager("42")
+        self.assertEqual(result["deal"]["id"], "2")
+
     def test_profile_policy_change_invalidates_cursor_instead_of_skipping_oldest(self):
         headers = [
             {"ID": "1", "STAGE_ID": next(iter(app.SOURCE_STAGES)), "DATE_MODIFY": "v1"},
@@ -4131,6 +4172,72 @@ class TestGreetingOutboxWorker(ClaimWorkflowTestCase):
         audit = self.store.latest_greeting_by_operation(self.operation_key())
         self.assertEqual(audit["status"], "manual")
         self.assertFalse(audit["autoSent"])
+
+    def test_worker_unaccepted_chat_becomes_manual_without_join_or_send(self):
+        self.seed_greeting_outbox()
+
+        def fake_bitrix(method, params=None, timeout=None):
+            if method == "crm.deal.get":
+                return self.claimed_deal()
+            if method == "imopenlines.session.history.get":
+                return self.official_history()
+            if method == "imopenlines.crm.chat.get":
+                self.assertEqual(params["ACTIVE_ONLY"], "Y")
+                return []
+            if method == "imopenlines.crm.chat.getLastId":
+                return 1763
+            raise AssertionError(f"unexpected mutation for unaccepted chat: {method}")
+
+        with (
+            patch.multiple(app, DRY_RUN=False, GREETING_AUTO_SEND=True, GREETING_AUTO_SEND_SUPPORTED=True),
+            patch.object(app, "get_greeting_manager_profile", return_value=self.active_manager()),
+            patch.object(app, "bitrix_call", side_effect=fake_bitrix) as bitrix,
+        ):
+            app.process_greeting_outbox_once(worker_token="worker-1")
+            replay = app.attach_greeting_to_claim(
+                {"ok": True, "auditRecorded": True, "dealId": self.deal_id},
+                self.manager_id, self.deal_id, None, self.operation_key(),
+            )
+            second = app.process_greeting_outbox_once(worker_token="worker-2")
+
+        job = self.store.get_greeting_outbox(self.operation_key())
+        self.assertEqual(job["status"], "manual")
+        self.assertEqual(job["errorCode"], "chat_not_latest_active_for_deal")
+        self.assertEqual(second["leased"], 0)
+        self.assertEqual(replay["greeting"]["status"], "manual")
+        self.assertFalse(replay["greeting"]["autoSent"])
+        self.assertIn("Проверьте чат", replay["greeting"]["message"])
+        self.assertEqual([item.args[0] for item in bitrix.call_args_list], [
+            "crm.deal.get", "imopenlines.session.history.get",
+            "imopenlines.crm.chat.get", "imopenlines.crm.chat.getLastId",
+        ])
+
+    def test_worker_rechecks_assignment_stage_and_marker_after_chat_resolution(self):
+        for index, (field, changed) in enumerate([
+            ("ASSIGNED_BY_ID", "another-manager"),
+            ("STAGE_ID", "LOSE"),
+            (app.BITRIX_CLAIM_MARKER_FIELD, "another-operation"),
+        ]):
+            with self.subTest(field=field):
+                self.deal_id = str(100 + index)
+                self.seed_greeting_outbox()
+                live = self.claimed_deal()
+
+                def resolve_and_change(*args):
+                    live[field] = changed
+                    return {"chatId": "1763", "sessionId": "321"}
+
+                with (
+                    patch.multiple(app, DRY_RUN=False, GREETING_AUTO_SEND=True, GREETING_AUTO_SEND_SUPPORTED=True),
+                    patch.object(app, "get_greeting_manager_profile", return_value=self.active_manager()),
+                    patch.object(app, "resolve_greeting_target", side_effect=resolve_and_change),
+                    patch.object(app, "bitrix_call", side_effect=lambda *args, **kwargs: dict(live)) as bitrix,
+                    patch.object(app, "send_greeting_message") as send,
+                ):
+                    app.process_greeting_outbox_once(worker_token="worker-1")
+                send.assert_not_called()
+                self.assertEqual([call.args[0] for call in bitrix.call_args_list], ["crm.deal.get", "crm.deal.get"])
+                self.assertEqual(self.store.get_greeting_outbox(self.operation_key())["status"], "manual")
 
     def test_send_exception_is_uncertain_and_never_automatically_retried(self):
         self.seed_greeting_outbox()

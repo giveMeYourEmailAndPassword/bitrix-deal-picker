@@ -10,7 +10,7 @@ import time
 KEY_ID = "baza-picker-v1"
 MAX_BODY_BYTES = 16_384
 MAX_CLOCK_SKEW_SECONDS = 300
-ACTIONS = frozenset({"status", "next", "claim", "reject", "extra-request"})
+ACTIONS = frozenset({"status", "next", "claim", "reject", "extra-request", "greeting-status"})
 PATH_PREFIX = "/integrations/baza/v1/"
 
 
