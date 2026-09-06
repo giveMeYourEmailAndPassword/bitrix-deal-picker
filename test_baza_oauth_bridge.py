@@ -59,14 +59,14 @@ class TestBazaOAuthBridge(unittest.TestCase):
         self.assertNotIn("Authorization", request.headers)
         self.assertLessEqual(send.call_args.kwargs["timeout"], 20)
         self.assertEqual(backend.read.call_args.args, (4097,))
-        self.assertEqual(HandlerHarness.status(handler), 200)
+        self.assertEqual(HandlerHarness.status(handler), 303)
         body = handler.wfile.getvalue().decode()
-        self.assertIn("Битрикс подключён", body)
-        self.assertIn('history.replaceState(null,"","/")', body)
-        self.assertIn('href="https://baza.krugo.tours/chats"', body)
-        for secret in (CODE, STATE, "must-not-forward", "untrusted.invalid"):
-            self.assertNotIn(secret, body)
+        self.assertEqual(body, "")
         headers = dict(HandlerHarness.headers(handler))
+        self.assertEqual(headers["Location"], "https://baza.krugo.tours/chats")
+        self.assertEqual(headers["Content-Length"], "0")
+        for secret in (CODE, STATE, "must-not-forward", "untrusted.invalid"):
+            self.assertNotIn(secret, body + json.dumps(headers))
         self.assertEqual(headers["Cache-Control"], "no-store")
         self.assertEqual(headers["Referrer-Policy"], "no-referrer")
         self.assertIn("default-src 'none'", headers["Content-Security-Policy"])
@@ -83,6 +83,7 @@ class TestBazaOAuthBridge(unittest.TestCase):
                 handler = self.handler()
                 handler.do_GET()
                 self.assertEqual(HandlerHarness.status(handler), 503)
+                self.assertNotIn("Location", dict(HandlerHarness.headers(handler)))
                 opener.assert_not_called()
 
     def test_malformed_or_duplicate_baza_credentials_do_not_reach_backend(self):
@@ -98,6 +99,7 @@ class TestBazaOAuthBridge(unittest.TestCase):
                 handler = self.handler(query)
                 handler.do_GET()
                 self.assertEqual(HandlerHarness.status(handler), 400)
+                self.assertNotIn("Location", dict(HandlerHarness.headers(handler)))
                 opener.assert_not_called()
 
     def test_ordinary_picker_get_and_install_post_are_preserved(self):
@@ -134,6 +136,7 @@ class TestBazaOAuthBridge(unittest.TestCase):
                     handler.log_message("untrusted %s", CODE + STATE)
                 send.assert_called_once()
                 self.assertEqual(HandlerHarness.status(handler), 502)
+                self.assertNotIn("Location", dict(HandlerHarness.headers(handler)))
                 body = handler.wfile.getvalue().decode()
                 self.assertIn("Проверьте подключение", body)
                 for secret in (CODE, STATE, "must-not-reflect"):
@@ -164,8 +167,9 @@ class TestBazaOAuthBridge(unittest.TestCase):
             second = self.handler()
             second.do_GET()
         self.assertEqual(send.call_count, 2)  # One attempt per navigation, never an automatic retry.
-        self.assertEqual(HandlerHarness.status(first), 200)
+        self.assertEqual(HandlerHarness.status(first), 303)
         self.assertEqual(HandlerHarness.status(second), 502)
+        self.assertNotIn("Location", dict(HandlerHarness.headers(second)))
         self.assertNotIn(CODE, second.wfile.getvalue().decode())
         ordinary = self.handler("")
         ordinary.send_html = MagicMock()
@@ -177,7 +181,24 @@ class TestBazaOAuthBridge(unittest.TestCase):
             handler = self.handler()
             handler.do_GET()
         self.assertEqual(HandlerHarness.status(handler), 429)
+        self.assertNotIn("Location", dict(HandlerHarness.headers(handler)))
         opener.assert_not_called()
+
+    def test_only_confirmed_success_redirects_and_errors_retain_safe_html(self):
+        for connected, status in ((False, 200), (False, 502), (True, 502), (True, 303), (1, 200)):
+            with self.subTest(connected=connected, status=status):
+                handler = self.handler()
+                handler.send_baza_oauth_result(connected, status)
+                headers = dict(HandlerHarness.headers(handler))
+                self.assertNotIn("Location", headers)
+                self.assertEqual(headers["Cache-Control"], "no-store")
+                self.assertEqual(headers["Referrer-Policy"], "no-referrer")
+                body = handler.wfile.getvalue().decode()
+                self.assertIn("Проверьте подключение", body)
+                self.assertIn('history.replaceState(null,"","/")', body)
+                self.assertIn('href="https://baza.krugo.tours/chats"', body)
+                self.assertNotIn(CODE, body + json.dumps(headers))
+                self.assertNotIn(STATE, body + json.dumps(headers))
 
 
 if __name__ == "__main__":

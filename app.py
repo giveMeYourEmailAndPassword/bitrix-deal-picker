@@ -285,6 +285,7 @@ BAZA_OAUTH_APPROVED_CALLBACK_URL = (
     "https://contracts-backend-production-f1a9.up.railway.app"
     "/integrations/bitrix-oauth/callback"
 )
+BAZA_OAUTH_CHATS_URL = "https://baza.krugo.tours/chats"
 BAZA_OAUTH_CALLBACK_TIMEOUT_SECONDS = 15
 BAZA_OAUTH_CALLBACK_MAX_RESPONSE_BYTES = 4096
 BAZA_TIMEOUT_SECONDS = env_float("BAZA_TIMEOUT_SECONDS", 5, 1, 30)
@@ -6034,13 +6035,19 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def send_baza_oauth_result(self, connected, status):
+        if connected is True and status == 200:
+            self.send_response(303)
+            self.send_common_headers()
+            self.send_header("Location", BAZA_OAUTH_CHATS_URL)
+            self.send_header("Content-Security-Policy", "; ".join((
+                "default-src 'none'", "frame-ancestors 'none'", "base-uri 'none'", "form-action 'none'",
+            )))
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         nonce = secrets.token_urlsafe(24)
-        title = "Битрикс подключён" if connected else "Проверьте подключение в Базе"
-        message = (
-            "Вернитесь в Базу, чтобы продолжить работу с чатами."
-            if connected else
-            "Не удалось подтвердить подключение. Вернитесь в Базу и при необходимости подключитесь снова."
-        )
+        title = "Проверьте подключение в Базе"
+        message = "Не удалось подтвердить подключение. Вернитесь в Базу и при необходимости подключитесь снова."
         body = (
             '<!doctype html><html lang="ru"><head><meta charset="utf-8">'
             '<meta name="viewport" content="width=device-width,initial-scale=1">'
@@ -6048,7 +6055,7 @@ class Handler(BaseHTTPRequestHandler):
             'body{font:18px/1.5 system-ui,sans-serif;max-width:560px;margin:12vh auto;padding:24px;color:#172033}'
             'a{display:inline-block;margin-top:16px;color:#1859b8}</style></head><body>'
             f'<h1>{title}</h1><p>{message}</p>'
-            '<a href="https://baza.krugo.tours/chats" target="_top" rel="noreferrer">Вернуться в Базу</a>'
+            f'<a href="{BAZA_OAUTH_CHATS_URL}" target="_top" rel="noreferrer">Вернуться в Базу</a>'
             f'<script nonce="{nonce}">history.replaceState(null,"","/");</script>'
             '</body></html>'
         ).encode("utf-8")
