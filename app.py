@@ -29,6 +29,7 @@ from state_store import (
     ExtraClaimGrantUnavailableError,
     IdempotencyConflictError,
     StateStore,
+    normalize_claim_export_from,
 )
 
 
@@ -276,6 +277,11 @@ CLAIM_RECONCILE_INTERVAL_SECONDS = env_float(
 CLAIM_RECONCILE_BATCH_SIZE = env_int("CLAIM_RECONCILE_BATCH_SIZE", 100, 1, 1000)
 CLAIM_EVENT_EXPORT_ENABLED = env_bool("CLAIM_EVENT_EXPORT_ENABLED", False)
 EXTRA_CLAIM_REQUESTS_ENABLED = env_bool("EXTRA_CLAIM_REQUESTS_ENABLED", False)
+try:
+    BAZA_CLAIM_EXPORT_FROM = normalize_claim_export_from(os.environ.get("BAZA_CLAIM_EXPORT_FROM"))
+except ValueError:
+    INVALID_ENV_VALUES.add("BAZA_CLAIM_EXPORT_FROM")
+    BAZA_CLAIM_EXPORT_FROM = None
 BAZA_API_BASE_URL = os.environ.get("BAZA_API_BASE_URL", "").strip().rstrip("/")
 BAZA_HMAC_SECRET = os.environ.get("BAZA_HMAC_SECRET", "")
 BAZA_HMAC_KEY_ID = os.environ.get("BAZA_HMAC_KEY_ID", "").strip()
@@ -526,6 +532,7 @@ def baza_integration_enabled():
 def baza_integration_configured():
     return bool(
         baza_base_url_valid()
+        and "BAZA_CLAIM_EXPORT_FROM" not in INVALID_ENV_VALUES
         and BAZA_HMAC_KEY_ID
         and len(BAZA_HMAC_SECRET.encode("utf-8")) >= 32
         and "REPLACE" not in BAZA_HMAC_SECRET.upper()
@@ -1302,6 +1309,8 @@ def flush_integration_outbox(limit=None, *, kinds=None, dedupe_key=None):
         limit=limit or INTEGRATION_OUTBOX_BATCH_SIZE,
         kinds=delivery_kinds,
         dedupe_key=dedupe_key,
+        claim_export_from=BAZA_CLAIM_EXPORT_FROM,
+        preserve_grant_claims=EXTRA_CLAIM_REQUESTS_ENABLED,
     ):
         try:
             outcome = _deliver_integration_outbox_item(item)
