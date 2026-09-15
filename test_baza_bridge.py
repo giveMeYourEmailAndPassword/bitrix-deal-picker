@@ -287,6 +287,29 @@ class TestBazaBridgeAuthentication(TemporaryStateTestCase):
         profile.assert_called_once_with("42")
         daily.assert_called_once_with("42", refresh=True)
 
+    def test_failed_profile_lookup_is_503_for_signed_status_and_next(self):
+        for action in ("status", "next"):
+            with self.subTest(action=action):
+                handler = self.handler(action)
+                with (
+                    patch.object(app, "EXTRA_CLAIM_REQUESTS_ENABLED", False),
+                    patch.object(app, "load_managers", return_value=[]),
+                    patch.object(app, "bitrix_call", side_effect=TimeoutError("private upstream URL")) as upstream,
+                    patch.object(app, "check_manager_access") as access,
+                    patch.object(app, "list_allowed_deal_headers") as search,
+                    patch.object(app.sys.stderr, "write"),
+                ):
+                    handler.do_POST()
+                result = HandlerHarness.json(handler)
+                self.assertEqual(HandlerHarness.status(handler), 503)
+                self.assertEqual(result["error"], "manager_profile_unavailable")
+                self.assertNotIn("деактивирован", str(result))
+                self.assertNotIn("private upstream URL", str(result))
+                self.assertNotIn("_httpStatus", result)
+                upstream.assert_called_once_with("user.get", {"ID": "42"}, timeout=app.BITRIX_FAST_TIMEOUT_SECONDS)
+                access.assert_not_called()
+                search.assert_not_called()
+
     def test_reject_and_extra_request_delegate_to_original_commands(self):
         for action in ("reject", "extra-request"):
             with self.subTest(action=action):
