@@ -89,6 +89,21 @@ def _json_dumps(value: Any) -> str:
     )
 
 
+def normalize_claim_export_from(value: Optional[str]) -> Optional[str]:
+    """Optional UTC boundary, at the canonical claim payload's millisecond precision."""
+    if value in (None, ""):
+        return None
+    if not isinstance(value, str) or not re.fullmatch(
+        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:Z|\+00:00)", value
+    ):
+        raise ValueError("BAZA_CLAIM_EXPORT_FROM must be a UTC ISO timestamp")
+    try:
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00" if value.endswith("Z") else value)
+    except ValueError as exc:
+        raise ValueError("BAZA_CLAIM_EXPORT_FROM must be a UTC ISO timestamp") from exc
+    return parsed.isoformat(timespec="milliseconds")
+
+
 class StateStore:
     """Connection-per-operation SQLite store.
 
@@ -2388,6 +2403,8 @@ class StateStore:
         limit: int = 20,
         kinds: Optional[Iterable[str]] = None,
         dedupe_key: Optional[str] = None,
+        claim_export_from: Optional[str] = None,
+        preserve_grant_claims: bool = False,
     ) -> list[Dict[str, Any]]:
         self._ensure_ready()
         now = now or self._now_iso()
@@ -2397,6 +2414,18 @@ class StateStore:
             "next_attempt_at <= ?",
         ]
         params: list[Any] = [now]
+        cutoff = normalize_claim_export_from(claim_export_from)
+        if cutoff is not None:
+            # Filter before LIMIT. Deferred history remains pending and untouched;
+            # a later audit recovery is dated by the original canonical occurrence.
+            # Extra-grant consumption keeps its established recovery path only
+            # while the caller has enabled that separate feature.
+            clauses.append("""(kind != 'claim_event' OR CASE WHEN json_valid(payload_json) THEN (
+                (? = 1 AND json_type(payload_json, '$.extraClaimRequestId') = 'text'
+                    AND length(json_extract(payload_json, '$.extraClaimRequestId')) > 0)
+                OR julianday(json_extract(payload_json, '$.occurredAt')) >= julianday(?)
+            ) ELSE 0 END)""")
+            params.extend([int(preserve_grant_claims is True), cutoff])
         if kinds is not None:
             normalized_kinds = tuple(
                 kind for kind in (str(item) for item in kinds) if kind in {"extra_claim_request", "claim_event"}
@@ -2691,12 +2720,15 @@ class StateStore:
         limit: int = 1,
         lease_seconds: int = 60,
         max_attempts: int = 3,
+        activation_max_attempts: Optional[int] = None,
         now: Optional[Any] = None,
     ) -> list[Dict[str, Any]]:
         """Atomically lease eligible pre-send jobs to one worker.
 
         A stale ``checking`` lease is safe to retry because dispatch has not
         started.  ``dispatching`` is deliberately never selected here.
+        Only a recorded activation wait gets the larger readiness allowance;
+        retain that classification during its lease in case the worker dies.
         """
 
         self._ensure_ready()
@@ -2708,6 +2740,10 @@ class StateStore:
             return []
         lease_seconds = max(1, min(3600, int(lease_seconds)))
         max_attempts = max(1, min(100, int(max_attempts)))
+        activation_max_attempts = (
+            max_attempts if activation_max_attempts is None
+            else max(1, min(100, int(activation_max_attempts)))
+        )
         now_dt = self._outbox_datetime(now)
         now_iso = self._outbox_time(now_dt)
         expires_iso = self._outbox_time(now_dt + timedelta(seconds=lease_seconds))
@@ -2722,14 +2758,16 @@ class StateStore:
                     updated_at=?, finalized_at=?
                 WHERE status='checking'
                   AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?
-                  AND attempt_count >= ?
+                  AND attempt_count >= CASE WHEN error_code='chat_activation_pending'
+                    THEN ? ELSE ? END
                 """,
-                (now_iso, now_iso, now_iso, max_attempts),
+                (now_iso, now_iso, now_iso, activation_max_attempts, max_attempts),
             )
             rows = connection.execute(
                 """
                 SELECT operation_key FROM greeting_outbox
-                WHERE attempt_count < ? AND (
+                WHERE attempt_count < CASE WHEN error_code='chat_activation_pending'
+                    THEN ? ELSE ? END AND (
                     (status='pending' AND (
                         next_attempt_at IS NULL OR next_attempt_at <= ?
                     )) OR
@@ -2739,7 +2777,7 @@ class StateStore:
                 ORDER BY created_at, operation_key
                 LIMIT ?
                 """,
-                (max_attempts, now_iso, now_iso, limit),
+                (activation_max_attempts, max_attempts, now_iso, now_iso, limit),
             ).fetchall()
             leased: list[Dict[str, Any]] = []
             for candidate in rows:
@@ -2749,8 +2787,11 @@ class StateStore:
                     UPDATE greeting_outbox SET
                         status='checking', attempt_count=attempt_count + 1,
                         lease_token=?, leased_at=?, lease_expires_at=?,
-                        next_attempt_at=NULL, error_code='', updated_at=?
-                    WHERE operation_key=? AND attempt_count < ? AND (
+                        next_attempt_at=NULL,
+                        error_code=CASE WHEN error_code='chat_activation_pending'
+                            THEN error_code ELSE '' END, updated_at=?
+                    WHERE operation_key=? AND attempt_count < CASE
+                        WHEN error_code='chat_activation_pending' THEN ? ELSE ? END AND (
                         (status='pending' AND (
                             next_attempt_at IS NULL OR next_attempt_at <= ?
                         )) OR
@@ -2764,6 +2805,7 @@ class StateStore:
                         expires_iso,
                         now_iso,
                         operation_key,
+                        activation_max_attempts,
                         max_attempts,
                         now_iso,
                         now_iso,

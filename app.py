@@ -29,6 +29,7 @@ from state_store import (
     ExtraClaimGrantUnavailableError,
     IdempotencyConflictError,
     StateStore,
+    normalize_claim_export_from,
 )
 
 
@@ -206,6 +207,10 @@ GREETING_AUTO_SEND_SUPPORTED = True
 GREETING_WORKER_POLL_SECONDS = env_float(
     "GREETING_WORKER_POLL_SECONDS", 1, 0.25, 30
 )
+# Baza accepts/pins the claimed dialog asynchronously after the picker replies.
+# Only pre-send readiness may wait; never turn this into an outbound retry.
+GREETING_ACTIVATION_MAX_ATTEMPTS = 12
+GREETING_DELIVERY_WINDOW_SECONDS = 120
 GREETING_ACTOR_THREAD_LIMIT = env_int("GREETING_ACTOR_THREAD_LIMIT", 8, 1, 32)
 GREETING_ACTOR_THREAD_SLOTS = threading.BoundedSemaphore(
     GREETING_ACTOR_THREAD_LIMIT
@@ -276,10 +281,23 @@ CLAIM_RECONCILE_INTERVAL_SECONDS = env_float(
 CLAIM_RECONCILE_BATCH_SIZE = env_int("CLAIM_RECONCILE_BATCH_SIZE", 100, 1, 1000)
 CLAIM_EVENT_EXPORT_ENABLED = env_bool("CLAIM_EVENT_EXPORT_ENABLED", False)
 EXTRA_CLAIM_REQUESTS_ENABLED = env_bool("EXTRA_CLAIM_REQUESTS_ENABLED", False)
+try:
+    BAZA_CLAIM_EXPORT_FROM = normalize_claim_export_from(os.environ.get("BAZA_CLAIM_EXPORT_FROM"))
+except ValueError:
+    INVALID_ENV_VALUES.add("BAZA_CLAIM_EXPORT_FROM")
+    BAZA_CLAIM_EXPORT_FROM = None
 BAZA_API_BASE_URL = os.environ.get("BAZA_API_BASE_URL", "").strip().rstrip("/")
 BAZA_HMAC_SECRET = os.environ.get("BAZA_HMAC_SECRET", "")
 BAZA_HMAC_KEY_ID = os.environ.get("BAZA_HMAC_KEY_ID", "").strip()
 BAZA_PICKER_BRIDGE_SECRET = os.environ.get("BAZA_PICKER_BRIDGE_SECRET", "")
+BAZA_OAUTH_CALLBACK_URL = os.environ.get("BAZA_OAUTH_CALLBACK_URL", "").strip()
+BAZA_OAUTH_APPROVED_CALLBACK_URL = (
+    "https://contracts-backend-production-f1a9.up.railway.app"
+    "/integrations/bitrix-oauth/callback"
+)
+BAZA_OAUTH_CHATS_URL = "https://baza.krugo.tours/chats"
+BAZA_OAUTH_CALLBACK_TIMEOUT_SECONDS = 15
+BAZA_OAUTH_CALLBACK_MAX_RESPONSE_BYTES = 4096
 BAZA_TIMEOUT_SECONDS = env_float("BAZA_TIMEOUT_SECONDS", 5, 1, 30)
 BAZA_MAX_RESPONSE_BYTES = env_int(
     "BAZA_MAX_RESPONSE_BYTES", 1024 * 1024, 4096, 5 * 1024 * 1024
@@ -518,6 +536,7 @@ def baza_integration_enabled():
 def baza_integration_configured():
     return bool(
         baza_base_url_valid()
+        and "BAZA_CLAIM_EXPORT_FROM" not in INVALID_ENV_VALUES
         and BAZA_HMAC_KEY_ID
         and len(BAZA_HMAC_SECRET.encode("utf-8")) >= 32
         and "REPLACE" not in BAZA_HMAC_SECRET.upper()
@@ -1294,6 +1313,8 @@ def flush_integration_outbox(limit=None, *, kinds=None, dedupe_key=None):
         limit=limit or INTEGRATION_OUTBOX_BATCH_SIZE,
         kinds=delivery_kinds,
         dedupe_key=dedupe_key,
+        claim_export_from=BAZA_CLAIM_EXPORT_FROM,
+        preserve_grant_claims=EXTRA_CLAIM_REQUESTS_ENABLED,
     ):
         try:
             outcome = _deliver_integration_outbox_item(item)
@@ -2991,6 +3012,11 @@ def resolve_greeting_target(deal_id, manager_id, context):
     last_chat_id = normalize_entity_id(
         bitrix_call("imopenlines.crm.chat.getLastId", crm_params)
     )
+    if chat_id and last_chat_id == chat_id and not active_chat_ids:
+        # The exact, still-latest, writable DEAL-bound dialog is not accepted
+        # yet. Do not join/send through another identity; let Baza finish its
+        # independently authorized operator preparation, then re-read evidence.
+        raise RuntimeError("chat_activation_pending")
     if not chat_id or chat_id not in active_chat_ids or last_chat_id != chat_id:
         raise RuntimeError("chat_not_latest_active_for_deal")
 
@@ -3841,15 +3867,30 @@ GREETING_TERMINAL_PREFLIGHT_ERRORS = {
     "claim_marker_mismatch",
     "manager_not_active",
     "manager_access_revoked",
+    "greeting_window_expired",
 }
+GREETING_RETRYABLE_PREFLIGHT_ERRORS = {"chat_activation_pending"}
 
 
 def greeting_machine_error(exc, fallback="greeting_preflight_failed"):
     raw = str(exc or "").strip()
-    for code in GREETING_TERMINAL_PREFLIGHT_ERRORS:
+    for code in GREETING_TERMINAL_PREFLIGHT_ERRORS | GREETING_RETRYABLE_PREFLIGHT_ERRORS:
         if code in raw:
             return code
     return fallback
+
+
+def require_recent_greeting(job):
+    """A delayed worker must not surprise a client with an old greeting."""
+    try:
+        created = datetime.fromisoformat(str(job.get("createdAt") or "").replace("Z", "+00:00"))
+        if created.tzinfo is None:
+            raise ValueError("missing timezone")
+        age = (datetime.now(timezone.utc) - created.astimezone(timezone.utc)).total_seconds()
+        if age < 0 or age >= GREETING_DELIVERY_WINDOW_SECONDS:
+            raise ValueError("outside greeting window")
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise RuntimeError("greeting_window_expired") from exc
 
 
 def append_greeting_delivery_audit(job, manager, *, status, auto_sent, message, error_code=""):
@@ -4108,6 +4149,7 @@ def process_greeting_outbox_job(job, worker_token):
     manager_id = normalize_entity_id(job.get("managerId"))
     manager = None
     try:
+        require_recent_greeting(job)
         operation = STATE_STORE.get_claim_operation(operation_key)
         if not operation or operation.get("status") != "succeeded":
             raise RuntimeError("claim_operation_not_succeeded")
@@ -4175,6 +4217,7 @@ def process_greeting_outbox_job(job, worker_token):
             or str(latest_deal.get(BITRIX_CLAIM_MARKER_FIELD) or "") != expected_marker
         ):
             raise RuntimeError("claim_marker_mismatch")
+        require_recent_greeting(job)
     except Exception as exc:
         code = greeting_machine_error(exc)
         try:
@@ -4189,8 +4232,8 @@ def process_greeting_outbox_job(job, worker_token):
                     operation_key,
                     worker_token,
                     error_code=code,
-                    delay_seconds=5,
-                    max_attempts=3,
+                    delay_seconds=10 if code == "chat_activation_pending" else 5,
+                    max_attempts=GREETING_ACTIVATION_MAX_ATTEMPTS if code == "chat_activation_pending" else 3,
                 )
         except Exception as state_exc:
             sys.stderr.write(
@@ -4274,6 +4317,7 @@ def process_greeting_outbox_once(worker_token=None, limit=1):
         limit=max(1, int(limit)),
         lease_seconds=max(30, int(BITRIX_TIMEOUT_SECONDS * 8)),
         max_attempts=3,
+        activation_max_attempts=GREETING_ACTIVATION_MAX_ATTEMPTS,
     )
     processed = 0
     for job in jobs:
@@ -4317,13 +4361,19 @@ def public_claim_greeting(job):
     if status in {"pending", "checking", "dispatching"}:
         return {
             "ok": True, "status": "queued", "autoSent": False, "text": "",
-            "message": "Приветствие отправляется в фоне.",
+            "message": "Ожидаем готовности диалога в Битриксе для приветствия." if job.get("errorCode") == "chat_activation_pending" else "Приветствие отправляется в фоне.",
         }
     if status == "sent":
         return {
             "ok": True, "status": "sent", "autoSent": True,
             "text": job.get("text") or "",
             "message": "Приветствие автоматически отправлено клиенту.",
+        }
+    if status == "manual" and job.get("errorCode") in {"chat_activation_pending", "greeting_window_expired"}:
+        return {
+            "ok": True, "status": "manual", "autoSent": False,
+            "text": job.get("text") or "",
+            "message": "Приветствие не отправлено: диалог не был готов вовремя. Проверьте подключение Битрикса и переписку перед ручной отправкой.",
         }
     return {
         "ok": True, "status": status, "autoSent": False,
@@ -5880,6 +5930,71 @@ def baza_picker_action(action, payload):
     return result, int(result.pop("_httpStatus", 200))
 
 
+class BazaOAuthNoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # The one-time code must never follow a backend redirect elsewhere.
+        return None
+
+
+def baza_oauth_callback_payload(query):
+    """Recognize only Baza's nonce namespace; retain the ordinary picker flow."""
+    if len(query) > 8192:
+        return None
+    try:
+        params = urllib.parse.parse_qs(query, keep_blank_values=True, max_num_fields=32)
+    except ValueError:
+        return None
+    states = params.get("state", [])
+    if not any(state.startswith("baza_") for state in states):
+        return None
+    codes = params.get("code", [])
+    if (
+        len(states) != 1
+        or re.fullmatch(r"baza_[A-Za-z0-9_-]{43}", states[0]) is None
+        or len(codes) != 1
+        or re.fullmatch(r"[\x21-\x7e]{1,2048}", codes[0]) is None
+    ):
+        return {}
+    # Portal, user and return URL are verified/configured by Baza, not supplied
+    # by this browser request. No OAuth credentials are retained by the picker.
+    return {"code": codes[0], "state": states[0]}
+
+
+def forward_baza_oauth_callback(payload):
+    """One bounded server request; Baza owns nonce consumption and token exchange."""
+    if BAZA_OAUTH_CALLBACK_URL != BAZA_OAUTH_APPROVED_CALLBACK_URL:
+        return False
+    try:
+        request = urllib.request.Request(
+            BAZA_OAUTH_APPROVED_CALLBACK_URL,
+            data=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "User-Agent": "KrugosvetDealPicker/1",
+            },
+            method="POST",
+        )
+        opener = urllib.request.build_opener(BazaOAuthNoRedirect())
+        with opener.open(request, timeout=BAZA_OAUTH_CALLBACK_TIMEOUT_SECONDS) as response:
+            if response.getcode() != 200:
+                return False
+            if response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower() != "application/json":
+                return False
+            body = response.read(BAZA_OAUTH_CALLBACK_MAX_RESPONSE_BYTES + 1)
+            if len(body) > BAZA_OAUTH_CALLBACK_MAX_RESPONSE_BYTES:
+                return False
+            result = json.loads(body)
+            return isinstance(result, dict) and set(result) == {"ok"} and result["ok"] is True
+    except urllib.error.HTTPError as exc:
+        exc.close()
+        return False
+    except Exception:
+        # Neither exception text nor upstream response bodies are safe to log.
+        # An uncertain exchange is not retried; the user checks Baza's status.
+        return False
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "KrugosvetDealPicker/1"
 
@@ -5961,6 +6076,42 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def send_baza_oauth_result(self, connected, status):
+        if connected is True and status == 200:
+            self.send_response(303)
+            self.send_common_headers()
+            self.send_header("Location", BAZA_OAUTH_CHATS_URL)
+            self.send_header("Content-Security-Policy", "; ".join((
+                "default-src 'none'", "frame-ancestors 'none'", "base-uri 'none'", "form-action 'none'",
+            )))
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        nonce = secrets.token_urlsafe(24)
+        title = "Проверьте подключение в Базе"
+        message = "Не удалось подтвердить подключение. Вернитесь в Базу и при необходимости подключитесь снова."
+        body = (
+            '<!doctype html><html lang="ru"><head><meta charset="utf-8">'
+            '<meta name="viewport" content="width=device-width,initial-scale=1">'
+            f'<title>{title}</title><style nonce="{nonce}">'
+            'body{font:18px/1.5 system-ui,sans-serif;max-width:560px;margin:12vh auto;padding:24px;color:#172033}'
+            'a{display:inline-block;margin-top:16px;color:#1859b8}</style></head><body>'
+            f'<h1>{title}</h1><p>{message}</p>'
+            f'<a href="{BAZA_OAUTH_CHATS_URL}" target="_top" rel="noreferrer">Вернуться в Базу</a>'
+            f'<script nonce="{nonce}">history.replaceState(null,"","/");</script>'
+            '</body></html>'
+        ).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_common_headers()
+        self.send_header("Content-Security-Policy", "; ".join((
+            "default-src 'none'", f"script-src 'nonce-{nonce}'", f"style-src 'nonce-{nonce}'",
+            "frame-ancestors 'none'", "base-uri 'none'", "form-action 'none'",
+        )))
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def read_body(self):
         if self.headers.get("Transfer-Encoding"):
             raise ValueError("Transfer-Encoding не поддерживается")
@@ -6009,6 +6160,18 @@ class Handler(BaseHTTPRequestHandler):
             self.send_html(True, {})
             return
         if parsed.path == "/":
+            callback = baza_oauth_callback_payload(parsed.query)
+            if callback is not None:
+                if not callback:
+                    self.send_baza_oauth_result(False, 400)
+                elif BAZA_OAUTH_CALLBACK_URL != BAZA_OAUTH_APPROVED_CALLBACK_URL:
+                    self.send_baza_oauth_result(False, 503)
+                elif not rate_limit_allowed(self.client_key()):
+                    self.send_baza_oauth_result(False, 429)
+                else:
+                    connected = forward_baza_oauth_callback(callback)
+                    self.send_baza_oauth_result(connected, 200 if connected else 502)
+                return
             self.send_html(False, {})
             return
         self.send_json({"ok": False, "message": "Маршрут не найден"}, 404)
