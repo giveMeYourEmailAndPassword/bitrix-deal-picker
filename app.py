@@ -159,7 +159,7 @@ APP_VERSION = (
 # Bump whenever classifier, eligibility, source-completeness or oldest-first
 # routing semantics change. Pre-deploy tokens must not authorize post-deploy
 # decisions under a different routing policy.
-ROUTING_POLICY_VERSION = "2026-09-06-routing-v4-no-reissue"
+ROUTING_POLICY_VERSION = "2026-09-15-routing-v5-unclassified-any-manager"
 
 SOURCE_STAGES = {
     "UC_ZJ55BR": "Необработанные ЛИДЫ",
@@ -3509,12 +3509,12 @@ def prepare_greeting(
 
 
 def deal_score_for_manager(deal, manager):
-    competencies = [str(item).strip() for item in manager.get("competencies", []) if str(item).strip()]
     direction_name = deal["classification"]["direction"]
-    if not competencies:
-        return 0
     if direction_name == "Не определено":
         return 1
+    competencies = [str(item).strip() for item in manager.get("competencies", []) if str(item).strip()]
+    if not competencies:
+        return 0
     direction = direction_name
     text = " ".join(deal.get("messages", []))
     score = 0
