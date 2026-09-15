@@ -1707,6 +1707,27 @@ class StateStore:
             ).fetchall()
         return {str(row[0]) for row in rows}
 
+    def list_rejection_history(self, manager_id: Any) -> Dict[str, int]:
+        """Latest rejection event per deal version, including pre-retry events.
+
+        Repeated offers keep the original semantic key in their audit payload.
+        Event IDs provide durable ordering without deleting earlier refusals or
+        relying on wall-clock timestamps. Legacy events use their own key.
+        """
+        self._ensure_ready()
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT id, semantic_key, payload_json FROM reject_events "
+                "WHERE manager_id = ? AND semantic_key <> '' ORDER BY id",
+                (str(manager_id),),
+            ).fetchall()
+        history: Dict[str, int] = {}
+        for row in rows:
+            payload = self._payload_from_row(row)
+            root = str(payload.get("rejectionRoot") or row["semantic_key"])
+            history[root] = int(row["id"])
+        return history
+
     def latest_greeting_by_deal(
         self,
         deal_id: Any,
