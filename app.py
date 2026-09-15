@@ -29,6 +29,7 @@ from state_store import (
     ExtraClaimGrantUnavailableError,
     IdempotencyConflictError,
     StateStore,
+    normalize_claim_export_from,
 )
 
 
@@ -280,10 +281,23 @@ CLAIM_RECONCILE_INTERVAL_SECONDS = env_float(
 CLAIM_RECONCILE_BATCH_SIZE = env_int("CLAIM_RECONCILE_BATCH_SIZE", 100, 1, 1000)
 CLAIM_EVENT_EXPORT_ENABLED = env_bool("CLAIM_EVENT_EXPORT_ENABLED", False)
 EXTRA_CLAIM_REQUESTS_ENABLED = env_bool("EXTRA_CLAIM_REQUESTS_ENABLED", False)
+try:
+    BAZA_CLAIM_EXPORT_FROM = normalize_claim_export_from(os.environ.get("BAZA_CLAIM_EXPORT_FROM"))
+except ValueError:
+    INVALID_ENV_VALUES.add("BAZA_CLAIM_EXPORT_FROM")
+    BAZA_CLAIM_EXPORT_FROM = None
 BAZA_API_BASE_URL = os.environ.get("BAZA_API_BASE_URL", "").strip().rstrip("/")
 BAZA_HMAC_SECRET = os.environ.get("BAZA_HMAC_SECRET", "")
 BAZA_HMAC_KEY_ID = os.environ.get("BAZA_HMAC_KEY_ID", "").strip()
 BAZA_PICKER_BRIDGE_SECRET = os.environ.get("BAZA_PICKER_BRIDGE_SECRET", "")
+BAZA_OAUTH_CALLBACK_URL = os.environ.get("BAZA_OAUTH_CALLBACK_URL", "").strip()
+BAZA_OAUTH_APPROVED_CALLBACK_URL = (
+    "https://contracts-backend-production-f1a9.up.railway.app"
+    "/integrations/bitrix-oauth/callback"
+)
+BAZA_OAUTH_CHATS_URL = "https://baza.krugo.tours/chats"
+BAZA_OAUTH_CALLBACK_TIMEOUT_SECONDS = 15
+BAZA_OAUTH_CALLBACK_MAX_RESPONSE_BYTES = 4096
 BAZA_TIMEOUT_SECONDS = env_float("BAZA_TIMEOUT_SECONDS", 5, 1, 30)
 BAZA_MAX_RESPONSE_BYTES = env_int(
     "BAZA_MAX_RESPONSE_BYTES", 1024 * 1024, 4096, 5 * 1024 * 1024
@@ -522,6 +536,7 @@ def baza_integration_enabled():
 def baza_integration_configured():
     return bool(
         baza_base_url_valid()
+        and "BAZA_CLAIM_EXPORT_FROM" not in INVALID_ENV_VALUES
         and BAZA_HMAC_KEY_ID
         and len(BAZA_HMAC_SECRET.encode("utf-8")) >= 32
         and "REPLACE" not in BAZA_HMAC_SECRET.upper()
@@ -1298,6 +1313,8 @@ def flush_integration_outbox(limit=None, *, kinds=None, dedupe_key=None):
         limit=limit or INTEGRATION_OUTBOX_BATCH_SIZE,
         kinds=delivery_kinds,
         dedupe_key=dedupe_key,
+        claim_export_from=BAZA_CLAIM_EXPORT_FROM,
+        preserve_grant_claims=EXTRA_CLAIM_REQUESTS_ENABLED,
     ):
         try:
             outcome = _deliver_integration_outbox_item(item)
@@ -5913,6 +5930,71 @@ def baza_picker_action(action, payload):
     return result, int(result.pop("_httpStatus", 200))
 
 
+class BazaOAuthNoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # The one-time code must never follow a backend redirect elsewhere.
+        return None
+
+
+def baza_oauth_callback_payload(query):
+    """Recognize only Baza's nonce namespace; retain the ordinary picker flow."""
+    if len(query) > 8192:
+        return None
+    try:
+        params = urllib.parse.parse_qs(query, keep_blank_values=True, max_num_fields=32)
+    except ValueError:
+        return None
+    states = params.get("state", [])
+    if not any(state.startswith("baza_") for state in states):
+        return None
+    codes = params.get("code", [])
+    if (
+        len(states) != 1
+        or re.fullmatch(r"baza_[A-Za-z0-9_-]{43}", states[0]) is None
+        or len(codes) != 1
+        or re.fullmatch(r"[\x21-\x7e]{1,2048}", codes[0]) is None
+    ):
+        return {}
+    # Portal, user and return URL are verified/configured by Baza, not supplied
+    # by this browser request. No OAuth credentials are retained by the picker.
+    return {"code": codes[0], "state": states[0]}
+
+
+def forward_baza_oauth_callback(payload):
+    """One bounded server request; Baza owns nonce consumption and token exchange."""
+    if BAZA_OAUTH_CALLBACK_URL != BAZA_OAUTH_APPROVED_CALLBACK_URL:
+        return False
+    try:
+        request = urllib.request.Request(
+            BAZA_OAUTH_APPROVED_CALLBACK_URL,
+            data=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "User-Agent": "KrugosvetDealPicker/1",
+            },
+            method="POST",
+        )
+        opener = urllib.request.build_opener(BazaOAuthNoRedirect())
+        with opener.open(request, timeout=BAZA_OAUTH_CALLBACK_TIMEOUT_SECONDS) as response:
+            if response.getcode() != 200:
+                return False
+            if response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower() != "application/json":
+                return False
+            body = response.read(BAZA_OAUTH_CALLBACK_MAX_RESPONSE_BYTES + 1)
+            if len(body) > BAZA_OAUTH_CALLBACK_MAX_RESPONSE_BYTES:
+                return False
+            result = json.loads(body)
+            return isinstance(result, dict) and set(result) == {"ok"} and result["ok"] is True
+    except urllib.error.HTTPError as exc:
+        exc.close()
+        return False
+    except Exception:
+        # Neither exception text nor upstream response bodies are safe to log.
+        # An uncertain exchange is not retried; the user checks Baza's status.
+        return False
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "KrugosvetDealPicker/1"
 
@@ -5994,6 +6076,42 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def send_baza_oauth_result(self, connected, status):
+        if connected is True and status == 200:
+            self.send_response(303)
+            self.send_common_headers()
+            self.send_header("Location", BAZA_OAUTH_CHATS_URL)
+            self.send_header("Content-Security-Policy", "; ".join((
+                "default-src 'none'", "frame-ancestors 'none'", "base-uri 'none'", "form-action 'none'",
+            )))
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        nonce = secrets.token_urlsafe(24)
+        title = "Проверьте подключение в Базе"
+        message = "Не удалось подтвердить подключение. Вернитесь в Базу и при необходимости подключитесь снова."
+        body = (
+            '<!doctype html><html lang="ru"><head><meta charset="utf-8">'
+            '<meta name="viewport" content="width=device-width,initial-scale=1">'
+            f'<title>{title}</title><style nonce="{nonce}">'
+            'body{font:18px/1.5 system-ui,sans-serif;max-width:560px;margin:12vh auto;padding:24px;color:#172033}'
+            'a{display:inline-block;margin-top:16px;color:#1859b8}</style></head><body>'
+            f'<h1>{title}</h1><p>{message}</p>'
+            f'<a href="{BAZA_OAUTH_CHATS_URL}" target="_top" rel="noreferrer">Вернуться в Базу</a>'
+            f'<script nonce="{nonce}">history.replaceState(null,"","/");</script>'
+            '</body></html>'
+        ).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_common_headers()
+        self.send_header("Content-Security-Policy", "; ".join((
+            "default-src 'none'", f"script-src 'nonce-{nonce}'", f"style-src 'nonce-{nonce}'",
+            "frame-ancestors 'none'", "base-uri 'none'", "form-action 'none'",
+        )))
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def read_body(self):
         if self.headers.get("Transfer-Encoding"):
             raise ValueError("Transfer-Encoding не поддерживается")
@@ -6042,6 +6160,18 @@ class Handler(BaseHTTPRequestHandler):
             self.send_html(True, {})
             return
         if parsed.path == "/":
+            callback = baza_oauth_callback_payload(parsed.query)
+            if callback is not None:
+                if not callback:
+                    self.send_baza_oauth_result(False, 400)
+                elif BAZA_OAUTH_CALLBACK_URL != BAZA_OAUTH_APPROVED_CALLBACK_URL:
+                    self.send_baza_oauth_result(False, 503)
+                elif not rate_limit_allowed(self.client_key()):
+                    self.send_baza_oauth_result(False, 429)
+                else:
+                    connected = forward_baza_oauth_callback(callback)
+                    self.send_baza_oauth_result(connected, 200 if connected else 502)
+                return
             self.send_html(False, {})
             return
         self.send_json({"ok": False, "message": "Маршрут не найден"}, 404)

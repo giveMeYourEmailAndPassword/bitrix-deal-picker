@@ -89,6 +89,21 @@ def _json_dumps(value: Any) -> str:
     )
 
 
+def normalize_claim_export_from(value: Optional[str]) -> Optional[str]:
+    """Optional UTC boundary, at the canonical claim payload's millisecond precision."""
+    if value in (None, ""):
+        return None
+    if not isinstance(value, str) or not re.fullmatch(
+        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:Z|\+00:00)", value
+    ):
+        raise ValueError("BAZA_CLAIM_EXPORT_FROM must be a UTC ISO timestamp")
+    try:
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00" if value.endswith("Z") else value)
+    except ValueError as exc:
+        raise ValueError("BAZA_CLAIM_EXPORT_FROM must be a UTC ISO timestamp") from exc
+    return parsed.isoformat(timespec="milliseconds")
+
+
 class StateStore:
     """Connection-per-operation SQLite store.
 
@@ -2388,6 +2403,8 @@ class StateStore:
         limit: int = 20,
         kinds: Optional[Iterable[str]] = None,
         dedupe_key: Optional[str] = None,
+        claim_export_from: Optional[str] = None,
+        preserve_grant_claims: bool = False,
     ) -> list[Dict[str, Any]]:
         self._ensure_ready()
         now = now or self._now_iso()
@@ -2397,6 +2414,18 @@ class StateStore:
             "next_attempt_at <= ?",
         ]
         params: list[Any] = [now]
+        cutoff = normalize_claim_export_from(claim_export_from)
+        if cutoff is not None:
+            # Filter before LIMIT. Deferred history remains pending and untouched;
+            # a later audit recovery is dated by the original canonical occurrence.
+            # Extra-grant consumption keeps its established recovery path only
+            # while the caller has enabled that separate feature.
+            clauses.append("""(kind != 'claim_event' OR CASE WHEN json_valid(payload_json) THEN (
+                (? = 1 AND json_type(payload_json, '$.extraClaimRequestId') = 'text'
+                    AND length(json_extract(payload_json, '$.extraClaimRequestId')) > 0)
+                OR julianday(json_extract(payload_json, '$.occurredAt')) >= julianday(?)
+            ) ELSE 0 END)""")
+            params.extend([int(preserve_grant_claims is True), cutoff])
         if kinds is not None:
             normalized_kinds = tuple(
                 kind for kind in (str(item) for item in kinds) if kind in {"extra_claim_request", "claim_event"}
