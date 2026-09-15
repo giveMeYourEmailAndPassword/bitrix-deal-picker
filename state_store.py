@@ -2691,12 +2691,15 @@ class StateStore:
         limit: int = 1,
         lease_seconds: int = 60,
         max_attempts: int = 3,
+        activation_max_attempts: Optional[int] = None,
         now: Optional[Any] = None,
     ) -> list[Dict[str, Any]]:
         """Atomically lease eligible pre-send jobs to one worker.
 
         A stale ``checking`` lease is safe to retry because dispatch has not
         started.  ``dispatching`` is deliberately never selected here.
+        Only a recorded activation wait gets the larger readiness allowance;
+        retain that classification during its lease in case the worker dies.
         """
 
         self._ensure_ready()
@@ -2708,6 +2711,10 @@ class StateStore:
             return []
         lease_seconds = max(1, min(3600, int(lease_seconds)))
         max_attempts = max(1, min(100, int(max_attempts)))
+        activation_max_attempts = (
+            max_attempts if activation_max_attempts is None
+            else max(1, min(100, int(activation_max_attempts)))
+        )
         now_dt = self._outbox_datetime(now)
         now_iso = self._outbox_time(now_dt)
         expires_iso = self._outbox_time(now_dt + timedelta(seconds=lease_seconds))
@@ -2722,14 +2729,16 @@ class StateStore:
                     updated_at=?, finalized_at=?
                 WHERE status='checking'
                   AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?
-                  AND attempt_count >= ?
+                  AND attempt_count >= CASE WHEN error_code='chat_activation_pending'
+                    THEN ? ELSE ? END
                 """,
-                (now_iso, now_iso, now_iso, max_attempts),
+                (now_iso, now_iso, now_iso, activation_max_attempts, max_attempts),
             )
             rows = connection.execute(
                 """
                 SELECT operation_key FROM greeting_outbox
-                WHERE attempt_count < ? AND (
+                WHERE attempt_count < CASE WHEN error_code='chat_activation_pending'
+                    THEN ? ELSE ? END AND (
                     (status='pending' AND (
                         next_attempt_at IS NULL OR next_attempt_at <= ?
                     )) OR
@@ -2739,7 +2748,7 @@ class StateStore:
                 ORDER BY created_at, operation_key
                 LIMIT ?
                 """,
-                (max_attempts, now_iso, now_iso, limit),
+                (activation_max_attempts, max_attempts, now_iso, now_iso, limit),
             ).fetchall()
             leased: list[Dict[str, Any]] = []
             for candidate in rows:
@@ -2749,8 +2758,11 @@ class StateStore:
                     UPDATE greeting_outbox SET
                         status='checking', attempt_count=attempt_count + 1,
                         lease_token=?, leased_at=?, lease_expires_at=?,
-                        next_attempt_at=NULL, error_code='', updated_at=?
-                    WHERE operation_key=? AND attempt_count < ? AND (
+                        next_attempt_at=NULL,
+                        error_code=CASE WHEN error_code='chat_activation_pending'
+                            THEN error_code ELSE '' END, updated_at=?
+                    WHERE operation_key=? AND attempt_count < CASE
+                        WHEN error_code='chat_activation_pending' THEN ? ELSE ? END AND (
                         (status='pending' AND (
                             next_attempt_at IS NULL OR next_attempt_at <= ?
                         )) OR
@@ -2764,6 +2776,7 @@ class StateStore:
                         expires_iso,
                         now_iso,
                         operation_key,
+                        activation_max_attempts,
                         max_attempts,
                         now_iso,
                         now_iso,

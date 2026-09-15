@@ -206,6 +206,10 @@ GREETING_AUTO_SEND_SUPPORTED = True
 GREETING_WORKER_POLL_SECONDS = env_float(
     "GREETING_WORKER_POLL_SECONDS", 1, 0.25, 30
 )
+# Baza accepts/pins the claimed dialog asynchronously after the picker replies.
+# Only pre-send readiness may wait; never turn this into an outbound retry.
+GREETING_ACTIVATION_MAX_ATTEMPTS = 12
+GREETING_DELIVERY_WINDOW_SECONDS = 120
 GREETING_ACTOR_THREAD_LIMIT = env_int("GREETING_ACTOR_THREAD_LIMIT", 8, 1, 32)
 GREETING_ACTOR_THREAD_SLOTS = threading.BoundedSemaphore(
     GREETING_ACTOR_THREAD_LIMIT
@@ -2991,6 +2995,11 @@ def resolve_greeting_target(deal_id, manager_id, context):
     last_chat_id = normalize_entity_id(
         bitrix_call("imopenlines.crm.chat.getLastId", crm_params)
     )
+    if chat_id and last_chat_id == chat_id and not active_chat_ids:
+        # The exact, still-latest, writable DEAL-bound dialog is not accepted
+        # yet. Do not join/send through another identity; let Baza finish its
+        # independently authorized operator preparation, then re-read evidence.
+        raise RuntimeError("chat_activation_pending")
     if not chat_id or chat_id not in active_chat_ids or last_chat_id != chat_id:
         raise RuntimeError("chat_not_latest_active_for_deal")
 
@@ -3841,15 +3850,30 @@ GREETING_TERMINAL_PREFLIGHT_ERRORS = {
     "claim_marker_mismatch",
     "manager_not_active",
     "manager_access_revoked",
+    "greeting_window_expired",
 }
+GREETING_RETRYABLE_PREFLIGHT_ERRORS = {"chat_activation_pending"}
 
 
 def greeting_machine_error(exc, fallback="greeting_preflight_failed"):
     raw = str(exc or "").strip()
-    for code in GREETING_TERMINAL_PREFLIGHT_ERRORS:
+    for code in GREETING_TERMINAL_PREFLIGHT_ERRORS | GREETING_RETRYABLE_PREFLIGHT_ERRORS:
         if code in raw:
             return code
     return fallback
+
+
+def require_recent_greeting(job):
+    """A delayed worker must not surprise a client with an old greeting."""
+    try:
+        created = datetime.fromisoformat(str(job.get("createdAt") or "").replace("Z", "+00:00"))
+        if created.tzinfo is None:
+            raise ValueError("missing timezone")
+        age = (datetime.now(timezone.utc) - created.astimezone(timezone.utc)).total_seconds()
+        if age < 0 or age >= GREETING_DELIVERY_WINDOW_SECONDS:
+            raise ValueError("outside greeting window")
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise RuntimeError("greeting_window_expired") from exc
 
 
 def append_greeting_delivery_audit(job, manager, *, status, auto_sent, message, error_code=""):
@@ -4108,6 +4132,7 @@ def process_greeting_outbox_job(job, worker_token):
     manager_id = normalize_entity_id(job.get("managerId"))
     manager = None
     try:
+        require_recent_greeting(job)
         operation = STATE_STORE.get_claim_operation(operation_key)
         if not operation or operation.get("status") != "succeeded":
             raise RuntimeError("claim_operation_not_succeeded")
@@ -4175,6 +4200,7 @@ def process_greeting_outbox_job(job, worker_token):
             or str(latest_deal.get(BITRIX_CLAIM_MARKER_FIELD) or "") != expected_marker
         ):
             raise RuntimeError("claim_marker_mismatch")
+        require_recent_greeting(job)
     except Exception as exc:
         code = greeting_machine_error(exc)
         try:
@@ -4189,8 +4215,8 @@ def process_greeting_outbox_job(job, worker_token):
                     operation_key,
                     worker_token,
                     error_code=code,
-                    delay_seconds=5,
-                    max_attempts=3,
+                    delay_seconds=10 if code == "chat_activation_pending" else 5,
+                    max_attempts=GREETING_ACTIVATION_MAX_ATTEMPTS if code == "chat_activation_pending" else 3,
                 )
         except Exception as state_exc:
             sys.stderr.write(
@@ -4274,6 +4300,7 @@ def process_greeting_outbox_once(worker_token=None, limit=1):
         limit=max(1, int(limit)),
         lease_seconds=max(30, int(BITRIX_TIMEOUT_SECONDS * 8)),
         max_attempts=3,
+        activation_max_attempts=GREETING_ACTIVATION_MAX_ATTEMPTS,
     )
     processed = 0
     for job in jobs:
@@ -4317,13 +4344,19 @@ def public_claim_greeting(job):
     if status in {"pending", "checking", "dispatching"}:
         return {
             "ok": True, "status": "queued", "autoSent": False, "text": "",
-            "message": "Приветствие отправляется в фоне.",
+            "message": "Ожидаем готовности диалога в Битриксе для приветствия." if job.get("errorCode") == "chat_activation_pending" else "Приветствие отправляется в фоне.",
         }
     if status == "sent":
         return {
             "ok": True, "status": "sent", "autoSent": True,
             "text": job.get("text") or "",
             "message": "Приветствие автоматически отправлено клиенту.",
+        }
+    if status == "manual" and job.get("errorCode") in {"chat_activation_pending", "greeting_window_expired"}:
+        return {
+            "ok": True, "status": "manual", "autoSent": False,
+            "text": job.get("text") or "",
+            "message": "Приветствие не отправлено: диалог не был готов вовремя. Проверьте подключение Битрикса и переписку перед ручной отправкой.",
         }
     return {
         "ok": True, "status": status, "autoSent": False,

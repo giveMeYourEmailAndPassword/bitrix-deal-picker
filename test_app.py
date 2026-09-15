@@ -19,7 +19,7 @@ import threading
 import time
 import unittest
 from contextlib import ExitStack, contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from io import BytesIO
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
@@ -3782,6 +3782,15 @@ class TestGreetingOutboxWorker(ClaimWorkflowTestCase):
             "competencies": ["Турция"],
         }
 
+    def make_greeting_retry_due(self):
+        # Only advance the synthetic job's scheduled check; never reset its
+        # status, attempt counter or no-repeat dispatch boundary.
+        with self.store._connect() as connection:
+            connection.execute(
+                "UPDATE greeting_outbox SET next_attempt_at=? WHERE operation_key=?",
+                ("2000-01-01T00:00:00+00:00", self.operation_key()),
+            )
+
     def actor_auth(self):
         return {
             "access_token": "actor-oauth-secret-must-stay-in-memory",
@@ -4173,7 +4182,7 @@ class TestGreetingOutboxWorker(ClaimWorkflowTestCase):
         self.assertEqual(audit["status"], "manual")
         self.assertFalse(audit["autoSent"])
 
-    def test_worker_unaccepted_chat_becomes_manual_without_join_or_send(self):
+    def test_worker_unaccepted_exact_latest_chat_waits_without_join_or_send(self):
         self.seed_greeting_outbox()
 
         def fake_bitrix(method, params=None, timeout=None):
@@ -4201,16 +4210,352 @@ class TestGreetingOutboxWorker(ClaimWorkflowTestCase):
             second = app.process_greeting_outbox_once(worker_token="worker-2")
 
         job = self.store.get_greeting_outbox(self.operation_key())
-        self.assertEqual(job["status"], "manual")
-        self.assertEqual(job["errorCode"], "chat_not_latest_active_for_deal")
+        self.assertEqual(job["status"], "pending")
+        self.assertEqual(job["errorCode"], "chat_activation_pending")
+        self.assertIsNotNone(job["nextAttemptAt"])
         self.assertEqual(second["leased"], 0)
-        self.assertEqual(replay["greeting"]["status"], "manual")
+        self.assertEqual(replay["greeting"]["status"], "queued")
         self.assertFalse(replay["greeting"]["autoSent"])
-        self.assertIn("Проверьте чат", replay["greeting"]["message"])
+        self.assertEqual(replay["greeting"]["text"], "")
         self.assertEqual([item.args[0] for item in bitrix.call_args_list], [
             "crm.deal.get", "imopenlines.session.history.get",
             "imopenlines.crm.chat.get", "imopenlines.crm.chat.getLastId",
         ])
+
+    def test_worker_waits_for_baza_acceptance_then_sends_exactly_one_greeting(self):
+        self.seed_greeting_outbox()
+        accepted = False
+
+        def fake_bitrix(method, params=None, timeout=None):
+            if method == "crm.deal.get":
+                return self.claimed_deal()
+            if method == "imopenlines.session.history.get":
+                return self.official_history()
+            if method == "imopenlines.crm.chat.get":
+                self.assertEqual(params["ACTIVE_ONLY"], "Y")
+                return [{"CHAT_ID": "1763"}] if accepted else []
+            if method == "imopenlines.crm.chat.getLastId":
+                return 1763
+            if method == "imopenlines.crm.chat.user.add":
+                self.assertTrue(accepted, "must not join before Baza accepts the chat")
+                self.assertEqual(params["USER_ID"], self.manager_id)
+                self.assertEqual(params["CHAT_ID"], "1763")
+                return 1763
+            if method == "imopenlines.crm.message.add":
+                self.assertTrue(accepted)
+                self.assertEqual(params["CHAT_ID"], "1763")
+                return 85851
+            raise AssertionError(f"unsafe or unexpected method: {method}")
+
+        with (
+            patch.multiple(app, DRY_RUN=False, GREETING_AUTO_SEND=True, GREETING_AUTO_SEND_SUPPORTED=True),
+            patch.object(app, "get_greeting_manager_profile", return_value=self.active_manager()),
+            patch.object(app, "bitrix_call", side_effect=fake_bitrix) as bitrix,
+        ):
+            # Activation is a bounded readiness wait, not the generic network
+            # retry budget: acceptance can legitimately take more than 3 polls.
+            for index in range(4):
+                self.make_greeting_retry_due()
+                self.assertEqual(app.process_greeting_outbox_once(f"waiting-{index}"), {"leased": 1, "processed": 1})
+                job = self.store.get_greeting_outbox(self.operation_key())
+                self.assertEqual(job["status"], "pending")
+                self.assertEqual(job["errorCode"], "chat_activation_pending")
+                self.assertEqual(job["attemptCount"], index + 1)
+            self.assertFalse(any(item.args[0] in {"imopenlines.crm.chat.user.add", "imopenlines.crm.message.add"} for item in bitrix.call_args_list))
+            accepted = True
+            self.make_greeting_retry_due()
+            self.assertEqual(app.process_greeting_outbox_once("accepted"), {"leased": 1, "processed": 1})
+            replay = app.attach_greeting_to_claim(
+                {"ok": True, "auditRecorded": True, "dealId": self.deal_id},
+                self.manager_id, self.deal_id, None, self.operation_key(),
+            )
+            self.make_greeting_retry_due()
+            self.assertEqual(app.process_greeting_outbox_once("replayed"), {"leased": 0, "processed": 0})
+
+        job = self.store.get_greeting_outbox(self.operation_key())
+        self.assertEqual(job["status"], "sent")
+        self.assertEqual(job["messageId"], "85851")
+        self.assertEqual(job["attemptCount"], 5)
+        self.assertEqual(replay["greeting"]["status"], "sent")
+        self.assertTrue(replay["greeting"]["autoSent"])
+        methods = [item.args[0] for item in bitrix.call_args_list]
+        self.assertEqual(methods.count("imopenlines.crm.message.add"), 1)
+        self.assertNotIn("imopenlines.operator.answer", methods)
+        self.assertNotIn("im.message.add", methods)
+        self.assertEqual(len(self.store.list_greetings()), 1)
+
+    def test_worker_waiting_for_activation_stops_if_owner_binding_or_latest_chat_changes(self):
+        for index, (change, expected_error) in enumerate([
+            ("owner", "claim_marker_mismatch"),
+            ("binding", "chat_entity_mismatch"),
+            ("latest", "chat_not_latest_active_for_deal"),
+        ]):
+            with self.subTest(change=change):
+                self.deal_id = str(700 + index)
+                self.seed_greeting_outbox()
+                changed = False
+
+                def fake_bitrix(method, params=None, timeout=None):
+                    if method == "crm.deal.get":
+                        return self.claimed_deal(manager="999" if changed and change == "owner" else None)
+                    if method == "imopenlines.session.history.get":
+                        return self.official_history(deal_id="999" if changed and change == "binding" else None)
+                    if method == "imopenlines.crm.chat.get":
+                        return []
+                    if method == "imopenlines.crm.chat.getLastId":
+                        return 1764 if changed and change == "latest" else 1763
+                    raise AssertionError(f"unexpected mutation while waiting: {method}")
+
+                with (
+                    patch.multiple(app, DRY_RUN=False, GREETING_AUTO_SEND=True, GREETING_AUTO_SEND_SUPPORTED=True),
+                    patch.object(app, "get_greeting_manager_profile", return_value=self.active_manager()),
+                    patch.object(app, "bitrix_call", side_effect=fake_bitrix) as bitrix,
+                ):
+                    app.process_greeting_outbox_once("before-change")
+                    self.assertEqual(self.store.get_greeting_outbox(self.operation_key())["status"], "pending")
+                    changed = True
+                    self.make_greeting_retry_due()
+                    app.process_greeting_outbox_once("after-change")
+                    job = self.store.get_greeting_outbox(self.operation_key())
+                    self.assertEqual(job["status"], "manual")
+                    self.assertEqual(job["errorCode"], expected_error)
+                    self.make_greeting_retry_due()
+                    self.assertEqual(app.process_greeting_outbox_once("terminal"), {"leased": 0, "processed": 0})
+                self.assertFalse(any(item.args[0] in {"imopenlines.crm.chat.user.add", "imopenlines.crm.message.add"} for item in bitrix.call_args_list))
+
+    def test_worker_does_not_resurrect_manual_or_uncertain_greetings_after_activation(self):
+        for index, status in enumerate(["manual", "uncertain"]):
+            with self.subTest(status=status):
+                self.deal_id = str(800 + index)
+                self.seed_greeting_outbox()
+                token = f"old-{status}"
+                self.store.lease_exact_greeting_outbox(self.operation_key(), token)
+                if status == "manual":
+                    self.store.mark_greeting_outbox_manual(
+                        self.operation_key(), token, error_code="chat_not_latest_active_for_deal",
+                    )
+                else:
+                    self.store.update_greeting_outbox_check(self.operation_key(), token, text="Existing greeting")
+                    self.store.mark_greeting_outbox_dispatching(self.operation_key(), token)
+                    self.store.mark_greeting_outbox_uncertain(
+                        self.operation_key(), token, error_code="send_result_uncertain",
+                    )
+                before = self.store.get_greeting_outbox(self.operation_key())
+                with (
+                    patch.multiple(app, DRY_RUN=False, GREETING_AUTO_SEND=True, GREETING_AUTO_SEND_SUPPORTED=True),
+                    patch.object(app, "bitrix_call") as bitrix,
+                ):
+                    replay = app.attach_greeting_to_claim(
+                        {"ok": True, "auditRecorded": True, "dealId": self.deal_id},
+                        self.manager_id, self.deal_id, None, self.operation_key(),
+                    )
+                    self.assertEqual(app.process_greeting_outbox_once("later-activation"), {"leased": 0, "processed": 0})
+                self.assertEqual(replay["greeting"]["status"], status)
+                self.assertFalse(replay["greeting"]["autoSent"])
+                self.assertEqual(self.store.get_greeting_outbox(self.operation_key()), before)
+                bitrix.assert_not_called()
+
+    def test_worker_activation_wait_exhausts_after_twelve_pre_send_checks(self):
+        self.seed_greeting_outbox()
+
+        def fake_bitrix(method, params=None, timeout=None):
+            if method == "crm.deal.get":
+                return self.claimed_deal()
+            if method == "imopenlines.session.history.get":
+                return self.official_history()
+            if method == "imopenlines.crm.chat.get":
+                return []
+            if method == "imopenlines.crm.chat.getLastId":
+                return 1763
+            raise AssertionError(f"unexpected mutation while awaiting acceptance: {method}")
+
+        with (
+            patch.multiple(app, DRY_RUN=False, GREETING_AUTO_SEND=True, GREETING_AUTO_SEND_SUPPORTED=True),
+            patch.object(app, "get_greeting_manager_profile", return_value=self.active_manager()),
+            patch.object(app, "bitrix_call", side_effect=fake_bitrix) as bitrix,
+        ):
+            for index in range(12):
+                self.make_greeting_retry_due()
+                self.assertEqual(app.process_greeting_outbox_once(f"wait-{index}"), {"leased": 1, "processed": 1})
+                job = self.store.get_greeting_outbox(self.operation_key())
+                self.assertEqual(job["status"], "pending" if index < 11 else "manual")
+                self.assertEqual(job["attemptCount"], index + 1)
+            self.make_greeting_retry_due()
+            self.assertEqual(app.process_greeting_outbox_once("exhausted"), {"leased": 0, "processed": 0})
+        self.assertEqual(job["errorCode"], "chat_activation_pending")
+        self.assertIsNone(job["nextAttemptAt"])
+        self.assertEqual(len(self.store.list_greetings()), 1)
+        self.assertFalse(any(item.args[0] in {"imopenlines.crm.chat.user.add", "imopenlines.crm.message.add"} for item in bitrix.call_args_list))
+
+    def test_worker_generic_network_failure_still_stops_after_three_checks(self):
+        self.seed_greeting_outbox()
+        with (
+            patch.multiple(app, DRY_RUN=False, GREETING_AUTO_SEND=True, GREETING_AUTO_SEND_SUPPORTED=True),
+            patch.object(app, "bitrix_call", side_effect=TimeoutError("read timeout")) as bitrix,
+            patch.object(app, "send_greeting_message") as send,
+        ):
+            for index in range(3):
+                self.make_greeting_retry_due()
+                app.process_greeting_outbox_once(f"network-{index}")
+                job = self.store.get_greeting_outbox(self.operation_key())
+                self.assertEqual(job["status"], "pending" if index < 2 else "manual")
+                self.assertEqual(job["attemptCount"], index + 1)
+            self.make_greeting_retry_due()
+            self.assertEqual(app.process_greeting_outbox_once("exhausted"), {"leased": 0, "processed": 0})
+        self.assertEqual(bitrix.call_count, 3)
+        self.assertEqual(job["errorCode"], "greeting_preflight_failed")
+        send.assert_not_called()
+
+    def test_worker_does_not_send_old_pending_greeting_after_service_restart(self):
+        self.seed_greeting_outbox()
+        with self.store._connect() as connection:
+            connection.execute(
+                "UPDATE greeting_outbox SET created_at=? WHERE operation_key=?",
+                ("2000-01-01T00:00:00+00:00", self.operation_key()),
+            )
+        with (
+            patch.multiple(app, DRY_RUN=False, GREETING_AUTO_SEND=True, GREETING_AUTO_SEND_SUPPORTED=True),
+            patch.object(app, "bitrix_call") as bitrix,
+            patch.object(app, "send_greeting_message") as send,
+        ):
+            app.process_greeting_outbox_once("restarted")
+        job = self.store.get_greeting_outbox(self.operation_key())
+        self.assertEqual(job["status"], "manual")
+        self.assertEqual(job["errorCode"], "greeting_window_expired")
+        bitrix.assert_not_called()
+        send.assert_not_called()
+
+    def test_worker_rechecks_age_before_dispatch_after_slow_target_resolution(self):
+        job = self.seed_greeting_outbox()
+        created = datetime.fromisoformat(job["createdAt"])
+
+        with patch.object(app, "datetime", wraps=datetime) as clock:
+            clock.now.return_value = created + timedelta(seconds=119)
+
+            def resolve_slowly(*args):
+                clock.now.return_value = created + timedelta(seconds=120)
+                return {"chatId": "1763", "sessionId": "321"}
+
+            with (
+                patch.multiple(app, DRY_RUN=False, GREETING_AUTO_SEND=True, GREETING_AUTO_SEND_SUPPORTED=True),
+                patch.object(app, "get_greeting_manager_profile", return_value=self.active_manager()),
+                patch.object(app, "bitrix_call", return_value=self.claimed_deal()),
+                patch.object(app, "resolve_greeting_target", side_effect=resolve_slowly) as resolve,
+                patch.object(app, "send_greeting_message") as send,
+            ):
+                app.process_greeting_outbox_once("slow-check")
+            resolve.assert_called_once()
+            send.assert_not_called()
+        job = self.store.get_greeting_outbox(self.operation_key())
+        self.assertEqual(job["status"], "manual")
+        self.assertEqual(job["errorCode"], "greeting_window_expired")
+        self.assertIsNone(job["dispatchingAt"])
+
+    def test_worker_rejects_invalid_naive_or_future_job_timestamp_before_network(self):
+        for index, timestamp in enumerate([
+            "not-an-iso-timestamp",
+            "2026-09-15T10:00:00",
+            "2999-01-01T00:00:00+00:00",
+        ]):
+            with self.subTest(timestamp=timestamp):
+                self.deal_id = str(900 + index)
+                self.seed_greeting_outbox()
+                with self.store._connect() as connection:
+                    connection.execute(
+                        "UPDATE greeting_outbox SET created_at=? WHERE operation_key=?",
+                        (timestamp, self.operation_key()),
+                    )
+                with (
+                    patch.multiple(app, DRY_RUN=False, GREETING_AUTO_SEND=True, GREETING_AUTO_SEND_SUPPORTED=True),
+                    patch.object(app, "bitrix_call") as bitrix,
+                    patch.object(app, "send_greeting_message") as send,
+                ):
+                    app.process_greeting_outbox_once("invalid-clock")
+                job = self.store.get_greeting_outbox(self.operation_key())
+                self.assertEqual(job["status"], "manual")
+                self.assertEqual(job["errorCode"], "greeting_window_expired")
+                bitrix.assert_not_called()
+                send.assert_not_called()
+
+    def test_worker_expired_third_generic_check_is_not_released_with_activation_budget(self):
+        for index, code in enumerate(["", "greeting_preflight_failed"]):
+            with self.subTest(error_code=code):
+                self.deal_id = str(950 + index)
+                self.seed_greeting_outbox()
+                with self.store._connect() as connection:
+                    connection.execute(
+                        """UPDATE greeting_outbox SET status='checking',
+                            attempt_count=3, error_code=?, lease_token='crashed-worker',
+                            lease_expires_at='2000-01-01T00:00:00+00:00'
+                            WHERE operation_key=?""",
+                        (code, self.operation_key()),
+                    )
+                with (
+                    patch.multiple(app, DRY_RUN=False, GREETING_AUTO_SEND=True, GREETING_AUTO_SEND_SUPPORTED=True),
+                    patch.object(app, "bitrix_call") as bitrix,
+                    patch.object(app, "get_greeting_manager_profile") as manager,
+                    patch.object(app, "send_greeting_message") as send,
+                ):
+                    result = app.process_greeting_outbox_once("restarted-worker")
+                self.assertEqual(result, {"leased": 0, "processed": 0})
+                job = self.store.get_greeting_outbox(self.operation_key())
+                self.assertEqual(job["status"], "manual")
+                self.assertEqual(job["errorCode"], "checking_attempts_exhausted")
+                self.assertEqual(job["attemptCount"], 3)
+                bitrix.assert_not_called()
+                manager.assert_not_called()
+                send.assert_not_called()
+
+    def test_worker_expired_fourth_activation_check_resumes_once_after_acceptance(self):
+        self.seed_greeting_outbox()
+        with self.store._connect() as connection:
+            connection.execute(
+                """UPDATE greeting_outbox SET attempt_count=3,
+                    error_code='chat_activation_pending' WHERE operation_key=?""",
+                (self.operation_key(),),
+            )
+        leased = self.store.lease_greeting_outbox(
+            "worker-before-crash", max_attempts=3, activation_max_attempts=12,
+        )
+        self.assertEqual(len(leased), 1)
+        self.assertEqual(leased[0]["attemptCount"], 4)
+        self.assertEqual(leased[0]["status"], "checking")
+        self.assertEqual(leased[0]["errorCode"], "chat_activation_pending")
+        with self.store._connect() as connection:
+            connection.execute(
+                """UPDATE greeting_outbox SET
+                    lease_expires_at='2000-01-01T00:00:00+00:00'
+                    WHERE operation_key=?""",
+                (self.operation_key(),),
+            )
+
+        def fake_bitrix(method, params=None, timeout=None):
+            if method == "crm.deal.get":
+                return self.claimed_deal()
+            if method == "imopenlines.session.history.get":
+                return self.official_history()
+            if method == "imopenlines.crm.chat.get":
+                return [{"CHAT_ID": "1763"}]
+            if method in {"imopenlines.crm.chat.getLastId", "imopenlines.crm.chat.user.add"}:
+                return 1763
+            if method == "imopenlines.crm.message.add":
+                self.assertEqual(params["CHAT_ID"], "1763")
+                self.assertEqual(params["USER_ID"], self.manager_id)
+                return 85851
+            raise AssertionError(f"unexpected provider call: {method}")
+
+        with (
+            patch.multiple(app, DRY_RUN=False, GREETING_AUTO_SEND=True, GREETING_AUTO_SEND_SUPPORTED=True),
+            patch.object(app, "get_greeting_manager_profile", return_value=self.active_manager()),
+            patch.object(app, "bitrix_call", side_effect=fake_bitrix) as bitrix,
+        ):
+            self.assertEqual(app.process_greeting_outbox_once("restarted-worker"), {"leased": 1, "processed": 1})
+            self.assertEqual(app.process_greeting_outbox_once("retry"), {"leased": 0, "processed": 0})
+        job = self.store.get_greeting_outbox(self.operation_key())
+        self.assertEqual(job["status"], "sent")
+        self.assertEqual(job["attemptCount"], 5)
+        self.assertEqual(job["messageId"], "85851")
+        self.assertEqual([item.args[0] for item in bitrix.call_args_list].count("imopenlines.crm.message.add"), 1)
 
     def test_worker_rechecks_assignment_stage_and_marker_after_chat_resolution(self):
         for index, (field, changed) in enumerate([
