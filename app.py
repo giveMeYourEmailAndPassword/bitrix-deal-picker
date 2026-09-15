@@ -159,7 +159,7 @@ APP_VERSION = (
 # Bump whenever classifier, eligibility, source-completeness or oldest-first
 # routing semantics change. Pre-deploy tokens must not authorize post-deploy
 # decisions under a different routing policy.
-ROUTING_POLICY_VERSION = "2026-09-15-routing-v5-unclassified-any-manager"
+ROUTING_POLICY_VERSION = "2026-09-15-routing-v6-reoffer-rejected"
 
 SOURCE_STAGES = {
     "UC_ZJ55BR": "Необработанные ЛИДЫ",
@@ -778,7 +778,9 @@ def _decode_signed_token(token):
     return payload if isinstance(payload, dict) else None
 
 
-def issue_selection_token(deal_id, manager_id, version, policy_hash, now=None):
+def issue_selection_token(
+    deal_id, manager_id, version, policy_hash, now=None, *, rejection_after=0
+):
     deal_id = normalize_entity_id(deal_id)
     manager_id = normalize_entity_id(manager_id)
     version = str(version or "").strip()
@@ -789,6 +791,8 @@ def issue_selection_token(deal_id, manager_id, version, policy_hash, now=None):
         or not version
         or len(version) > 256
         or not re.fullmatch(r"[0-9a-f]{64}", policy_hash)
+        or type(rejection_after) is not int
+        or not 0 <= rejection_after <= 2**63 - 1
     ):
         raise ValueError("Некорректный ID сделки, менеджера, версия или политика доступа")
     expires_at = int(now if now is not None else time.time()) + SELECTION_TOKEN_TTL_SECONDS
@@ -800,6 +804,7 @@ def issue_selection_token(deal_id, manager_id, version, policy_hash, now=None):
             "version": version,
             "policy": policy_hash,
             "routing": ROUTING_POLICY_VERSION,
+            "rejectionAfter": rejection_after,
             "expires": expires_at,
         }
     )
@@ -820,6 +825,8 @@ def decode_selection_token(token, deal_id, manager_id, now=None):
         and len(str(payload.get("version") or "")) <= 256
         and bool(re.fullmatch(r"[0-9a-f]{64}", str(payload.get("policy") or "")))
         and payload.get("routing") == ROUTING_POLICY_VERSION
+        and type(payload.get("rejectionAfter", 0)) is int
+        and 0 <= payload.get("rejectionAfter", 0) <= 2**63 - 1
         and current_time <= expires_at <= current_time + SELECTION_TOKEN_TTL_SECONDS
     )
     return payload if valid else None
@@ -839,10 +846,13 @@ def claim_attempt_marker(operation_key, manager_id, nonce=None):
     return f"{operation_key}:{normalize_entity_id(manager_id)}:{nonce}"
 
 
-def rejection_semantic_key(manager_id, deal_id, version):
-    return hashlib.sha256(
+def rejection_semantic_key(manager_id, deal_id, version, rejection_after=0):
+    root = hashlib.sha256(
         f"reject\0{normalize_entity_id(manager_id)}\0{normalize_entity_id(deal_id)}\0{version}".encode("utf-8")
     ).hexdigest()
+    if not rejection_after:
+        return root
+    return hashlib.sha256(f"{root}\0after\0{rejection_after}".encode("utf-8")).hexdigest()
 
 
 def manager_policy_hash(manager=None, rule=None):
@@ -864,7 +874,8 @@ def manager_policy_hash(manager=None, rule=None):
 def search_snapshot(headers, manager=None, rule=None):
     material = ROUTING_POLICY_VERSION + "\n" + manager_policy_hash(manager, rule) + "\n"
     material += "\n".join(
-        f"{normalize_entity_id(item.get('ID'))}:{deal_version(item)}" for item in headers
+        f"{normalize_entity_id(item.get('ID'))}:{deal_version(item)}:{item.get('_rejectionAfter', 0)}"
+        for item in headers
     )
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
@@ -3742,17 +3753,25 @@ def _get_next_deal_for_manager(manager_id, continuation_token=None):
             "extraClaimGrantAvailable": bool(access.get("extraClaimGrantAvailable")),
         }
 
-    rejected_keys = STATE_STORE.list_rejection_semantic_keys(manager_id)
+    rejection_history = STATE_STORE.list_rejection_history(manager_id)
     unresolved_deal_ids = STATE_STORE.list_unresolved_claim_deal_ids()
     claimed_deal_ids = STATE_STORE.list_claimed_deal_ids()
     headers = [
-        header
+        {
+            **header,
+            "_rejectionAfter": rejection_history.get(
+                rejection_semantic_key(manager_id, header.get("ID"), deal_version(header)),
+                0,
+            ),
+        }
         for header in list_allowed_deal_headers()
         if str(header.get("ID") or "") not in unresolved_deal_ids
         if str(header.get("ID") or "") not in claimed_deal_ids
-        if rejection_semantic_key(manager_id, header.get("ID"), deal_version(header))
-        not in rejected_keys
     ]
+    # Unrejected versions retain oldest-first priority. Once those are exhausted,
+    # revisit refusals in order of their last rejection. A new refusal therefore
+    # goes to the back of the queue, while its audit history remains intact.
+    headers.sort(key=lambda header: header["_rejectionAfter"])
     snapshot = search_snapshot(headers, manager, access.get("rule"))
     offset = decode_search_cursor(continuation_token, manager_id, snapshot)
     if offset is None or offset > len(headers):
@@ -3802,6 +3821,13 @@ def _get_next_deal_for_manager(manager_id, continuation_token=None):
         score = deal_score_for_manager(deal, manager)
         if score <= 0:
             continue
+        rejection_after = header["_rejectionAfter"]
+        if STATE_STORE.get_rejection_by_semantic_key(
+            rejection_semantic_key(manager_id, header_id, deal.get("version"), rejection_after)
+        ):
+            # A concurrent search may have offered this same attempt already.
+            # Never issue a token for an attempt rejected during this scan.
+            continue
         deal["matchScore"] = score
         if not deal.get("messages"):
             deal["matchReason"] = "Сообщения не найдены, заявка доступна всем менеджерам."
@@ -3814,6 +3840,7 @@ def _get_next_deal_for_manager(manager_id, continuation_token=None):
             manager_id,
             deal.get("version"),
             manager_policy_hash(manager, access.get("rule")),
+            rejection_after=rejection_after,
         )
         return {
             "manager": manager,
@@ -4482,7 +4509,9 @@ def preview_claim(deal_id, manager_id, auth=None, selection_token=None, *, send_
 
     selection_version = str(selection.get("version") or "")
     operation_key = claim_operation_key(deal_id, selection_version)
-    semantic_rejection = rejection_semantic_key(manager_id, deal_id, selection_version)
+    semantic_rejection = rejection_semantic_key(
+        manager_id, deal_id, selection_version, selection.get("rejectionAfter", 0)
+    )
     greeting_snapshot = None
     if send_greeting and GREETING_AUTO_SEND and GREETING_AUTO_SEND_SUPPORTED and not DRY_RUN:
         greeting_snapshot = cached_greeting_context(deal_id, selection_version)
@@ -4490,7 +4519,7 @@ def preview_claim(deal_id, manager_id, auth=None, selection_token=None, *, send_
         return {
             "selectionStale": True,
             "ok": False,
-            "message": "По этой версии сделки уже сохранён отказ. Получите другую заявку.",
+            "message": "По этому предложению уже сохранён отказ. Запустите поиск заново.",
             "_httpStatus": 409,
         }
     if not DRY_RUN and not claim_marker_field_valid():
@@ -4511,7 +4540,7 @@ def preview_claim(deal_id, manager_id, auth=None, selection_token=None, *, send_
             return {
                 "selectionStale": True,
                 "ok": False,
-                "message": "По этой версии сделки уже сохранён отказ. Получите другую заявку.",
+                "message": "По этому предложению уже сохранён отказ. Запустите поиск заново.",
                 "_httpStatus": 409,
             }
         conflicting_deal_operations = [
@@ -5345,7 +5374,9 @@ def record_rejection(manager_id, payload):
     if not selection:
         return {"selectionStale": True, "ok": False, "message": "Выбор сделки устарел. Получите сделку заново."}
     selection_version = str(selection.get("version") or "")
-    semantic_key = rejection_semantic_key(manager_id, deal_id, selection_version)
+    semantic_key = rejection_semantic_key(
+        manager_id, deal_id, selection_version, selection.get("rejectionAfter", 0)
+    )
     operation_key = claim_operation_key(deal_id, selection_version)
     reason = normalize_reject_reason(payload.get("reason"))
     with DATA_LOCK:
@@ -5440,6 +5471,8 @@ def record_rejection(manager_id, payload):
                     "reasonLabel": REJECT_REASONS[reason],
                     "selectionTokenHash": token_hash,
                     "semanticKey": semantic_key,
+                    "rejectionRoot": rejection_semantic_key(manager_id, deal_id, selection_version),
+                    "rejectionAfter": selection.get("rejectionAfter", 0),
                 }
             )
         except Exception:
