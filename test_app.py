@@ -885,17 +885,22 @@ class TestManagerMatching(unittest.TestCase):
             "messages": ["female traveler"],
             "classification": {"direction": "Не определено", "confidence": "низкая"},
         }
-        # Unknown directions remain available to skilled managers by policy,
+        # Unknown directions remain available to every manager by policy,
         # so use a known direction to verify the text score itself.
         deal["classification"]["direction"] = "Египет"
         self.assertEqual(app.deal_score_for_manager(deal, {"competencies": ["male"]}), 0)
 
-    def test_manager_without_skills_gets_zero_even_for_unknown_direction(self):
+    def test_unknown_direction_is_available_regardless_of_skills(self):
         deal = {
-            "messages": [],
+            "messages": ["Здравствуйте, можно узнать цену?"],
             "classification": {"direction": "Не определено", "confidence": "низкая"},
         }
-        self.assertEqual(app.deal_score_for_manager(deal, {"competencies": []}), 0)
+        for competencies in ([], ["", "  "], ["Турция"], ["Египет"]):
+            with self.subTest(competencies=competencies):
+                self.assertEqual(
+                    app.deal_score_for_manager(deal, {"competencies": competencies}),
+                    1,
+                )
 
     def test_manager_without_skills_gets_zero_for_known_direction(self):
         deal = {
@@ -3044,6 +3049,31 @@ class TestSearchContinuation(TemporaryStateTestCase):
             "messages": [direction],
             "classification": {"direction": direction, "confidence": "high"},
         }
+
+    def test_manager_without_skills_is_offered_oldest_unclassified_deal(self):
+        headers = [
+            {"ID": "1", "STAGE_ID": next(iter(app.SOURCE_STAGES)), "DATE_MODIFY": "v1"},
+            {"ID": "2", "STAGE_ID": next(iter(app.SOURCE_STAGES)), "DATE_MODIFY": "v2"},
+        ]
+        manager = {"id": "42", "active": True, "intranet": True, "competencies": []}
+        unclassified = self._deal(headers[1], "Не определено")
+        unclassified["messages"] = []
+        with (
+            patch.object(app, "get_manager_profile", return_value=manager),
+            patch.object(app, "check_manager_access", return_value={"ok": True, "rule": {}}),
+            patch.object(app, "list_allowed_deal_headers", return_value=headers),
+            patch.object(
+                app,
+                "analyze_deal_headers",
+                return_value=({"1": self._deal(headers[0], "Турция"), "2": unclassified}, {}),
+            ),
+        ):
+            result = app._get_next_deal_for_manager("42")
+
+        self.assertIsNotNone(result["deal"])
+        self.assertEqual(result["deal"]["id"], "2")
+        self.assertTrue(app.verify_selection_token(result["deal"]["selectionToken"], "2", "42"))
+        self.assertFalse(result["hasMore"])
 
     def test_only_server_signed_cursor_can_advance_oldest_first_search(self):
         headers = [
