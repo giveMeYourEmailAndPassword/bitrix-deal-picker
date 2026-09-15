@@ -1649,7 +1649,9 @@ def get_manager_profile(manager_id):
     local = next((item for item in load_managers() if str(item.get("id")) == manager_id), None)
     try:
         users = bitrix_call("user.get", {"ID": manager_id}, timeout=BITRIX_FAST_TIMEOUT_SECONDS) or []
-    except Exception:
+    except Exception as exc:
+        # Exception text can contain the secret webhook URL; log only its type.
+        sys.stderr.write(f"Manager profile lookup failed: {type(exc).__name__}\n")
         users = []
     if users:
         return manager_profile_from_user(users[0], manager_id)
@@ -1663,6 +1665,24 @@ def get_manager_profile(manager_id):
             "source": "local_fallback",
         }
     return {"id": manager_id, "name": manager_id, "competencies": [], "active": False, "source": "unavailable"}
+
+
+def manager_profile_unavailable_response(manager):
+    """Keep failed lookups closed without reporting an employee as deactivated."""
+    source = (manager or {}).get("source")
+    if source != "unavailable" and not (
+        source == "local_fallback" and not is_unverified_dev_mode()
+    ):
+        return None
+    message = "Не удалось проверить сотрудника в Bitrix24. Подождите минуту и повторите попытку."
+    return {
+        "ok": False,
+        "deal": None,
+        "error": "manager_profile_unavailable",
+        "message": message,
+        "reason": message,
+        "_httpStatus": 503,
+    }
 
 
 def manager_profile_from_user(user, manager_id=None):
@@ -3699,6 +3719,9 @@ def analyze_deal_headers(headers):
 
 def _get_next_deal_for_manager(manager_id, continuation_token=None):
     manager = get_manager_profile(manager_id)
+    unavailable = manager_profile_unavailable_response(manager)
+    if unavailable:
+        return unavailable
     if not manager:
         return {"deal": None, "reason": "Менеджер не найден в настройке компетенций."}
     if manager.get("active") is not True:
@@ -4551,6 +4574,9 @@ def preview_claim(deal_id, manager_id, auth=None, selection_token=None, *, send_
             )
         else:
             actor_manager = get_manager_profile(manager_id)
+            unavailable = manager_profile_unavailable_response(actor_manager)
+            if unavailable:
+                return unavailable
             if (
                 not actor_manager
                 or actor_manager.get("active") is not True
@@ -5891,6 +5917,9 @@ def baza_picker_action(action, payload):
         }, 200
     if action == "status":
         manager = get_manager_profile(manager_id)
+        unavailable = manager_profile_unavailable_response(manager)
+        if unavailable:
+            return unavailable, int(unavailable.pop("_httpStatus"))
         if not manager or manager.get("active") is not True or manager.get("intranet") is not True:
             return {"ok": False, "message": "Выдача доступна только активному сотруднику Битрикс."}, 403
         extra = extra_claim_limit_state(manager_id, refresh=True)

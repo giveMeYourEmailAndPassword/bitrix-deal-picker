@@ -806,6 +806,79 @@ class TestBitrixResponseBounds(unittest.TestCase):
                 )
 
 
+class TestManagerProfileAvailability(TemporaryStateTestCase):
+    def test_failed_or_empty_profile_lookup_returns_503_without_searching(self):
+        for failure in (
+            TimeoutError("private webhook URL"),
+            app.urllib.error.URLError("private webhook URL"),
+            RuntimeError("Bitrix API error: insufficient_scope"),
+            None,
+        ):
+            with self.subTest(failure=type(failure).__name__):
+                handler = HandlerHarness.make("POST", "/api/next-deal", {})
+                with (
+                    patch.object(app, "rate_limit_allowed", return_value=True),
+                    patch.object(app, "readiness_state", return_value={"ok": True}),
+                    patch.object(app, "actor_id_from_payload", return_value="42"),
+                    patch.object(app, "EXTRA_CLAIM_REQUESTS_ENABLED", False),
+                    patch.object(app, "load_managers", return_value=[]),
+                    patch.object(app, "bitrix_call", side_effect=failure, return_value=[]) as upstream,
+                    patch.object(app, "check_manager_access") as access,
+                    patch.object(app, "list_allowed_deal_headers") as search,
+                    patch.object(app.sys.stderr, "write") as log,
+                ):
+                    handler.do_POST()
+
+                result = HandlerHarness.json(handler)
+                self.assertEqual(HandlerHarness.status(handler), 503)
+                self.assertEqual(result["error"], "manager_profile_unavailable")
+                self.assertFalse(result["ok"])
+                self.assertIsNone(result["deal"])
+                self.assertEqual(result["reason"], result["message"])
+                self.assertNotIn("деактивирован", str(result))
+                self.assertNotIn("_httpStatus", result)
+                self.assertNotIn("private webhook URL", str(result) + str(log.call_args_list))
+                upstream.assert_called_once_with("user.get", {"ID": "42"}, timeout=app.BITRIX_FAST_TIMEOUT_SECONDS)
+                access.assert_not_called()
+                search.assert_not_called()
+
+    def test_local_profile_cannot_hide_failed_production_lookup(self):
+        local = {"id": "42", "name": "Local manager", "active": True, "competencies": ["Турция"]}
+        for dev_mode in (False, True):
+            with (
+                self.subTest(dev_mode=dev_mode),
+                patch.object(app, "load_managers", return_value=[local]),
+                patch.object(app, "bitrix_call", return_value=[]),
+                patch.object(app, "is_unverified_dev_mode", return_value=dev_mode),
+                patch.object(app, "check_manager_access", return_value={"ok": False, "reason": "access checked"}) as access,
+            ):
+                result = app.get_next_deal_for_manager("42")
+            if dev_mode:
+                self.assertEqual(result["reason"], "access checked")
+                access.assert_called_once_with("42")
+            else:
+                self.assertEqual(result["_httpStatus"], 503)
+                self.assertEqual(result["error"], "manager_profile_unavailable")
+                access.assert_not_called()
+
+    def test_confirmed_active_and_inactive_users_keep_existing_access_rules(self):
+        for active in (True, "Y", False, "N", "0"):
+            with (
+                self.subTest(active=active),
+                patch.object(app, "load_managers", return_value=[]),
+                patch.object(app, "bitrix_call", return_value=[{"ID": "42", "ACTIVE": active, "UF_DEPARTMENT": [1]}]),
+                patch.object(app, "check_manager_access", return_value={"ok": False, "reason": "access checked"}) as access,
+            ):
+                result = app.get_next_deal_for_manager("42")
+            self.assertNotIn("error", result)
+            if active in (True, "Y"):
+                self.assertEqual(result["reason"], "access checked")
+                access.assert_called_once_with("42")
+            else:
+                self.assertEqual(result["reason"], "Пользователь деактивирован в Bitrix24.")
+                access.assert_not_called()
+
+
 class TestManagerMatching(unittest.TestCase):
     def test_competency_matching_uses_word_boundaries(self):
         deal = {
@@ -2334,6 +2407,20 @@ class TestStalePendingRecovery(ClaimWorkflowTestCase):
 
 
 class TestEligibilityAndAccessPolicy(ClaimWorkflowTestCase):
+    def test_unavailable_profile_blocks_claim_before_any_bitrix_write(self):
+        with (
+            self.common_claim_context(dry_run=False),
+            patch.object(app, "get_manager_profile", return_value={"id": self.manager_id, "active": False, "source": "unavailable"}),
+            patch.object(app, "bitrix_call") as upstream,
+        ):
+            result = app.preview_claim(self.deal_id, self.manager_id, selection_token=self.token())
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["_httpStatus"], 503)
+        self.assertEqual(result["error"], "manager_profile_unavailable")
+        upstream.assert_not_called()
+        self.assertEqual(self.store.count_claims(self.manager_id), 0)
+        self.assertIsNone(self.store.get_claim_operation(self.operation_key()))
+
     def test_selection_token_is_revoked_when_competencies_change(self):
         with (
             self.common_claim_context(dry_run=True),
