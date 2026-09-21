@@ -5923,6 +5923,20 @@ def readiness_state(*, force=False):
 
 def baza_picker_action(action, payload):
     """Use the existing allocator as the trusted Baza actor, never browser OAuth."""
+    if action == "claim-history":
+        # Analytics reads the complete canonical journal, including history
+        # deliberately deferred by the operational claim-event export cutoff.
+        # Do not resolve an actor or enter any allocation/delivery flow here.
+        if set(payload) - {"start", "end", "asOf", "snapshot", "cursor"}:
+            return {"ok": False, "error": "invalid_payload"}, 400
+        try:
+            return STATE_STORE.claim_history_page(
+                start=payload.get("start"), end=payload.get("end"),
+                as_of=payload.get("asOf"), snapshot=payload.get("snapshot"),
+                cursor=payload.get("cursor"),
+            ), 200
+        except ValueError:
+            return {"ok": False, "error": "invalid_payload"}, 400
     manager_id = normalize_entity_id(payload.get("bitrixUserId"))
     if not manager_id:
         return {"ok": False, "error": "invalid_actor", "message": "Не подтверждён менеджер Битрикс."}, 400
@@ -6450,7 +6464,11 @@ class Handler(BaseHTTPRequestHandler):
         if not baza_bridge.configured(BAZA_PICKER_BRIDGE_SECRET):
             self.send_json({"ok": False, "error": "bridge_not_configured"}, 503)
             return
-        if not rate_limit_allowed(self.client_key()):
+        client_key = self.client_key()
+        # History pagination must not spend the same caller's live allocation
+        # budget, or allocations could fail while an admin loads a report.
+        rate_key = f"baza-history:{client_key}" if action == "claim-history" else client_key
+        if not rate_limit_allowed(rate_key):
             self.send_json({"ok": False, "error": "rate_limited"}, 429)
             return
         try:

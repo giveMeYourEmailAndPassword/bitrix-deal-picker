@@ -1606,6 +1606,78 @@ class StateStore:
 
     load_claim_log = list_claims
 
+    def claim_history_page(
+        self, *, start: str, end: str, as_of: str,
+        snapshot: Optional[int] = None, cursor: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Read canonical claims without replaying operational side effects.
+
+        The ID watermark freezes pagination while concurrent new claims are
+        appended. Dates are the same stored business dates used by admin stats;
+        as_of compares aware instants, including microseconds and UTC offsets.
+        """
+        self._ensure_ready()
+        for value in (start, end):
+            if not isinstance(value, str) or not _DATE_RE.fullmatch(value):
+                raise ValueError("history dates must be YYYY-MM-DD")
+        start_date = datetime.strptime(start, "%Y-%m-%d").date()
+        end_date = datetime.strptime(end, "%Y-%m-%d").date()
+        if not 0 <= (end_date - start_date).days <= 365:
+            raise ValueError("history range must contain 1 to 366 days")
+        if not isinstance(as_of, str) or not re.fullmatch(
+            r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})", as_of
+        ):
+            raise ValueError("asOf must include an ISO-8601 offset")
+        instant = datetime.fromisoformat(as_of[:-1] + "+00:00" if as_of.endswith("Z") else as_of)
+        for value in (snapshot, cursor):
+            if value is not None and (type(value) is not int or not 0 <= value <= 9_007_199_254_740_991):
+                raise ValueError("history cursor and snapshot must be non-negative integers")
+        if cursor is not None and snapshot is None:
+            raise ValueError("history cursor requires a snapshot")
+        after_id = cursor or 0
+        with self._connect() as connection:
+            connection.execute("PRAGMA query_only = ON")
+            connection.execute("BEGIN")
+            maximum = int(connection.execute("SELECT COALESCE(MAX(id), 0) FROM claim_events").fetchone()[0])
+            watermark = maximum if snapshot is None else snapshot
+            if watermark > maximum or after_id > watermark:
+                raise ValueError("history cursor is outside the snapshot")
+            # A Python predicate avoids SQLite date functions rounding away
+            # microseconds at the asOf boundary. Invalid stored timestamps fail
+            # the whole read instead of silently understating the denominator.
+            connection.create_function(
+                "claim_at_or_before", 1,
+                lambda value: datetime.fromisoformat(value.replace("Z", "+00:00")) <= instant,
+            )
+            filters = "id <= ? AND event_date >= ? AND event_date <= ? AND claim_at_or_before(timestamp)"
+            parameters = (watermark, start, end)
+            total = int(connection.execute(
+                f"SELECT COUNT(*) FROM claim_events WHERE {filters}", parameters
+            ).fetchone()[0])
+            first_date = connection.execute(
+                "SELECT MIN(event_date) FROM claim_events WHERE id <= ?", (watermark,)
+            ).fetchone()[0]
+            rows = connection.execute(
+                "SELECT id, manager_id, deal_id, timestamp, event_date, operation_key "
+                f"FROM claim_events WHERE {filters} AND id > ? ORDER BY id LIMIT 501",
+                (*parameters, after_id),
+            ).fetchall()
+        items = [
+            {
+                "id": row["id"], "bitrixUserId": row["manager_id"],
+                "bitrixDealId": row["deal_id"], "occurredAt": row["timestamp"],
+                "eventDate": row["event_date"],
+                **({"operationKey": row["operation_key"]} if row["operation_key"] else {}),
+            }
+            for row in rows[:500]
+        ]
+        return {
+            "ok": True, "start": start, "end": end, "asOf": as_of,
+            "snapshot": watermark, "historyStartDate": first_date,
+            "total": total, "items": items,
+            "nextCursor": items[-1]["id"] if len(rows) > 500 else None,
+        }
+
     def list_rejections(
         self,
         manager_id: Optional[Any] = None,
