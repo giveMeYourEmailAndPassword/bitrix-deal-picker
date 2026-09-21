@@ -5923,6 +5923,20 @@ def readiness_state(*, force=False):
 
 def baza_picker_action(action, payload):
     """Use the existing allocator as the trusted Baza actor, never browser OAuth."""
+    if action == "claim-history":
+        # Analytics reads the complete canonical journal, including history
+        # deliberately deferred by the operational claim-event export cutoff.
+        # Do not resolve an actor or enter any allocation/delivery flow here.
+        if set(payload) - {"start", "end", "asOf", "snapshot", "cursor"}:
+            return {"ok": False, "error": "invalid_payload"}, 400
+        try:
+            return STATE_STORE.claim_history_page(
+                start=payload.get("start"), end=payload.get("end"),
+                as_of=payload.get("asOf"), snapshot=payload.get("snapshot"),
+                cursor=payload.get("cursor"),
+            ), 200
+        except ValueError:
+            return {"ok": False, "error": "invalid_payload"}, 400
     manager_id = normalize_entity_id(payload.get("bitrixUserId"))
     if not manager_id:
         return {"ok": False, "error": "invalid_actor", "message": "Не подтверждён менеджер Битрикс."}, 400
