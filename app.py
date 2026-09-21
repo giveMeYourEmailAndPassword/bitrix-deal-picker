@@ -6464,7 +6464,11 @@ class Handler(BaseHTTPRequestHandler):
         if not baza_bridge.configured(BAZA_PICKER_BRIDGE_SECRET):
             self.send_json({"ok": False, "error": "bridge_not_configured"}, 503)
             return
-        if not rate_limit_allowed(self.client_key()):
+        client_key = self.client_key()
+        # History pagination must not spend the same caller's live allocation
+        # budget, or allocations could fail while an admin loads a report.
+        rate_key = f"baza-history:{client_key}" if action == "claim-history" else client_key
+        if not rate_limit_allowed(rate_key):
             self.send_json({"ok": False, "error": "rate_limited"}, 429)
             return
         try:

@@ -2,6 +2,7 @@
 
 import json
 import unittest
+from collections import defaultdict, deque
 from unittest.mock import patch
 
 from test_app import TemporaryStateTestCase, HandlerHarness, app, _network_is_forbidden
@@ -124,6 +125,28 @@ class TestClaimHistory(TemporaryStateTestCase):
         invalid = self.signed_request({**payload, "start": "2026-09-31"})
         self.assertEqual(HandlerHarness.status(invalid), 400)
         self.assertEqual(HandlerHarness.json(invalid), {"ok": False, "error": "invalid_payload"})
+
+    def test_history_and_live_claims_cannot_exhaust_each_others_rate_budget(self):
+        for first, second in (("claim-history", "claim"), ("claim", "claim-history")):
+            with (
+                self.subTest(first=first),
+                patch.object(app, "BAZA_PICKER_BRIDGE_SECRET", SECRET),
+                patch.object(app, "readiness_state", return_value={"ok": True}),
+                patch.object(app, "RATE_LIMIT_REQUESTS", 2),
+                patch.object(app, "RATE_LIMIT_BUCKETS", defaultdict(deque)),
+                patch.object(app.time, "monotonic", return_value=42),
+                patch.object(baza_bridge.time, "time", return_value=NOW),
+                patch.object(app, "baza_picker_action", return_value=({"ok": True}, 200)) as action,
+            ):
+                results = []
+                for name in (first, first, first, second, second, second):
+                    path = "/integrations/baza/v1/" + name
+                    body = b'{"bitrixUserId":"42"}'
+                    handler = HandlerHarness.make("POST", path, body, headers=signed_headers(path, body))
+                    handler.do_POST()
+                    results.append(HandlerHarness.status(handler))
+                self.assertEqual(results, [200, 200, 429, 200, 200, 429])
+                self.assertEqual(action.call_count, 4)
 
 
 if __name__ == "__main__":
