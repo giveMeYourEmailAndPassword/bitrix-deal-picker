@@ -22,6 +22,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import baza_bridge
+from claim_chat_guard import ClaimChatGuardUnavailable, read_claim_chat_ownership
 
 from state_store import (
     DealAlreadyClaimedError,
@@ -154,12 +155,12 @@ LOCAL_TZ = timezone(timedelta(hours=env_int("APP_TZ_OFFSET_HOURS", 6, -12, 14)))
 STATE_STORE = StateStore(APP_DIR, local_timezone=LOCAL_TZ, auto_initialize=False)
 APP_VERSION = (
     "2026-08-18-office-extra-claims-proven-greeting-"
-    "lost-deal-chat-autoclose-inbound-fix"
+    "lost-deal-chat-autoclose-inbound-fix-active-dialog-guard"
 )
 # Bump whenever classifier, eligibility, source-completeness or oldest-first
 # routing semantics change. Pre-deploy tokens must not authorize post-deploy
 # decisions under a different routing policy.
-ROUTING_POLICY_VERSION = "2026-09-15-routing-v6-reoffer-rejected"
+ROUTING_POLICY_VERSION = "2026-10-10-routing-v7-active-dialog-guard"
 
 SOURCE_STAGES = {
     "UC_ZJ55BR": "Необработанные ЛИДЫ",
@@ -3051,6 +3052,7 @@ def resolve_greeting_target(deal_id, manager_id, context):
     if not chat_id or chat_id not in active_chat_ids or last_chat_id != chat_id:
         raise RuntimeError("chat_not_latest_active_for_deal")
 
+    require_available_greeting_chat(deal_id, manager_id)
     added_chat_id = normalize_entity_id(
         bitrix_call(
             "imopenlines.crm.chat.user.add",
@@ -3728,6 +3730,37 @@ def analyze_deal_headers(headers):
     return analyzed, errors
 
 
+def claim_chat_occupied(deal_id, manager_id, *, timeout=8):
+    """Fresh native OpenLine ownership; deliberately independent of deal caches."""
+    return read_claim_chat_ownership(deal_id, manager_id, bitrix_call, timeout=timeout)
+
+
+def claim_chat_check_response(deal_id, manager_id):
+    try:
+        if not claim_chat_occupied(deal_id, manager_id):
+            return None
+    except ClaimChatGuardUnavailable:
+        return {
+            "ok": False, "_httpStatus": 503,
+            "code": "chat_ownership_unavailable",
+            "message": "Не удалось проверить, свободен ли диалог. Назначение не выполнено; повторите попытку позже.",
+        }
+    return {
+        "ok": False, "_httpStatus": 409, "selectionStale": True,
+        "code": "chat_owned_by_another_manager",
+        "message": "Диалог уже принят другим менеджером в Битриксе. Получите другую заявку.",
+    }
+
+
+def require_available_greeting_chat(deal_id, manager_id):
+    try:
+        occupied = claim_chat_occupied(deal_id, manager_id)
+    except ClaimChatGuardUnavailable:
+        raise RuntimeError("chat_ownership_unavailable") from None
+    if occupied:
+        raise RuntimeError("chat_owned_by_another_manager")
+
+
 def _get_next_deal_for_manager(manager_id, continuation_token=None):
     manager = get_manager_profile(manager_id)
     unavailable = manager_profile_unavailable_response(manager)
@@ -3796,7 +3829,8 @@ def _get_next_deal_for_manager(manager_id, continuation_token=None):
         ),
     }
 
-    for header in batch_headers:
+    ownership_checks = 0
+    for header_index, header in enumerate(batch_headers):
         header_id = str(header.get("ID") or "")
         # Another process may have completed a claim during the history scan.
         if STATE_STORE.deal_was_claimed(header_id):
@@ -3828,6 +3862,35 @@ def _get_next_deal_for_manager(manager_id, continuation_token=None):
             # A concurrent search may have offered this same attempt already.
             # Never issue a token for an attempt rejected during this scan.
             continue
+        # Bound extra REST work per response. Resume after confirmed skipped
+        # candidates, so many occupied dialogs cannot restart/starve the queue.
+        if ownership_checks >= 3:
+            return {
+                "manager": manager, "deal": None,
+                "reason": "Проверяю следующие заявки...",
+                "checkedCount": header_index, "partialTimeouts": len(errors),
+                "hasMore": True,
+                "continuationToken": issue_search_cursor(
+                    manager_id, offset + header_index, snapshot,
+                ),
+            }
+        ownership_checks += 1
+        try:
+            if claim_chat_occupied(
+                header_id, manager_id,
+                timeout=8,
+            ):
+                continue
+        except ClaimChatGuardUnavailable:
+            # An unreadable older candidate must not silently be declared free
+            # or skipped in favor of a newer lead.
+            return {
+                "manager": manager, "deal": None,
+                "reason": "Не удалось проверить, свободен ли диалог. Повторите поиск через минуту.",
+                "code": "chat_ownership_unavailable", "_httpStatus": 503,
+                "checkedCount": len(batch_headers), "hasMore": False,
+                "continuationToken": None,
+            }
         deal["matchScore"] = score
         if not deal.get("messages"):
             deal["matchReason"] = "Сообщения не найдены, заявка доступна всем менеджерам."
@@ -3903,6 +3966,7 @@ def fail_claim_operation_safely(operation_key, error, result=None):
 
 
 GREETING_TERMINAL_PREFLIGHT_ERRORS = {
+    "chat_owned_by_another_manager",
     "openline_session_not_found",
     "chat_context_unavailable",
     "chat_not_openline",
@@ -3919,7 +3983,7 @@ GREETING_TERMINAL_PREFLIGHT_ERRORS = {
     "manager_access_revoked",
     "greeting_window_expired",
 }
-GREETING_RETRYABLE_PREFLIGHT_ERRORS = {"chat_activation_pending"}
+GREETING_RETRYABLE_PREFLIGHT_ERRORS = {"chat_activation_pending", "chat_ownership_unavailable"}
 
 
 def greeting_machine_error(exc, fallback="greeting_preflight_failed"):
@@ -4049,7 +4113,9 @@ def process_actor_greeting_outbox_job(job, worker_token, auth, manager):
 
         # This is the exact sequence used by the previous working release.
         # Taking operator responsibility is pre-send and therefore retry-safe.
+        require_available_greeting_chat(deal_id, manager_id)
         answer_openline_for_actor(auth, chat_context["chatId"])
+        require_available_greeting_chat(deal_id, manager_id)
         dispatching = STATE_STORE.mark_greeting_outbox_dispatching(
             operation_key,
             worker_token,
@@ -4268,6 +4334,7 @@ def process_greeting_outbox_job(job, worker_token):
         ):
             raise RuntimeError("claim_marker_mismatch")
         require_recent_greeting(job)
+        require_available_greeting_chat(deal_id, manager_id)
     except Exception as exc:
         code = greeting_machine_error(exc)
         try:
@@ -4418,6 +4485,11 @@ def public_claim_greeting(job):
             "ok": True, "status": "sent", "autoSent": True,
             "text": job.get("text") or "",
             "message": "Приветствие автоматически отправлено клиенту.",
+        }
+    if status == "manual" and job.get("errorCode") == "chat_owned_by_another_manager":
+        return {
+            "ok": True, "status": "manual", "autoSent": False, "text": "",
+            "message": "Приветствие не отправлено: диалог уже принят другим менеджером. Согласуйте передачу клиента.",
         }
     if status == "manual" and job.get("errorCode") in {"chat_activation_pending", "greeting_window_expired"}:
         return {
@@ -4845,6 +4917,11 @@ def preview_claim(deal_id, manager_id, auth=None, selection_token=None, *, send_
         if success_result is None and STATE_STORE.deal_was_claimed(deal_id, except_operation_key=operation_key):
             return already_claimed_response()
 
+        if success_result is None:
+            chat_check = claim_chat_check_response(deal_id, manager_id)
+            if chat_check:
+                return chat_check
+
         if success_result is None and DRY_RUN:
             return {
                 "ok": True,
@@ -5038,6 +5115,15 @@ def preview_claim(deal_id, manager_id, auth=None, selection_token=None, *, send_
             # Re-read only after a durable attempt-specific operation lease is
             # reserved. DATA_LOCK serializes this single production process;
             # SQLite and the CRM marker protect restart/race recovery.
+            # Native Bitrix acceptance need not change the CRM deal version.
+            # Check again after the lease and immediately before the write.
+            chat_check = claim_chat_check_response(deal_id, manager_id)
+            if chat_check:
+                fail_claim_operation_safely(
+                    operation_key, chat_check["code"], {"remoteUpdated": False},
+                )
+                return chat_check
+
             live_deal = bitrix_call("crm.deal.get", {"id": deal_id})
             if not live_deal or str(live_deal.get("STAGE_ID") or "") not in SOURCE_STAGES:
                 fail_claim_operation_safely(operation_key, "stage_changed_before_update")
