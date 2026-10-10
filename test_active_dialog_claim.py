@@ -1,4 +1,5 @@
 """Regression: a native Bitrix acceptance must fence the independent picker."""
+from datetime import datetime, timezone
 from unittest.mock import patch
 import unittest
 import test_app as fixtures
@@ -141,6 +142,66 @@ class TestActiveDialogClaim(fixtures.ClaimWorkflowTestCase):
     def test_search_checks_live_ownership_even_with_unchanged_analysis(self):
         self.assertEqual(self.search(self.manager_id)["deal"]["id"], "100")
         self.assertEqual(self.search("33")["deal"]["id"], "101")
+
+    def search_zero_owner_session(self, operator_id, *, bot):
+        headers = [{"ID": i, "DATE_MODIFY": self.version} for i in ("100", "101")]
+        deals = {header["ID"]: {"id": header["ID"], "version": self.version, "messages": [],
+                                  "classification": {"direction": "Не определено"}}
+                 for header in headers}
+        source = "wz_whatsapp_synthetic"
+        created = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        session = {"id": 321, "chatId": 570831, "configId": 33, "source": source,
+                   "crmEntityType": "deal", "crmEntityId": 100, "operatorId": int(operator_id),
+                   "status": "answered", "dateCreate": created,
+                   "dateOperatorAnswer": None, "dateClose": None}
+
+        def call(method, params=None, timeout=None):
+            self.assertGreater(timeout, 0)
+            self.assertLessEqual(timeout, 8)
+            if method == "imopenlines.crm.chat.get":
+                return [{"CHAT_ID": "570831", "CONNECTOR_ID": source}] if params["CRM_ENTITY"] == "100" else []
+            if method == "imopenlines.dialog.get":
+                return {"id": 570831, "type": "lines", "entity_type": "LINES",
+                        "entity_id": f"{source}|33|synthetic-chat|synthetic-user",
+                        "entity_data_1": "Y|DEAL|100|N|N|321|0|0|0|0",
+                        "entity_data_2": "DEAL|100", "owner": 0}
+            if method == "imopenlines.v2.Session.list":
+                self.assertEqual(str(params["configId"]), "33")
+                self.assertEqual(params["source"], source)
+                return {"sessions": [dict(session)], "hasNextPage": False}
+            if method == "im.user.get":
+                self.assertEqual(str(params["ID"]), str(operator_id))
+                return {"id": int(operator_id), "bot": bot, "connector": False,
+                        "extranet": False, "departments": [] if bot else [187]}
+            raise AssertionError(f"Unexpected non-read-only method: {method}")
+
+        with (self.common_claim_context(),
+              patch.object(app, "check_manager_access", return_value={"ok": True, "rule": {}}),
+              patch.object(app, "list_allowed_deal_headers", return_value=headers),
+              patch.object(app, "iter_analyzed_deal_headers", side_effect=lambda batch: fixtures.analysis_fixture_rows(batch, deals, {})),
+              patch.object(app, "bitrix_call", side_effect=call) as remote):
+            result = app._get_next_deal_for_manager(self.manager_id)
+        self.assertEqual(self.store.list_claims(), [])
+        self.assert_no_send(remote)
+        return result, remote
+
+    def test_search_zero_owner_verified_bot_offers_oldest_eligible_candidate(self):
+        result, remote = self.search_zero_owner_session("262867", bot=True)
+        self.assertIsNotNone(result["deal"], result)
+        self.assertEqual(result["deal"]["id"], "100")
+        self.assertTrue(result["deal"]["selectionToken"])
+        self.assertEqual(result["checkedCount"], 1)
+        self.assertEqual([call.args[1]["CRM_ENTITY"] for call in remote.call_args_list
+                          if call.args[0] == "imopenlines.crm.chat.get"], ["100"])
+
+    def test_search_zero_owner_foreign_employee_still_skips_to_next_candidate(self):
+        result, remote = self.search_zero_owner_session("33", bot=False)
+        self.assertIsNotNone(result["deal"], result)
+        self.assertEqual(result["deal"]["id"], "101")
+        self.assertTrue(result["deal"]["selectionToken"])
+        self.assertEqual(result["checkedCount"], 2)
+        self.assertEqual([call.args[1]["CRM_ENTITY"] for call in remote.call_args_list
+                          if call.args[0] == "imopenlines.crm.chat.get"], ["100", "101"])
 
     def test_many_occupied_candidates_resume_without_starving_free_leads(self):
         headers = [{"ID": str(i), "DATE_MODIFY": self.version} for i in range(100, 106)]
