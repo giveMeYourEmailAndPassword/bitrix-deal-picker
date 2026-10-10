@@ -131,6 +131,26 @@ Bitrix24; полям `currentUserId`, `managerId` и копии сделки и�
 перед записью. Смена владельца после проверки и внутри самого REST-вызова
 остаётся ограничением платформы.
 
+Поиск анализирует карточки в порядке очереди и возвращает первую подходящую,
+как только проверены все более ранние. Медленная более новая карточка не
+задерживает готовый результат. `NEXT_DEAL_SCAN_LIMIT` остаётся размером порции
+для подписанного продолжения, а `NEXT_DEAL_PREFETCH=2` ограничивает чтение вперёд.
+Все поиски используют общий пул из `NEXT_DEAL_SCAN_WORKERS` потоков и ограниченную
+очередь. Одновременные запросы одинакового списка или одной версии сделки
+разделяют уже выполняющееся чтение. Ошибки не кешируются; смена версии требует нового чтения.
+Сброс кеша после назначения не позволяет незавершённому чтению восстановить
+устаревший кеш. Владение диалогом по-прежнему проверяется отдельно и заново.
+
+`BITRIX_SOURCE_BATCH_ENABLED=1` объединяет два обязательных источника одной
+карточки — CRM-комментарии и активности — в один HTTP-запрос Bitrix `batch`.
+Каждый источник проверяется на ошибку и дочитывается по собственному курсору;
+неполный ответ никогда не считается пустым обращением. История последней
+OpenLine-сессии и правила выбора направления остаются прежними. Значение `0`
+возвращает отдельные запросы источников. `SEARCH_TIMING_LOG_ENABLED=1` пишет
+одну JSON-строку `deal_search_timing` на поиск: время профиля, доступа, локального
+журнала, заголовков, ожидания анализа и проверки владельца. В ней нет ID,
+переписки, параметров REST или токенов.
+
 Статистика `CLAIM_STATS_SOURCE=app_events` считается по неизменяемым событиям
 принятия заявки, записанным приложением. `DATE_MODIFY` и простое нахождение
 сделки в стадии `NEW` не считаются достоверной датой принятия. Ручной переход
@@ -779,3 +799,14 @@ JSON-версии не должен продолжать запись: она н
 - [Volumes и права доступа](https://docs.railway.com/volumes)
 - [Deployment healthchecks](https://docs.railway.com/deployments/healthchecks)
 - [Rollback deployment](https://docs.railway.com/deployments/deployment-actions)
+
+
+### Concurrent claim fences
+
+A claim/rejection holds its employee quota/policy lock and the deal lock. Other
+employees claiming different deals no longer wait for its remote Bitrix reads.
+Administrative access changes keep the employee lock; the reconciler uses the
+same employee/deal order and rereads the durable operation after acquiring it.
+Recovering a prior employee's ambiguous operation holds both employee locks in
+sorted order, preserving their quota before the deal lock. SQLite leases and
+fresh ownership checks remain authoritative across retries and restarts.

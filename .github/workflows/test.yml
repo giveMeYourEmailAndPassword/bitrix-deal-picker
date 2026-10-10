@@ -31,7 +31,7 @@ jobs:
         run: python -m unittest discover -s . -p 'test*.py' -v
 
       - name: Compile runtime modules
-        run: python -m py_compile app.py state_store.py claim_chat_guard.py
+        run: python -m py_compile app.py state_store.py claim_chat_guard.py search_runtime.py claim_locks.py
 
       - name: Validate committed JSON
         run: |
