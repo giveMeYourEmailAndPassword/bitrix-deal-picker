@@ -104,6 +104,11 @@ class TemporaryStateTestCase(unittest.TestCase):
         self.store = StateStore(self.data_dir, db_filename="state.sqlite3", local_timezone=app.LOCAL_TZ)
         self._store_patch = patch.object(app, "STATE_STORE", self.store)
         self._store_patch.start()
+        # Existing tests isolate claim/recovery behavior from the new remote
+        # ownership read. test_active_dialog_claim.py exercises its real wiring.
+        self._chat_guard_patch = patch.object(app, "claim_chat_occupied", return_value=False)
+        self._chat_guard_patch.start()
+        self.addCleanup(self._chat_guard_patch.stop)
         app.DEAL_ANALYSIS_CACHE.clear()
         app.DEAL_HEADERS_CACHE.clear()
         app.PORTAL_USERS_CACHE.clear()
