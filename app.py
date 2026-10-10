@@ -22,7 +22,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import baza_bridge
-from claim_chat_guard import ClaimChatGuardUnavailable, read_claim_chat_ownership
+from claim_chat_guard import (
+    ClaimChatGuardUnavailable, claim_chat_guard_diagnostic, read_claim_chat_ownership,
+)
 from claim_locks import ClaimLocks, hold_claim_operation
 from search_runtime import (
     SearchTimings, SharedAnalysisPool, SingleFlight, ordered_analysis, read_source_lists_batch,
@@ -1764,14 +1766,23 @@ def read_limited_bitrix_json(response):
     return payload
 
 
+def bitrix_response_error(message, *, status=None, code=None):
+    # Preserve the existing exception contract while making guard diagnostics
+    # independent of exception text, provider descriptions and private URLs.
+    error = RuntimeError(message)
+    error.bitrix_http_status = status
+    error.bitrix_error_code = code
+    return error
+
+
 def raise_bitrix_http_error(exc):
     try:
         payload = read_limited_bitrix_json(exc)
     except RuntimeError:
-        raise RuntimeError(f"Bitrix HTTP {exc.code}") from exc
+        raise bitrix_response_error(f"Bitrix HTTP {exc.code}", status=exc.code) from exc
     error_code = str(payload.get("error") or "").strip()
     suffix = f": {error_code}" if error_code else ""
-    raise RuntimeError(f"Bitrix HTTP {exc.code}{suffix}") from exc
+    raise bitrix_response_error(f"Bitrix HTTP {exc.code}{suffix}", status=exc.code, code=error_code or None) from exc
 
 
 def bitrix_call(method, params=None, timeout=None):
@@ -1788,10 +1799,11 @@ def bitrix_call_full(method, params=None, timeout=None):
     try:
         with urllib.request.urlopen(url, data=data, timeout=timeout or BITRIX_TIMEOUT_SECONDS) as response:
             payload = read_limited_bitrix_json(response)
+            response_status = getattr(response, "status", None)
     except urllib.error.HTTPError as exc:
         raise_bitrix_http_error(exc)
     if "error" in payload:
-        raise RuntimeError(f"Bitrix API error: {payload.get('error') or 'unknown'}")
+        raise bitrix_response_error(f"Bitrix API error: {payload.get('error') or 'unknown'}", status=response_status, code=payload.get("error"))
     return payload
 
 
@@ -3798,11 +3810,20 @@ def claim_chat_occupied(deal_id, manager_id, *, timeout=8):
     return read_claim_chat_ownership(deal_id, manager_id, bitrix_call, timeout=timeout)
 
 
+def log_claim_chat_guard_unavailable(phase, error):
+    try:
+        sys.stderr.write(json.dumps(claim_chat_guard_diagnostic(phase, error), separators=(",", ":")) + "\n")
+    except Exception:
+        # Observability must not change the fail-closed response or start retries.
+        pass
+
+
 def claim_chat_check_response(deal_id, manager_id):
     try:
         if not claim_chat_occupied(deal_id, manager_id):
             return None
-    except ClaimChatGuardUnavailable:
+    except ClaimChatGuardUnavailable as error:
+        log_claim_chat_guard_unavailable("claim", error)
         return {
             "ok": False, "_httpStatus": 503,
             "code": "chat_ownership_unavailable",
@@ -3818,7 +3839,8 @@ def claim_chat_check_response(deal_id, manager_id):
 def require_available_greeting_chat(deal_id, manager_id):
     try:
         occupied = claim_chat_occupied(deal_id, manager_id)
-    except ClaimChatGuardUnavailable:
+    except ClaimChatGuardUnavailable as error:
+        log_claim_chat_guard_unavailable("greeting", error)
         raise RuntimeError("chat_ownership_unavailable") from None
     if occupied:
         raise RuntimeError("chat_owned_by_another_manager")
@@ -3955,7 +3977,8 @@ def _search_next_deal_for_manager(manager_id, continuation_token, timings):
                 timeout=8,
             ):
                 continue
-        except ClaimChatGuardUnavailable:
+        except ClaimChatGuardUnavailable as error:
+            log_claim_chat_guard_unavailable("search", error)
             # An unreadable older candidate must not silently be declared free
             # or skipped in favor of a newer lead.
             return {
