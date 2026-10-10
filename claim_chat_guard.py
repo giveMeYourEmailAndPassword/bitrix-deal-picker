@@ -7,10 +7,45 @@ import time
 
 MAX_ACTIVE_CLAIM_CHATS = 10
 MAX_CLAIM_CHAT_GUARD_SECONDS = 8.0
+GUARD_REASONS = frozenset({
+    "invalid_identity", "invalid_active_chat_list", "too_many_active_chats",
+    "invalid_active_chat_row", "invalid_dialog_deal_binding",
+    "dialog_deal_binding_mismatch", "invalid_dialog", "dialog_id_mismatch",
+    "dialog_not_openline", "owner_identity_mismatch", "invalid_owner_identity",
+    "invalid_owner_departments", "owner_not_internal", "owner_staff_unconfirmed",
+    "invalid_guard_timeout", "chat_guard_timeout", "chat_guard_read_failed",
+})
+GUARD_METHODS = frozenset({
+    "imopenlines.crm.chat.get", "imopenlines.dialog.get", "im.user.get",
+})
+GUARD_UPSTREAM_CODES = frozenset({
+    "QUERY_LIMIT_EXCEEDED", "OPERATION_TIME_LIMIT", "ACCESS_DENIED",
+    "ERROR_ACCESS_DENIED", "INVALID_CREDENTIALS", "INVALID_TOKEN",
+    "NO_AUTH_FOUND", "METHOD_NOT_FOUND", "ERROR_METHOD_NOT_FOUND",
+    "NOT_FOUND", "ERROR_NOT_FOUND",
+})
 
 
 class ClaimChatGuardUnavailable(RuntimeError):
     """The current dialog ownership could not be established safely."""
+
+
+def claim_chat_guard_diagnostic(phase, error):
+    """Return finite metadata only; never serialize an exception or its cause."""
+    reason = error.args[0] if error.args else None
+    method = getattr(error, "method", None)
+    duration = getattr(error, "duration_ms", None)
+    status = getattr(error, "upstream_status", None)
+    code = getattr(error, "upstream_code", None)
+    return {
+        "event": "claim_chat_guard_unavailable",
+        "phase": phase if type(phase) is str and phase in {"search", "claim", "greeting"} else "unknown",
+        "reason": reason if type(reason) is str and reason in GUARD_REASONS else "unknown",
+        "method": method if type(method) is str and method in GUARD_METHODS else None,
+        "durationMs": round(duration, 1) if type(duration) in (int, float) and 0 <= duration <= 60_000 and math.isfinite(duration) else None,
+        "upstreamStatus": status if type(status) is int and 100 <= status <= 599 else None,
+        "upstreamCode": code if type(code) is str and code in GUARD_UPSTREAM_CODES else "other" if code is not None else None,
+    }
 
 
 def _positive_id(value):
@@ -120,10 +155,17 @@ def read_claim_chat_ownership(deal_id, manager_id, call, timeout=8):
         raise ClaimChatGuardUnavailable("invalid_guard_timeout") from exc
     if not math.isfinite(budget) or budget <= 0:
         raise ClaimChatGuardUnavailable("invalid_guard_timeout")
-    deadline = time.monotonic() + min(budget, MAX_CLAIM_CHAT_GUARD_SECONDS)
+    started = time.monotonic()
+    deadline = started + min(budget, MAX_CLAIM_CHAT_GUARD_SECONDS)
+    last_method = None
+    elapsed_ms = 0.0
 
     def bounded_call(method, params):
-        remaining = deadline - time.monotonic()
+        nonlocal last_method, elapsed_ms
+        last_method = method
+        checked_at = time.monotonic()
+        elapsed_ms = (checked_at - started) * 1000
+        remaining = deadline - checked_at
         if remaining <= 0:
             raise ClaimChatGuardUnavailable("chat_guard_timeout")
         try:
@@ -131,23 +173,34 @@ def read_claim_chat_ownership(deal_id, manager_id, call, timeout=8):
         except Exception as exc:
             # Keep remote error text (which may contain credentials) out of
             # messages presented by the calling claim route.
-            raise ClaimChatGuardUnavailable("chat_guard_read_failed") from exc
-        if time.monotonic() >= deadline:
+            elapsed_ms = (time.monotonic() - started) * 1000
+            error = ClaimChatGuardUnavailable("chat_guard_read_failed")
+            error.upstream_status = getattr(exc, "bitrix_http_status", None)
+            error.upstream_code = getattr(exc, "bitrix_error_code", None)
+            raise error from exc
+        checked_at = time.monotonic()
+        elapsed_ms = (checked_at - started) * 1000
+        if checked_at >= deadline:
             raise ClaimChatGuardUnavailable("chat_guard_timeout")
         return result
 
-    chats = bounded_call(
-        "imopenlines.crm.chat.get",
-        {"CRM_ENTITY_TYPE": "DEAL", "CRM_ENTITY": deal_id, "ACTIVE_ONLY": "Y"},
-    )
-    for chat_id in _active_chat_ids(chats):
-        owner_id = _dialog_owner(
-            bounded_call("imopenlines.dialog.get", {"CHAT_ID": chat_id}),
-            chat_id,
-            deal_id,
+    try:
+        chats = bounded_call(
+            "imopenlines.crm.chat.get",
+            {"CRM_ENTITY_TYPE": "DEAL", "CRM_ENTITY": deal_id, "ACTIVE_ONLY": "Y"},
         )
-        if owner_id == manager_id:
-            continue
-        if _owner_is_staff(bounded_call("im.user.get", {"ID": owner_id}), owner_id):
-            return True
-    return False
+        for chat_id in _active_chat_ids(chats):
+            owner_id = _dialog_owner(
+                bounded_call("imopenlines.dialog.get", {"CHAT_ID": chat_id}),
+                chat_id,
+                deal_id,
+            )
+            if owner_id == manager_id:
+                continue
+            if _owner_is_staff(bounded_call("im.user.get", {"ID": owner_id}), owner_id):
+                return True
+        return False
+    except ClaimChatGuardUnavailable as error:
+        error.method = last_method
+        error.duration_ms = elapsed_ms
+        raise
