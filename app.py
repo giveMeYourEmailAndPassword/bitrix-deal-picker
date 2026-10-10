@@ -2844,12 +2844,12 @@ def split_message_fragments(text):
     return fragments or [text]
 
 
-def useful_fragments(text):
+def useful_fragments(text, *, minimum_length=8):
     fragments = []
     for fragment in split_message_fragments(text):
-        if len(fragment) < 8:
+        if len(fragment) < minimum_length:
             continue
-        if not re.search(r"[A-Za-zА-Яа-яЁё]", fragment):
+        if not any(character.isalpha() for character in fragment):
             continue
         if is_service_text(fragment):
             continue
@@ -2881,6 +2881,22 @@ def source_numeric_id(value):
     return int(raw)
 
 
+def openline_sender_is_employee(users, sender_id):
+    """Exclude only an exact, explicitly internal employee from request text."""
+    identity = source_numeric_id(sender_id)
+    if not isinstance(users, dict) or identity is None or identity <= 0:
+        return False
+    user = users.get(str(identity), users.get(identity))
+    if not isinstance(user, dict) or source_numeric_id(user.get("id")) != identity:
+        return False
+    departments = user.get("departments")
+    return (
+        user.get("connector") is False and user.get("extranet") is False
+        and isinstance(departments, list) and bool(departments)
+        and all((source_numeric_id(value) or 0) > 0 for value in departments)
+    )
+
+
 def get_openline_history_candidates(session_id, timeout=None):
     if not session_id:
         return []
@@ -2899,10 +2915,12 @@ def get_openline_history_candidates(session_id, timeout=None):
         "imopenlines.session.history.get",
         {"SESSION_ID": session_id},
         timeout=effective_timeout,
-    ) or {}
+    )
     if time.monotonic() > deadline:
         raise TimeoutError("Истёк таймаут истории открытой линии")
-    raw_messages = history.get("message") or {}
+    if not isinstance(history, dict):
+        raise RuntimeError("Bitrix вернул неожиданный формат истории открытой линии")
+    raw_messages = history.get("message")
     if isinstance(raw_messages, dict):
         message_entries = list(raw_messages.items())
     elif isinstance(raw_messages, list):
@@ -2918,8 +2936,12 @@ def get_openline_history_candidates(session_id, timeout=None):
             raise RuntimeError("Bitrix вернул повреждённое сообщение открытой линии")
         if str(message.get("senderid", "0")) == "0":
             continue
+        if openline_sender_is_employee(history.get("users"), message.get("senderid")):
+            continue
         text = clean_text(message.get("text") or message.get("textlegacy"))
-        fragments = useful_fragments(text)
+        # Direct chat messages include meaningful short replies such as "ОАЭ"
+        # and "Египет"; the CRM transcript length heuristic must not hide them.
+        fragments = useful_fragments(text, minimum_length=1)
         if not fragments:
             continue
         timestamp = parse_source_message_time(message.get("date"))
@@ -3249,13 +3271,13 @@ def get_deal_messages(deal_id):
         ),
         reverse=True,
     )
-    if openline_candidates:
+    if newest_openline_session_id:
         # If the latest message already names a destination, it supersedes an
         # older contradictory message in the same session. Otherwise keep one
         # preceding message because it can carry the destination for a short
         # follow-up such as "двое взрослых".
         candidates = openline_candidates[:2]
-        if classify([candidates[0].get("text") or ""])["direction"] != "Не определено":
+        if candidates and classify([candidates[0].get("text") or ""])["direction"] != "Не определено":
             candidates = candidates[:1]
     useful = []
     for candidate in candidates:
