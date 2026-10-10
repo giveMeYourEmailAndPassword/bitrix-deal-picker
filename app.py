@@ -23,6 +23,10 @@ from pathlib import Path
 
 import baza_bridge
 from claim_chat_guard import ClaimChatGuardUnavailable, read_claim_chat_ownership
+from claim_locks import ClaimLocks, hold_claim_operation
+from search_runtime import (
+    SearchTimings, SharedAnalysisPool, SingleFlight, ordered_analysis, read_source_lists_batch,
+)
 
 from state_store import (
     DealAlreadyClaimedError,
@@ -145,12 +149,16 @@ def normalize_allowed_hostname(value):
 
 APP_DIR = Path(os.environ.get("APP_DATA_DIR") or Path(__file__).resolve().parent)
 MANAGERS_FILE = APP_DIR / "managers.json"
-DATA_LOCK = threading.Lock()
+CLAIM_LOCKS = ClaimLocks()
 GREETING_LOCK = threading.Lock()
 GREETING_WAKE_EVENT = threading.Event()
 LOST_DEAL_AUTOCLOSE_WAKE_EVENT = threading.Event()
 DEAL_ANALYSIS_CACHE_LOCK = threading.Lock()
 DEAL_HEADERS_CACHE_LOCK = threading.Lock()
+DEAL_HEADERS_GENERATION = 0
+DEAL_ANALYSIS_GENERATIONS = defaultdict(int)
+HEADERS_INFLIGHT = SingleFlight()
+ANALYSIS_INFLIGHT = SingleFlight()
 LOCAL_TZ = timezone(timedelta(hours=env_int("APP_TZ_OFFSET_HOURS", 6, -12, 14)))
 STATE_STORE = StateStore(APP_DIR, local_timezone=LOCAL_TZ, auto_initialize=False)
 APP_VERSION = (
@@ -218,6 +226,10 @@ GREETING_ACTOR_THREAD_SLOTS = threading.BoundedSemaphore(
 )
 NEXT_DEAL_SCAN_LIMIT = env_int("NEXT_DEAL_SCAN_LIMIT", 12, 1, 50)
 NEXT_DEAL_SCAN_WORKERS = env_int("NEXT_DEAL_SCAN_WORKERS", NEXT_DEAL_SCAN_LIMIT, 1, 32)
+NEXT_DEAL_PREFETCH = env_int("NEXT_DEAL_PREFETCH", 2, 1, 8)
+BITRIX_SOURCE_BATCH_ENABLED = env_bool("BITRIX_SOURCE_BATCH_ENABLED", True)
+SEARCH_TIMING_LOG_ENABLED = env_bool("SEARCH_TIMING_LOG_ENABLED", True)
+SEARCH_ANALYSIS_POOL = SharedAnalysisPool(NEXT_DEAL_SCAN_WORKERS)
 NEXT_DEAL_BATCH_TIMEOUT_SECONDS = env_float("NEXT_DEAL_BATCH_TIMEOUT_SECONDS", 12, 1, 60)
 DEAL_ANALYSIS_CACHE_TTL_SECONDS = env_float("DEAL_ANALYSIS_CACHE_TTL_SECONDS", 300, 5, 3600)
 DEAL_HEADERS_CACHE_TTL_SECONDS = env_float("DEAL_HEADERS_CACHE_TTL_SECONDS", 10, 1, 60)
@@ -3084,7 +3096,43 @@ def get_deal_messages(deal_id):
             raise TimeoutError("Истёк общий таймаут анализа сделки")
         return min(float(maximum), remaining)
 
+    source_params = {
+        "crm.timeline.comment.list": {
+            "filter[ENTITY_ID]": deal_id,
+            "filter[ENTITY_TYPE]": "deal",
+            "select[]": ["ID", "COMMENT", "CREATED"],
+            "order[CREATED]": "DESC",
+            "order[ID]": "DESC",
+        },
+        "crm.activity.list": {
+            "filter[OWNER_ID]": deal_id,
+            "filter[OWNER_TYPE_ID]": "2",
+            "select[]": [
+                "ID", "SUBJECT", "DESCRIPTION", "CREATED", "PROVIDER_ID",
+                "DIRECTION", "ASSOCIATED_ENTITY_ID", "PROVIDER_PARAMS",
+            ],
+            "order[CREATED]": "DESC",
+            "order[ID]": "DESC",
+        },
+    }
+    batched_sources = None
+    if BITRIX_SOURCE_BATCH_ENABLED:
+        try:
+            batched_sources = read_source_lists_batch(
+                {
+                    "timeline": ("crm.timeline.comment.list", source_params["crm.timeline.comment.list"]),
+                    "activity": ("crm.activity.list", source_params["crm.activity.list"]),
+                },
+                bitrix_call,
+                max_items=MAX_SOURCE_RECORDS_PER_DEAL,
+                timeout=remaining_timeout(maximum=2 * BITRIX_FAST_TIMEOUT_SECONDS),
+            )
+        except Exception:
+            raise RuntimeError("Не удалось полностью прочитать историю сделки из Bitrix.") from None
+
     def bounded_source_list(method, params):
+        if batched_sources is not None:
+            return batched_sources["timeline" if method == "crm.timeline.comment.list" else "activity"]
         items = bitrix_list_all(
             method,
             params,
@@ -3101,14 +3149,7 @@ def get_deal_messages(deal_id):
     source_errors = []
     try:
         comments = bounded_source_list(
-            "crm.timeline.comment.list",
-            {
-                "filter[ENTITY_ID]": deal_id,
-                "filter[ENTITY_TYPE]": "deal",
-                "select[]": ["ID", "COMMENT", "CREATED"],
-                "order[CREATED]": "DESC",
-                "order[ID]": "DESC",
-            },
+            "crm.timeline.comment.list", source_params["crm.timeline.comment.list"],
         ) or []
         for item in comments:
             text = clean_text(item.get("COMMENT"))
@@ -3126,23 +3167,7 @@ def get_deal_messages(deal_id):
 
     try:
         activities = bounded_source_list(
-            "crm.activity.list",
-            {
-                "filter[OWNER_ID]": deal_id,
-                "filter[OWNER_TYPE_ID]": "2",
-                "select[]": [
-                    "ID",
-                    "SUBJECT",
-                    "DESCRIPTION",
-                    "CREATED",
-                    "PROVIDER_ID",
-                    "DIRECTION",
-                    "ASSOCIATED_ENTITY_ID",
-                    "PROVIDER_PARAMS",
-                ],
-                "order[CREATED]": "DESC",
-                "order[ID]": "DESC",
-            },
+            "crm.activity.list", source_params["crm.activity.list"],
         ) or []
         openline_activities = [
             item
@@ -3547,6 +3572,21 @@ def list_allowed_deal_headers():
         cached = DEAL_HEADERS_CACHE.get("all")
         if cached and now - cached.get("cachedAt", 0) < DEAL_HEADERS_CACHE_TTL_SECONDS:
             return [dict(item) for item in cached.get("headers", [])]
+        generation = DEAL_HEADERS_GENERATION
+    headers = HEADERS_INFLIGHT.run(
+        generation, lambda: _load_allowed_deal_headers(generation),
+        timeout=BITRIX_TIMEOUT_SECONDS + 1,
+    )
+    return [dict(item) for item in headers]
+
+
+def _load_allowed_deal_headers(generation):
+    # A read that finished while another caller entered SingleFlight may have
+    # populated the cache already. Check again before creating remote work.
+    with DEAL_HEADERS_CACHE_LOCK:
+        cached = DEAL_HEADERS_CACHE.get("all")
+        if cached and time.monotonic() - cached.get("cachedAt", 0) < DEAL_HEADERS_CACHE_TTL_SECONDS:
+            return [dict(item) for item in cached.get("headers", [])]
     pending = []
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=len(SOURCE_STAGES))
     futures = {
@@ -3590,18 +3630,22 @@ def list_allowed_deal_headers():
 
     pending.sort(key=lambda item: (item.get("DATE_CREATE") or "", int(item.get("ID") or 0)))
     with DEAL_HEADERS_CACHE_LOCK:
-        DEAL_HEADERS_CACHE["all"] = {
-            "cachedAt": time.monotonic(),
-            "headers": [dict(item) for item in pending],
-        }
+        if generation == DEAL_HEADERS_GENERATION:
+            DEAL_HEADERS_CACHE["all"] = {
+                "cachedAt": time.monotonic(),
+                "headers": [dict(item) for item in pending],
+            }
     return [dict(item) for item in pending]
 
 
 def invalidate_deal_caches(deal_id=None):
+    global DEAL_HEADERS_GENERATION
     with DEAL_HEADERS_CACHE_LOCK:
+        DEAL_HEADERS_GENERATION += 1
         DEAL_HEADERS_CACHE.clear()
     if deal_id is not None:
         with DEAL_ANALYSIS_CACHE_LOCK:
+            DEAL_ANALYSIS_GENERATIONS[str(deal_id)] += 1
             DEAL_ANALYSIS_CACHE.pop(str(deal_id), None)
 
 
@@ -3661,6 +3705,26 @@ def analyze_deal_header(deal):
         ):
             return dict(cached["deal"])
 
+        generation = DEAL_ANALYSIS_GENERATIONS.get(deal_id, 0)
+    result = ANALYSIS_INFLIGHT.run(
+        (deal_id, cache_version, generation),
+        lambda: _analyze_deal_header_uncached(deal, cache_version, generation),
+        timeout=NEXT_DEAL_BATCH_TIMEOUT_SECONDS,
+    )
+    return dict(result)
+
+
+def _analyze_deal_header_uncached(deal, cache_version, generation):
+    deal_id = str(deal.get("ID") or "")
+    now = time.monotonic()
+    with DEAL_ANALYSIS_CACHE_LOCK:
+        cached = DEAL_ANALYSIS_CACHE.get(deal_id)
+        if (
+            cached and cached.get("version") == cache_version
+            and now - cached.get("cachedAt", 0) < DEAL_ANALYSIS_CACHE_TTL_SECONDS
+        ):
+            return dict(cached["deal"])
+
     messages = get_deal_messages(deal_id)
     classification = classify(messages["useful"])
     analyzed = {
@@ -3677,12 +3741,14 @@ def analyze_deal_header(deal):
         "classification": classification,
     }
     with DEAL_ANALYSIS_CACHE_LOCK:
+        if generation != DEAL_ANALYSIS_GENERATIONS.get(deal_id, 0):
+            return dict(analyzed)
         bounded_cache_put(
             DEAL_ANALYSIS_CACHE,
             deal_id,
             {
                 "version": cache_version,
-                "cachedAt": now,
+                "cachedAt": time.monotonic(),
                 "deal": analyzed,
                 # This never enters the browser DTO.  It is the same
                 # server-read snapshot that produced the signed selection.
@@ -3698,35 +3764,32 @@ def analyze_deal_header(deal):
     return dict(analyzed)
 
 
+def iter_analyzed_deal_headers(headers):
+    def submit(header):
+        deal_id = str(header.get("ID") or "")
+        with DEAL_ANALYSIS_CACHE_LOCK:
+            generation = DEAL_ANALYSIS_GENERATIONS.get(deal_id, 0)
+        key = (deal_id, deal_version(header), generation)
+        return SEARCH_ANALYSIS_POOL.submit(key, lambda: analyze_deal_header(header))
+
+    for header, deal, error in ordered_analysis(
+        headers, submit,
+        prefetch=min(NEXT_DEAL_PREFETCH, NEXT_DEAL_SCAN_WORKERS),
+        timeout=NEXT_DEAL_BATCH_TIMEOUT_SECONDS,
+    ):
+        # Shared futures must never share manager-specific offer fields/tokens.
+        yield header, dict(deal) if deal is not None else None, error
+
+
 def analyze_deal_headers(headers):
-    if not headers:
-        return {}, {}
-    workers = max(1, min(NEXT_DEAL_SCAN_WORKERS, len(headers)))
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
-    futures = {
-        executor.submit(analyze_deal_header, header): str(header.get("ID") or "")
-        for header in headers
-    }
-    analyzed = {}
-    errors = {}
-    try:
-        for future in concurrent.futures.as_completed(
-            futures,
-            timeout=NEXT_DEAL_BATCH_TIMEOUT_SECONDS,
-        ):
-            deal_id = futures[future]
-            try:
-                analyzed[deal_id] = future.result()
-            except Exception as exc:
-                errors[deal_id] = str(exc)
-    except concurrent.futures.TimeoutError:
-        pass
-    finally:
-        for future, deal_id in futures.items():
-            if not future.done():
-                errors.setdefault(deal_id, "timeout")
-                future.cancel()
-        executor.shutdown(wait=True, cancel_futures=True)
+    """Materialize a batch for callers that need all results, with shared bounds."""
+    analyzed, errors = {}, {}
+    for header, deal, error in iter_analyzed_deal_headers(headers):
+        deal_id = str(header.get("ID") or "")
+        if error:
+            errors[deal_id] = error
+        else:
+            analyzed[deal_id] = deal
     return analyzed, errors
 
 
@@ -3762,7 +3825,18 @@ def require_available_greeting_chat(deal_id, manager_id):
 
 
 def _get_next_deal_for_manager(manager_id, continuation_token=None):
-    manager = get_manager_profile(manager_id)
+    timings = SearchTimings()
+    result = {"_httpStatus": 503}
+    try:
+        result = _search_next_deal_for_manager(manager_id, continuation_token, timings)
+        return result
+    finally:
+        if SEARCH_TIMING_LOG_ENABLED:
+            sys.stderr.write(json.dumps(timings.summary(result), separators=(",", ":")) + "\n")
+
+
+def _search_next_deal_for_manager(manager_id, continuation_token, timings):
+    manager = timings.call("profile", get_manager_profile, manager_id)
     unavailable = manager_profile_unavailable_response(manager)
     if unavailable:
         return unavailable
@@ -3772,7 +3846,7 @@ def _get_next_deal_for_manager(manager_id, continuation_token=None):
         return {"manager": manager, "deal": None, "reason": "Пользователь деактивирован в Bitrix24."}
     if manager.get("intranet") is not True:
         return {"manager": manager, "deal": None, "reason": "Выдача доступна только сотрудникам компании."}
-    access = check_manager_access(manager_id)
+    access = timings.call("access", check_manager_access, manager_id)
     if not access["ok"]:
         return {
             "manager": manager,
@@ -3786,9 +3860,9 @@ def _get_next_deal_for_manager(manager_id, continuation_token=None):
             "extraClaimGrantAvailable": bool(access.get("extraClaimGrantAvailable")),
         }
 
-    rejection_history = STATE_STORE.list_rejection_history(manager_id)
-    unresolved_deal_ids = STATE_STORE.list_unresolved_claim_deal_ids()
-    claimed_deal_ids = STATE_STORE.list_claimed_deal_ids()
+    rejection_history = timings.call("local_history", STATE_STORE.list_rejection_history, manager_id)
+    unresolved_deal_ids = timings.call("local_history", STATE_STORE.list_unresolved_claim_deal_ids)
+    claimed_deal_ids = timings.call("local_history", STATE_STORE.list_claimed_deal_ids)
     headers = [
         {
             **header,
@@ -3797,7 +3871,7 @@ def _get_next_deal_for_manager(manager_id, continuation_token=None):
                 0,
             ),
         }
-        for header in list_allowed_deal_headers()
+        for header in timings.call("headers", list_allowed_deal_headers)
         if str(header.get("ID") or "") not in unresolved_deal_ids
         if str(header.get("ID") or "") not in claimed_deal_ids
     ]
@@ -3817,25 +3891,26 @@ def _get_next_deal_for_manager(manager_id, continuation_token=None):
         }
     batch_limit = max(1, NEXT_DEAL_SCAN_LIMIT)
     batch_headers = headers[offset : offset + batch_limit]
-    analyzed, errors = analyze_deal_headers(batch_headers)
+    analysis_rows = timings.rows(iter_analyzed_deal_headers(batch_headers))
     next_offset = offset + len(batch_headers)
     has_more = next_offset < len(headers)
     response_meta = {
-        "checkedCount": len(batch_headers),
+        "checkedCount": 0,
         "hasMore": has_more,
-        "partialTimeouts": len(errors),
+        "partialTimeouts": 0,
         "continuationToken": (
             issue_search_cursor(manager_id, next_offset, snapshot) if has_more else None
         ),
     }
 
     ownership_checks = 0
-    for header_index, header in enumerate(batch_headers):
+    for header_index, (header, deal, analysis_error) in enumerate(analysis_rows):
+        response_meta["checkedCount"] = header_index + 1
         header_id = str(header.get("ID") or "")
         # Another process may have completed a claim during the history scan.
         if STATE_STORE.deal_was_claimed(header_id):
             continue
-        if header_id in errors or header_id not in analyzed:
+        if analysis_error:
             return {
                 "manager": manager,
                 "deal": None,
@@ -3843,13 +3918,12 @@ def _get_next_deal_for_manager(manager_id, continuation_token=None):
                     "Не удалось безопасно проверить самую старую заявку. "
                     "Повторите поиск через минуту."
                 ),
-                "checkedCount": len(batch_headers),
-                "partialTimeouts": max(1, len(errors)),
+                "checkedCount": header_index + 1,
+                "partialTimeouts": 1,
                 "hasMore": False,
                 "continuationToken": None,
                 "_httpStatus": 503,
             }
-        deal = analyzed.get(header_id)
         if not deal:
             continue
         score = deal_score_for_manager(deal, manager)
@@ -3868,7 +3942,7 @@ def _get_next_deal_for_manager(manager_id, continuation_token=None):
             return {
                 "manager": manager, "deal": None,
                 "reason": "Проверяю следующие заявки...",
-                "checkedCount": header_index, "partialTimeouts": len(errors),
+                "checkedCount": header_index, "partialTimeouts": 0,
                 "hasMore": True,
                 "continuationToken": issue_search_cursor(
                     manager_id, offset + header_index, snapshot,
@@ -3876,8 +3950,8 @@ def _get_next_deal_for_manager(manager_id, continuation_token=None):
             }
         ownership_checks += 1
         try:
-            if claim_chat_occupied(
-                header_id, manager_id,
+            if timings.call(
+                "ownership", claim_chat_occupied, header_id, manager_id,
                 timeout=8,
             ):
                 continue
@@ -3888,7 +3962,7 @@ def _get_next_deal_for_manager(manager_id, continuation_token=None):
                 "manager": manager, "deal": None,
                 "reason": "Не удалось проверить, свободен ли диалог. Повторите поиск через минуту.",
                 "code": "chat_ownership_unavailable", "_httpStatus": 503,
-                "checkedCount": len(batch_headers), "hasMore": False,
+                "checkedCount": header_index + 1, "hasMore": False,
                 "continuationToken": None,
             }
         deal["matchScore"] = score
@@ -3920,9 +3994,7 @@ def _get_next_deal_for_manager(manager_id, continuation_token=None):
             "reason": "Проверяю следующие заявки...",
             **response_meta,
         }
-    if errors and not analyzed:
-        reason = "Bitrix отвечает слишком долго. Повторите поиск через минуту."
-    elif not manager.get("competencies"):
+    if not manager.get("competencies"):
         reason = "В карточке сотрудника нет навыков, а общих заявок без страны сейчас нет."
     else:
         reason = "Нет доступных сделок по навыкам менеджера или общих заявок без страны."
@@ -4603,9 +4675,12 @@ def preview_claim(deal_id, manager_id, auth=None, selection_token=None, *, send_
     success_result = None
     suppress_replay_greeting = False
     claim_access = None
-    with DATA_LOCK:
+    with hold_claim_operation(
+        CLAIM_LOCKS, manager_id, deal_id,
+        lambda: normalize_entity_id((STATE_STORE.get_claim_operation(operation_key) or {}).get("managerId")),
+    ):
         # Reject and claim are mutually exclusive for one offered lifecycle.
-        # Recheck after acquiring the same process-wide lock used by
+        # Recheck after acquiring the same manager/deal fences used by
         # ``record_rejection``; a rejection may have committed between the
         # fast-path check above and this critical section.
         if STATE_STORE.get_rejection_by_semantic_key(semantic_rejection):
@@ -5113,7 +5188,7 @@ def preview_claim(deal_id, manager_id, auth=None, selection_token=None, *, send_
 
         if success_result is None:
             # Re-read only after a durable attempt-specific operation lease is
-            # reserved. DATA_LOCK serializes this single production process;
+            # reserved. Manager/deal fences serialize conflicting operations;
             # SQLite and the CRM marker protect restart/race recovery.
             # Native Bitrix acceptance need not change the CRM deal version.
             # Check again after the lease and immediately before the write.
@@ -5313,10 +5388,22 @@ def reconcile_stale_claim_operations(limit=None):
     for listed_operation in candidates[: max(0, int(limit or CLAIM_RECONCILE_BATCH_SIZE))]:
         if listed_operation.get("status") == "pending" and not claim_operation_is_stale(listed_operation):
             continue
-        with DATA_LOCK:
-            operation_key = listed_operation.get("operationKey")
+        operation_key = listed_operation.get("operationKey")
+        listed_manager_id = normalize_entity_id(listed_operation.get("managerId"))
+        listed_deal_id = normalize_entity_id(listed_operation.get("dealId"))
+        if not operation_key or not listed_manager_id or not listed_deal_id:
+            summary["errors"] += 1
+            continue
+        with CLAIM_LOCKS.hold(listed_manager_id, listed_deal_id):
             operation = STATE_STORE.get_claim_operation(operation_key)
             if not operation or operation.get("status") not in {"pending", "failed"}:
+                continue
+            # A safe retry can transfer a failed operation to another manager
+            # after the candidate list was read. Do not act under the old
+            # manager's quota fence; the next sweep will lock its fresh owner.
+            if (operation.get("operationKey") != operation_key
+                    or str(operation.get("managerId") or "") != listed_manager_id
+                    or str(operation.get("dealId") or "") != listed_deal_id):
                 continue
             if operation.get("status") == "pending" and not claim_operation_is_stale(operation):
                 continue
@@ -5465,7 +5552,7 @@ def record_rejection(manager_id, payload):
     )
     operation_key = claim_operation_key(deal_id, selection_version)
     reason = normalize_reject_reason(payload.get("reason"))
-    with DATA_LOCK:
+    with CLAIM_LOCKS.hold(manager_id, deal_id):
         token_hash = hashlib.sha256(str(selection_token).encode("utf-8")).hexdigest()
         existing = (
             STATE_STORE.get_rejection_by_token_hash(token_hash)
@@ -5725,7 +5812,7 @@ def update_admin_rule(payload):
     # Serialize policy changes with claim/reject critical sections. Once the
     # administrator receives a successful disable response, no operation that
     # passed the old rule can still be waiting to write Bitrix.
-    with DATA_LOCK:
+    with CLAIM_LOCKS.hold(manager_id):
         rule = set_manager_rule(
             manager_id,
             enabled=enabled,

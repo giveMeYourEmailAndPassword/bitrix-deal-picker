@@ -83,7 +83,7 @@ class TestRejectionRetry(fixtures.ClaimWorkflowTestCase):
             patch.object(app, "get_manager_profile", return_value=profile),
             patch.object(app, "check_manager_access", return_value={"ok": True, "rule": {}}),
             patch.object(app, "list_allowed_deal_headers", return_value=headers),
-            patch.object(app, "analyze_deal_headers", side_effect=analyze) as analysis,
+            patch.object(app, "iter_analyzed_deal_headers", side_effect=lambda batch: fixtures.analysis_fixture_rows(batch, *(analyze(batch)))) as analysis,
             patch.object(app, "NEXT_DEAL_SCAN_LIMIT", batch_limit),
             patch.object(app, "bitrix_call", side_effect=lambda method, params=None, **kw:
                          next(dict(h) for h in headers if h["ID"] == params["id"])),
@@ -289,6 +289,10 @@ class TestRejectionRetry(fixtures.ClaimWorkflowTestCase):
         testcase = self
 
         class RejectBeforeClaimLock:
+            def hold(self, manager_id, deal_id, **_kwargs):
+                assert (manager_id, deal_id) == ("42", "1")
+                return self
+
             def __enter__(self):
                 testcase.seed_rejection(header, after=predecessor)
 
@@ -296,7 +300,7 @@ class TestRejectionRetry(fixtures.ClaimWorkflowTestCase):
                 return False
 
         with (
-            patch.object(app, "DATA_LOCK", RejectBeforeClaimLock()),
+            patch.object(app, "CLAIM_LOCKS", RejectBeforeClaimLock()),
             patch.object(app, "bitrix_call") as bitrix,
         ):
             result = app.preview_claim("1", "42", selection_token=offer["selectionToken"])

@@ -129,7 +129,7 @@ class TestActiveDialogClaim(fixtures.ClaimWorkflowTestCase):
         with (self.common_claim_context(),
               patch.object(app, "check_manager_access", return_value={"ok": True, "rule": {}}),
               patch.object(app, "list_allowed_deal_headers", return_value=headers),
-              patch.object(app, "analyze_deal_headers", return_value=(deals, {})),
+              patch.object(app, "iter_analyzed_deal_headers", side_effect=lambda batch: fixtures.analysis_fixture_rows(batch, *((deals, {})))),
               patch.object(app, "bitrix_call", side_effect=call)):
             return app._get_next_deal_for_manager(self.manager_id)
 
@@ -154,7 +154,7 @@ class TestActiveDialogClaim(fixtures.ClaimWorkflowTestCase):
         with (self.common_claim_context(),
               patch.object(app, "check_manager_access", return_value={"ok": True, "rule": {}}),
               patch.object(app, "list_allowed_deal_headers", return_value=headers),
-              patch.object(app, "analyze_deal_headers", side_effect=analyze),
+              patch.object(app, "iter_analyzed_deal_headers", side_effect=lambda batch: fixtures.analysis_fixture_rows(batch, *(analyze(batch)))),
               patch.object(app, "claim_chat_occupied", side_effect=occupied)):
             first = app._get_next_deal_for_manager(self.manager_id)
             self.assertIsNone(first["deal"])

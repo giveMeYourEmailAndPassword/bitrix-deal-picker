@@ -95,6 +95,11 @@ def tearDownModule():
             os.environ[name] = value
 
 
+def analysis_fixture_rows(headers, analyzed, errors):
+    return iter((header, analyzed.get(str(header["ID"])), errors.get(str(header["ID"])))
+                for header in headers)
+
+
 class TemporaryStateTestCase(unittest.TestCase):
     """Give each stateful test a fresh SQLite database outside the repo."""
 
@@ -109,6 +114,15 @@ class TemporaryStateTestCase(unittest.TestCase):
         self._chat_guard_patch = patch.object(app, "claim_chat_occupied", return_value=False)
         self._chat_guard_patch.start()
         self.addCleanup(self._chat_guard_patch.stop)
+        # Parsing/fallback regressions retain individual source fixtures; the
+        # batch transport and real streaming path are covered in test_search_speed.
+        for name, value in (("BITRIX_SOURCE_BATCH_ENABLED", False), ("SEARCH_TIMING_LOG_ENABLED", False)):
+            setting = patch.object(app, name, value)
+            setting.start()
+            self.addCleanup(setting.stop)
+        self._analysis_pool = app.SharedAnalysisPool(2)
+        self._analysis_pool_patch = patch.object(app, "SEARCH_ANALYSIS_POOL", self._analysis_pool)
+        self._analysis_pool_patch.start()
         app.DEAL_ANALYSIS_CACHE.clear()
         app.DEAL_HEADERS_CACHE.clear()
         app.PORTAL_USERS_CACHE.clear()
@@ -116,6 +130,8 @@ class TemporaryStateTestCase(unittest.TestCase):
         app.READINESS_CACHE.update({"checkedAt": 0.0, "state": None})
 
     def tearDown(self):
+        self._analysis_pool.shutdown()
+        self._analysis_pool_patch.stop()
         self._store_patch.stop()
         self._temp_dir.cleanup()
 
@@ -2573,7 +2589,7 @@ class TestEligibilityAndAccessPolicy(ClaimWorkflowTestCase):
 
 class TestAdminRuleSerialization(unittest.TestCase):
     def test_admin_rule_update_waits_for_claim_and_reject_critical_section(self):
-        shared_lock = threading.Lock()
+        claim_locks = app.ClaimLocks()
         saved = threading.Event()
         results = []
 
@@ -2586,19 +2602,18 @@ class TestAdminRuleSerialization(unittest.TestCase):
             }
 
         with (
-            patch.object(app, "DATA_LOCK", shared_lock),
+            patch.object(app, "CLAIM_LOCKS", claim_locks),
             patch.object(app, "require_admin", return_value={"id": "1"}),
             patch.object(app, "set_manager_rule", side_effect=save_rule),
         ):
-            shared_lock.acquire()
-            worker = threading.Thread(
-                target=lambda: results.append(
-                    app.update_admin_rule({"managerId": "42", "enabled": False})
+            with claim_locks.hold("42", "100"):
+                worker = threading.Thread(
+                    target=lambda: results.append(
+                        app.update_admin_rule({"managerId": "42", "enabled": False})
+                    )
                 )
-            )
-            worker.start()
-            self.assertFalse(saved.wait(0.05))
-            shared_lock.release()
+                worker.start()
+                self.assertFalse(saved.wait(0.05))
             worker.join(timeout=1)
 
         self.assertFalse(worker.is_alive())
@@ -3067,11 +3082,7 @@ class TestSearchContinuation(TemporaryStateTestCase):
             patch.object(app, "get_manager_profile", return_value=manager),
             patch.object(app, "check_manager_access", return_value={"ok": True, "rule": {}}),
             patch.object(app, "list_allowed_deal_headers", return_value=headers),
-            patch.object(
-                app,
-                "analyze_deal_headers",
-                return_value=({"1": self._deal(headers[0], "Турция"), "2": unclassified}, {}),
-            ),
+            patch.object(app, "iter_analyzed_deal_headers", side_effect=lambda batch: analysis_fixture_rows(batch, *(({"1": self._deal(headers[0], "Турция"), "2": unclassified}, {})))),
         ):
             result = app._get_next_deal_for_manager("42")
 
@@ -3103,7 +3114,7 @@ class TestSearchContinuation(TemporaryStateTestCase):
             patch.object(app, "get_manager_profile", return_value=dict(manager)),
             patch.object(app, "check_manager_access", return_value={"ok": True, "rule": {}}),
             patch.object(app, "list_allowed_deal_headers", return_value=headers),
-            patch.object(app, "analyze_deal_headers", side_effect=analyze),
+            patch.object(app, "iter_analyzed_deal_headers", side_effect=lambda batch: analysis_fixture_rows(batch, *(analyze(batch)))),
         ):
             first = app._get_next_deal_for_manager("42")
             second = app._get_next_deal_for_manager("42", first["continuationToken"])
@@ -3170,11 +3181,7 @@ class TestSearchContinuation(TemporaryStateTestCase):
             patch.object(app, "get_manager_profile", return_value=manager),
             patch.object(app, "check_manager_access", return_value={"ok": True, "rule": {}}),
             patch.object(app, "list_allowed_deal_headers", return_value=headers),
-            patch.object(
-                app,
-                "analyze_deal_headers",
-                return_value=({"2": self._deal(headers[1], "Турция")}, {"1": "timeout"}),
-            ),
+            patch.object(app, "iter_analyzed_deal_headers", side_effect=lambda batch: analysis_fixture_rows(batch, *(({"2": self._deal(headers[1], "Турция")}, {"1": "timeout"})))),
         ):
             result = app._get_next_deal_for_manager("42")
 
@@ -3212,7 +3219,7 @@ class TestSearchContinuation(TemporaryStateTestCase):
             patch.object(app, "get_manager_profile", return_value=manager),
             patch.object(app, "check_manager_access", return_value={"ok": True, "rule": {}}),
             patch.object(app, "list_allowed_deal_headers", return_value=headers),
-            patch.object(app, "analyze_deal_headers", side_effect=analyze),
+            patch.object(app, "iter_analyzed_deal_headers", side_effect=lambda batch: analysis_fixture_rows(batch, *(analyze(batch)))),
         ):
             result = app._get_next_deal_for_manager("42")
 
@@ -3234,7 +3241,7 @@ class TestSearchContinuation(TemporaryStateTestCase):
             patch.object(app, "get_manager_profile", return_value=manager),
             patch.object(app, "check_manager_access", return_value={"ok": True, "rule": {}}),
             patch.object(app, "list_allowed_deal_headers", return_value=headers),
-            patch.object(app, "analyze_deal_headers", side_effect=analyze),
+            patch.object(app, "iter_analyzed_deal_headers", side_effect=lambda batch: analysis_fixture_rows(batch, *(analyze(batch)))),
         ):
             result = app._get_next_deal_for_manager("42")
         self.assertEqual(result["deal"]["id"], "2")
@@ -3270,7 +3277,7 @@ class TestSearchContinuation(TemporaryStateTestCase):
             patch.object(app, "get_manager_profile", side_effect=profiles),
             patch.object(app, "check_manager_access", return_value={"ok": True, "rule": {}}),
             patch.object(app, "list_allowed_deal_headers", return_value=headers),
-            patch.object(app, "analyze_deal_headers", side_effect=analyze),
+            patch.object(app, "iter_analyzed_deal_headers", side_effect=lambda batch: analysis_fixture_rows(batch, *(analyze(batch)))),
         ):
             first = app._get_next_deal_for_manager("42")
             after_profile_change = app._get_next_deal_for_manager(
@@ -3375,6 +3382,10 @@ class TestSemanticRejectionLifecycle(TemporaryStateTestCase):
         store = self.store
 
         class RejectBeforeClaimLock:
+            def hold(self, manager_id, deal_id, **_kwargs):
+                assert (manager_id, deal_id) == ("42", "100")
+                return self
+
             def __enter__(self):
                 store.append_reject(
                     {
@@ -3390,7 +3401,7 @@ class TestSemanticRejectionLifecycle(TemporaryStateTestCase):
                 return False
 
         with (
-            patch.object(app, "DATA_LOCK", RejectBeforeClaimLock()),
+            patch.object(app, "CLAIM_LOCKS", RejectBeforeClaimLock()),
             patch.object(app, "bitrix_call") as bitrix_call,
         ):
             claimed = app.preview_claim("100", "42", selection_token=token)
