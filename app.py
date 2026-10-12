@@ -22,6 +22,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import baza_bridge
+from contact_owner_sync import ContactOwnerSync, entity_id as contact_entity_id
+from native_acceptance_sync import native_deal_unresolved
 from claim_chat_guard import (
     ClaimChatGuardUnavailable, claim_chat_guard_diagnostic, read_claim_chat_ownership,
 )
@@ -294,6 +296,7 @@ CLAIM_RECONCILE_INTERVAL_SECONDS = env_float(
     "CLAIM_RECONCILE_INTERVAL_SECONDS", 60, 30, 3600
 )
 CLAIM_RECONCILE_BATCH_SIZE = env_int("CLAIM_RECONCILE_BATCH_SIZE", 100, 1, 1000)
+NATIVE_ACCEPTANCE_SYNC_ENABLED = env_bool("NATIVE_ACCEPTANCE_SYNC_ENABLED", False)
 CLAIM_EVENT_EXPORT_ENABLED = env_bool("CLAIM_EVENT_EXPORT_ENABLED", False)
 EXTRA_CLAIM_REQUESTS_ENABLED = env_bool("EXTRA_CLAIM_REQUESTS_ENABLED", False)
 try:
@@ -4724,6 +4727,10 @@ def preview_claim(deal_id, manager_id, auth=None, selection_token=None, *, send_
         CLAIM_LOCKS, manager_id, deal_id,
         lambda: normalize_entity_id((STATE_STORE.get_claim_operation(operation_key) or {}).get("managerId")),
     ):
+        if native_deal_unresolved(STATE_STORE, deal_id):
+            return {"ok": False, "recoveryPending": True, "code": "native_owner_update_pending",
+                    "message": "Предыдущее принятие диалога ещё сверяется с Bitrix. Повторите проверку этой заявки позже.",
+                    "_httpStatus": 409}
         # Reject and claim are mutually exclusive for one offered lifecycle.
         # Recheck after acquiring the same manager/deal fences used by
         # ``record_rejection``; a rejection may have committed between the
@@ -5112,7 +5119,26 @@ def preview_claim(deal_id, manager_id, auth=None, selection_token=None, *, send_
                         "integrationUnavailable": False,
                         "_httpStatus": 409,
                     }
+            # Freeze the primary contact and its prior owner before reserving a
+            # new claim. A later manual change must not be overwritten by retry.
+            contact_context = None
+            primary_contact_id = normalize_entity_id(deal.get("CONTACT_ID"))
+            if primary_contact_id:
+                try:
+                    contact_snapshot_started = local_now().isoformat(timespec="microseconds")
+                    contact = bitrix_call("crm.contact.get", {"id": primary_contact_id}, timeout=8) or {}
+                    prior_owner = contact_entity_id(contact.get("ASSIGNED_BY_ID"), allow_zero=True)
+                    if normalize_entity_id(contact.get("ID")) != primary_contact_id or not prior_owner:
+                        raise ValueError("contact_unavailable")
+                    contact_context = {"contactId": primary_contact_id, "previousOwner": prior_owner,
+                                       "snapshotStartedAt": contact_snapshot_started}
+                except Exception:
+                    return {"ok": False, "message": "Не удалось проверить ответственного контакта. Повторите получение этой заявки.",
+                            "_httpStatus": 503}
             request_context = dict((existing_operation or {}).get("request") or {})
+            request_context.pop("contactOwnerContext", None)
+            if contact_context:
+                request_context["contactOwnerContext"] = contact_context
             if not send_greeting:
                 request_context.pop("greetingRequested", None)
                 request_context.pop("greetingContext", None)
@@ -5280,7 +5306,8 @@ def preview_claim(deal_id, manager_id, auth=None, selection_token=None, *, send_
                     "recoveryPending": True,
                     "_httpStatus": 409,
                 }
-            if deal_version(live_deal) != selection_version:
+            if (deal_version(live_deal) != selection_version
+                    or normalize_entity_id(live_deal.get("CONTACT_ID")) != primary_contact_id):
                 fail_claim_operation_safely(
                     operation_key,
                     "deal_version_changed_before_update",
@@ -5400,6 +5427,21 @@ def preview_claim(deal_id, manager_id, auth=None, selection_token=None, *, send_
         previous_claim = STATE_STORE.get_claim_by_operation_key(operation_key)
         if previous_claim:
             success_result["claimedAt"] = previous_claim["timestamp"]
+    if not DRY_RUN:
+        try:
+            contact_sync = ContactOwnerSync(STATE_STORE, bitrix_call, BITRIX_CLAIM_MARKER_FIELD, locks=CLAIM_LOCKS)
+            contact_sync.process(operation_key)
+            contact_status = contact_sync.status(operation_key)
+            if contact_status:
+                success_result["contactAssignment"] = contact_status
+                if contact_status["status"] != "ready":
+                    success_result.setdefault("warnings", []).append(
+                        "Сделка взята. Проверьте ответственного контакта: автоматическое назначение остановлено из-за изменения данных."
+                        if contact_status["status"] in {"conflict", "cancelled"} else
+                        "Сделка взята. Назначение ответственного контакта ещё не подтверждено."
+                    )
+        except Exception:
+            success_result["contactAssignment"] = {"status": "pending", "code": "contact_sync_unavailable"}
     if suppress_replay_greeting or not send_greeting:
         return success_result
     return attach_greeting_to_claim(
@@ -5580,6 +5622,26 @@ def claim_reconciliation_loop():
         except Exception as exc:
             sys.stderr.write(f"Claim reconciliation failed: {type(exc).__name__}\n")
         time.sleep(CLAIM_RECONCILE_INTERVAL_SECONDS)
+
+
+def responsibility_sync_loop():
+    contacts = ContactOwnerSync(STATE_STORE, bitrix_call, BITRIX_CLAIM_MARKER_FIELD, locks=CLAIM_LOCKS)
+    native = None
+    while True:
+        try:
+            if not DRY_RUN and readiness_state().get("ok"):
+                if NATIVE_ACCEPTANCE_SYNC_ENABLED:
+                    if native is None:
+                        from native_acceptance_sync import NativeAcceptanceSync
+                        native = NativeAcceptanceSync(
+                            STATE_STORE, bitrix_call, CLAIM_LOCKS, contacts, BITRIX_CLAIM_MARKER_FIELD,
+                            after_confirmed=invalidate_deal_caches,
+                        )
+                    native.run()
+                contacts.process()
+        except Exception as exc:
+            sys.stderr.write(f"Responsibility sync failed: {type(exc).__name__}\n")
+        time.sleep(30)
 
 
 def record_rejection(manager_id, payload):
@@ -7722,6 +7784,11 @@ def main():
     threading.Thread(
         target=claim_reconciliation_loop,
         name="claim-reconciler",
+        daemon=True,
+    ).start()
+    threading.Thread(
+        target=responsibility_sync_loop,
+        name="responsibility-sync",
         daemon=True,
     ).start()
     threading.Thread(

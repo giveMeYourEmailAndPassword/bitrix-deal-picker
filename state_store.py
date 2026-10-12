@@ -14,6 +14,7 @@ import os
 import re
 import secrets
 import sqlite3
+import contact_owner_sync
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone, tzinfo
@@ -450,7 +451,7 @@ class StateStore:
                     ON lost_deal_close_operations(status, updated_at);
                 """
             )
-            for statement in schema_sql.split(";"):
+            for statement in (schema_sql + contact_owner_sync.SCHEMA).split(";"):
                 if statement.strip():
                     connection.execute(statement)
             operation_columns = {
@@ -771,6 +772,7 @@ class StateStore:
                         "extra_claim_grants",
                         "integration_outbox",
                         "greeting_outbox",
+                        "contact_owner_jobs",
                         "lost_deal_close_operations",
                     )
                 )
@@ -935,6 +937,7 @@ class StateStore:
                     "extra_claim_grants",
                     "integration_outbox",
                     "greeting_outbox",
+                    "contact_owner_jobs",
                 )
             }
             if any(state_counts.values()):
@@ -3546,6 +3549,7 @@ class StateStore:
                     row = connection.execute(
                         "SELECT * FROM claim_operations WHERE operation_key = ?", (operation_key,)
                     ).fetchone()
+                    contact_owner_sync.reserve(connection, row, now)
                     operation = self._operation_row(row, created=False)
                     operation["retried"] = True
                     return operation
@@ -3582,6 +3586,7 @@ class StateStore:
             row = connection.execute(
                 "SELECT * FROM claim_operations WHERE operation_key = ?", (operation_key,)
             ).fetchone()
+            contact_owner_sync.reserve(connection, row, now)
             operation = self._operation_row(row, created=True)
             operation["retried"] = False
             return operation
@@ -3719,6 +3724,7 @@ class StateStore:
             row = connection.execute(
                 "SELECT * FROM claim_operations WHERE operation_key = ?", (operation_key,)
             ).fetchone()
+            contact_owner_sync.reserve(connection, row, now)
             operation = self._operation_row(row, created=False)
             operation["reassigned"] = True
             return operation
@@ -3935,6 +3941,7 @@ class StateStore:
                     operation_key,
                 ),
             )
+            contact_owner_sync.activate(connection, operation_key, current_request.get("claimMarker"), now)
             greeting_queued = self._enqueue_greeting_from_request(
                 connection,
                 row,
@@ -3980,6 +3987,9 @@ class StateStore:
                     and result_payload.get("remoteUpdated") is not False
                 )
             )
+            if not uncertainty_holds_grant:
+                request = json.loads(row["request_json"] or "{}")
+                contact_owner_sync.cancel_unapplied(connection, operation_key, request.get("claimMarker"), now)
             extra_claim_grant_id = row["extra_claim_grant_id"]
             if extra_claim_grant_id and not uncertainty_holds_grant:
                 grant = connection.execute(
