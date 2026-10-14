@@ -900,37 +900,6 @@ class TestManagerProfileAvailability(TemporaryStateTestCase):
                 access.assert_not_called()
 
 
-class TestManagerMatching(unittest.TestCase):
-    def test_competency_matching_uses_word_boundaries(self):
-        deal = {
-            "messages": ["female traveler"],
-            "classification": {"direction": "Не определено", "confidence": "низкая"},
-        }
-        # Unknown directions remain available to every manager by policy,
-        # so use a known direction to verify the text score itself.
-        deal["classification"]["direction"] = "Египет"
-        self.assertEqual(app.deal_score_for_manager(deal, {"competencies": ["male"]}), 0)
-
-    def test_unknown_direction_is_available_regardless_of_skills(self):
-        deal = {
-            "messages": ["Здравствуйте, можно узнать цену?"],
-            "classification": {"direction": "Не определено", "confidence": "низкая"},
-        }
-        for competencies in ([], ["", "  "], ["Турция"], ["Египет"]):
-            with self.subTest(competencies=competencies):
-                self.assertEqual(
-                    app.deal_score_for_manager(deal, {"competencies": competencies}),
-                    1,
-                )
-
-    def test_manager_without_skills_gets_zero_for_known_direction(self):
-        deal = {
-            "messages": ["Хочу в Турцию"],
-            "classification": {"direction": "Турция", "confidence": "средняя"},
-        }
-        self.assertEqual(app.deal_score_for_manager(deal, {"competencies": []}), 0)
-
-
 class TestExactApplicationEventStats(TemporaryStateTestCase):
     def test_admin_stats_use_only_persisted_application_events(self):
         self.store.append_claim(
@@ -2447,7 +2416,7 @@ class TestEligibilityAndAccessPolicy(ClaimWorkflowTestCase):
         self.assertEqual(self.store.count_claims(self.manager_id), 0)
         self.assertIsNone(self.store.get_claim_operation(self.operation_key()))
 
-    def test_selection_token_is_revoked_when_competencies_change(self):
+    def test_selection_token_remains_claimable_when_competencies_are_removed(self):
         with (
             self.common_claim_context(dry_run=True),
             patch.object(
@@ -2461,7 +2430,7 @@ class TestEligibilityAndAccessPolicy(ClaimWorkflowTestCase):
                     "competencies": [],
                 },
             ),
-            patch.object(app, "bitrix_call") as bitrix_call,
+            patch.object(app, "bitrix_call", return_value=self.source_deal()) as bitrix_call,
         ):
             result = app.preview_claim(
                 self.deal_id,
@@ -2469,7 +2438,20 @@ class TestEligibilityAndAccessPolicy(ClaimWorkflowTestCase):
                 selection_token=self.token(),
             )
 
+        self.assertTrue(result["ok"], result)
+        self.assertTrue(result["dryRun"])
+        bitrix_call.assert_called_once_with("crm.deal.get", {"id": self.deal_id})
+
+    def test_selection_token_is_revoked_when_daily_limit_changes(self):
+        token = self.token()
+        self.store.set_manager_rule(self.manager_id, enabled=True, daily_limit=10, note="")
+        with (
+            self.common_claim_context(dry_run=True),
+            patch.object(app, "bitrix_call") as bitrix_call,
+        ):
+            result = app.preview_claim(self.deal_id, self.manager_id, selection_token=token)
         self.assertFalse(result["ok"])
+        self.assertTrue(result["selectionStale"])
         self.assertEqual(result["_httpStatus"], 409)
         bitrix_call.assert_not_called()
 
@@ -3070,7 +3052,7 @@ class TestSearchContinuation(TemporaryStateTestCase):
             "classification": {"direction": direction, "confidence": "high"},
         }
 
-    def test_manager_without_skills_is_offered_oldest_unclassified_deal(self):
+    def test_manager_without_skills_is_offered_oldest_deal_with_known_direction(self):
         headers = [
             {"ID": "1", "STAGE_ID": next(iter(app.SOURCE_STAGES)), "DATE_MODIFY": "v1"},
             {"ID": "2", "STAGE_ID": next(iter(app.SOURCE_STAGES)), "DATE_MODIFY": "v2"},
@@ -3087,8 +3069,8 @@ class TestSearchContinuation(TemporaryStateTestCase):
             result = app._get_next_deal_for_manager("42")
 
         self.assertIsNotNone(result["deal"])
-        self.assertEqual(result["deal"]["id"], "2")
-        self.assertTrue(app.verify_selection_token(result["deal"]["selectionToken"], "2", "42"))
+        self.assertEqual(result["deal"]["id"], "1")
+        self.assertTrue(app.verify_selection_token(result["deal"]["selectionToken"], "1", "42"))
         self.assertFalse(result["hasMore"])
 
     def test_only_server_signed_cursor_can_advance_oldest_first_search(self):
@@ -3115,6 +3097,7 @@ class TestSearchContinuation(TemporaryStateTestCase):
             patch.object(app, "check_manager_access", return_value={"ok": True, "rule": {}}),
             patch.object(app, "list_allowed_deal_headers", return_value=headers),
             patch.object(app, "iter_analyzed_deal_headers", side_effect=lambda batch: analysis_fixture_rows(batch, *(analyze(batch)))),
+            patch.object(app, "claim_chat_occupied", side_effect=lambda deal_id, *_, **_kw: deal_id == "1"),
         ):
             first = app._get_next_deal_for_manager("42")
             second = app._get_next_deal_for_manager("42", first["continuationToken"])
@@ -3246,7 +3229,7 @@ class TestSearchContinuation(TemporaryStateTestCase):
             result = app._get_next_deal_for_manager("42")
         self.assertEqual(result["deal"]["id"], "2")
 
-    def test_profile_policy_change_invalidates_cursor_instead_of_skipping_oldest(self):
+    def test_skill_changes_do_not_invalidate_continuation_after_an_occupied_dialog(self):
         headers = [
             {"ID": "1", "STAGE_ID": next(iter(app.SOURCE_STAGES)), "DATE_MODIFY": "v1"},
             {"ID": "2", "STAGE_ID": next(iter(app.SOURCE_STAGES)), "DATE_MODIFY": "v2"},
@@ -3278,6 +3261,7 @@ class TestSearchContinuation(TemporaryStateTestCase):
             patch.object(app, "check_manager_access", return_value={"ok": True, "rule": {}}),
             patch.object(app, "list_allowed_deal_headers", return_value=headers),
             patch.object(app, "iter_analyzed_deal_headers", side_effect=lambda batch: analysis_fixture_rows(batch, *(analyze(batch)))),
+            patch.object(app, "claim_chat_occupied", side_effect=lambda deal_id, *_, **_kw: deal_id == "1"),
         ):
             first = app._get_next_deal_for_manager("42")
             after_profile_change = app._get_next_deal_for_manager(
@@ -3285,8 +3269,9 @@ class TestSearchContinuation(TemporaryStateTestCase):
             )
 
         self.assertIsNone(first["deal"])
-        self.assertEqual(after_profile_change["_httpStatus"], 409)
-        self.assertIsNone(after_profile_change["deal"])
+        self.assertTrue(first["hasMore"])
+        self.assertEqual(after_profile_change["deal"]["id"], "2")
+        self.assertFalse(after_profile_change["hasMore"])
 
 
 class TestSemanticRejectionLifecycle(TemporaryStateTestCase):

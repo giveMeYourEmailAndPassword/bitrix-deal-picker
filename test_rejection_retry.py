@@ -69,7 +69,7 @@ class TestRejectionRetry(fixtures.ClaimWorkflowTestCase):
 
     @contextmanager
     def search_context(self, headers, *, directions=None, manager_id="42",
-                       competencies=("Турция",), batch_limit=12):
+                       competencies=("Турция",), batch_limit=12, occupied=()):
         directions = directions or {}
         profile = self.profile(manager_id, competencies)
 
@@ -85,6 +85,7 @@ class TestRejectionRetry(fixtures.ClaimWorkflowTestCase):
             patch.object(app, "list_allowed_deal_headers", return_value=headers),
             patch.object(app, "iter_analyzed_deal_headers", side_effect=lambda batch: fixtures.analysis_fixture_rows(batch, *(analyze(batch)))) as analysis,
             patch.object(app, "NEXT_DEAL_SCAN_LIMIT", batch_limit),
+            patch.object(app, "claim_chat_occupied", side_effect=lambda deal_id, *_, **_kw: deal_id in occupied),
             patch.object(app, "bitrix_call", side_effect=lambda method, params=None, **kw:
                          next(dict(h) for h in headers if h["ID"] == params["id"])),
         ):
@@ -167,6 +168,7 @@ class TestRejectionRetry(fixtures.ClaimWorkflowTestCase):
         with (
             self.common_claim_context(),
             patch.object(app.time, "time", return_value=current_time),
+            patch.object(app, "get_manager_profile", return_value=self.profile(competencies=())),
             patch.object(app, "bitrix_call", side_effect=self.claim_side_effect(
                 [self.source_deal(), self.source_deal(), self.claimed_deal()]
             )) as bitrix,
@@ -177,31 +179,52 @@ class TestRejectionRetry(fixtures.ClaimWorkflowTestCase):
         self.assertEqual(len(self.store.list_claims()), 1)
         self.assertEqual(len(self.store.list_rejections()), 1)
 
-    def test_skill_mismatch_is_skipped_before_paginated_rejection_fallback(self):
+    def test_other_direction_is_offered_before_previously_rejected_lead(self):
         headers = [self.header(1), self.header(2), self.header(3)]
         self.seed_rejection(headers[0])
         with self.search_context(headers, directions={"2": "Египет", "3": "Египет"}, batch_limit=1):
-            first = app._get_next_deal_for_manager("42")
-            second = app._get_next_deal_for_manager("42", first["continuationToken"])
-            third = app._get_next_deal_for_manager("42", second["continuationToken"])
-        self.assertIsNone(first["deal"])
-        self.assertTrue(first["hasMore"])
-        self.assertIsNone(second["deal"])
-        self.assertTrue(second["hasMore"])
-        self.assertEqual(third["deal"]["id"], "1")
+            result = app._get_next_deal_for_manager("42")
+        self.assertEqual(result["deal"]["id"], "2")
+        self.assertEqual(result["deal"]["classification"]["direction"], "Египет")
+        self.assertFalse(result["hasMore"])
 
-    def test_without_skills_only_unclassified_rejected_lead_is_reoffered(self):
+    def test_without_skills_rejected_leads_of_every_direction_cycle(self):
         headers = [self.header(1), self.header(2)]
         for header in headers:
             self.seed_rejection(header)
         with self.search_context(headers, directions={"2": "Не определено"}, competencies=()):
-            result = app._get_next_deal_for_manager("42")
-        self.assertEqual(result["deal"]["id"], "2")
+            offered = []
+            for _ in range(3):
+                deal = app._get_next_deal_for_manager("42")["deal"]
+                offered.append(deal["id"])
+                self.assertTrue(self.reject_offer(deal)["ok"])
+        self.assertEqual(offered, ["1", "2", "1"])
+        self.assertEqual(len(self.store.list_rejections()), 5)
 
-    def test_matching_new_lead_on_later_page_precedes_rejected_fallback(self):
+    def test_skills_and_rejections_do_not_exclude_any_direction_for_either_manager(self):
+        headers = [self.header(i) for i in (1, 2, 3)]
+        directions = {"1": "Египет", "2": "Турция", "3": "Не определено"}
+        self.seed_rejection(headers[0], "42")
+        self.seed_rejection(headers[1], "43")
+        for manager_id, skills, expected in (
+            ("42", (), ["2", "3", "1", "2"]),
+            ("43", ("Мальдивы",), ["1", "3", "2", "1"]),
+        ):
+            with self.subTest(manager_id=manager_id), self.search_context(
+                headers, directions=directions, manager_id=manager_id, competencies=skills,
+            ):
+                offered = []
+                for _ in range(4):
+                    deal = app._get_next_deal_for_manager(manager_id)["deal"]
+                    offered.append(deal["id"])
+                    self.assertTrue(self.reject_offer(deal, manager_id)["ok"])
+                self.assertEqual(offered, expected)
+        self.assertEqual(len(self.store.list_rejections()), 10)
+
+    def test_available_new_lead_after_occupied_dialogs_precedes_rejected_fallback(self):
         headers = [self.header(i) for i in (1, 2, 3, 4)]
         self.seed_rejection(headers[0])
-        with self.search_context(headers, directions={"2": "Египет", "3": "Египет"}, batch_limit=1):
+        with self.search_context(headers, directions={"2": "Египет", "3": "Египет"}, batch_limit=1, occupied={"2", "3"}):
             first = app._get_next_deal_for_manager("42")
             second = app._get_next_deal_for_manager("42", first["continuationToken"])
             third = app._get_next_deal_for_manager("42", second["continuationToken"])
@@ -215,7 +238,7 @@ class TestRejectionRetry(fixtures.ClaimWorkflowTestCase):
     def test_cursor_expires_when_rejection_changes_even_if_queue_order_does_not(self):
         headers = [self.header(1), self.header(2)]
         predecessor = self.seed_rejection(headers[1])
-        with self.search_context(headers, directions={"1": "Египет"}, batch_limit=1):
+        with self.search_context(headers, directions={"1": "Египет"}, batch_limit=1, occupied={"1"}):
             first = app._get_next_deal_for_manager("42")
             self.assertTrue(first["hasMore"])
             self.seed_rejection(headers[1], after=predecessor)
