@@ -157,6 +157,38 @@ class TestBazaBridgeAuthentication(TemporaryStateTestCase):
         get_next.assert_called_once_with("42", "cursor")
         oauth.assert_not_called()
 
+    def test_native_and_baza_next_offer_other_directions_without_requiring_skills(self):
+        header = {
+            "ID": "100", "TITLE": "Test inquiry", "DATE_MODIFY": "v1",
+            "STAGE_ID": next(iter(app.SOURCE_STAGES)),
+        }
+        for competencies in ([], ["Турция"]):
+            for channel in ("bitrix", "baza"):
+                with self.subTest(competencies=competencies, channel=channel):
+                    handler = self.handler() if channel == "baza" else HandlerHarness.make(
+                        "POST", "/api/next-deal", {"managerId": "999"},
+                        origin="https://picker.example.test",
+                    )
+                    with (
+                        patch.object(app, "actor_id_from_payload", return_value="42"),
+                        patch.object(app, "get_manager_profile", return_value={
+                            "id": "42", "active": True, "intranet": True,
+                            "competencies": competencies,
+                        }),
+                        patch.object(app, "check_manager_access", return_value={"ok": True, "rule": {}}),
+                        patch.object(app, "list_allowed_deal_headers", return_value=[header]),
+                        patch.object(app, "get_deal_messages", return_value={
+                            "useful": ["Хочу в Египет"], "openlineSessionIds": [],
+                        }),
+                    ):
+                        handler.do_POST()
+                    self.assertEqual(HandlerHarness.status(handler), 200)
+                    result = HandlerHarness.json(handler)
+                    self.assertEqual(result["deal"]["id"], "100")
+                    self.assertEqual(result["deal"]["classification"]["direction"], "Египет")
+                    self.assertTrue(app.verify_selection_token(result["deal"]["selectionToken"], "100", "42"))
+                    self.assertFalse(app.verify_selection_token(result["deal"]["selectionToken"], "100", "999"))
+
     def test_claim_uses_canonical_greeting_and_ignores_browser_actor(self):
         handler = self.handler("claim", {"bitrixUserId": "42", "managerId": "999", "auth": {"AUTH_ID": "spoof"}, "dealId": "100", "selectionToken": "selection"})
         with patch.object(app, "preview_claim", return_value={"ok": True}) as claim:

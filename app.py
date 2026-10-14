@@ -172,7 +172,7 @@ APP_VERSION = (
 # Bump whenever classifier, eligibility, source-completeness or oldest-first
 # routing semantics change. Pre-deploy tokens must not authorize post-deploy
 # decisions under a different routing policy.
-ROUTING_POLICY_VERSION = "2026-10-10-routing-v7-active-dialog-guard"
+ROUTING_POLICY_VERSION = "2026-10-14-routing-v8-all-manager-directions"
 
 SOURCE_STAGES = {
     "UC_ZJ55BR": "Необработанные ЛИДЫ",
@@ -875,9 +875,6 @@ def rejection_semantic_key(manager_id, deal_id, version, rejection_after=0):
 
 def manager_policy_hash(manager=None, rule=None):
     policy = {
-        "competencies": sorted(
-            {str(item or "").strip().casefold() for item in (manager or {}).get("competencies", []) if str(item or "").strip()}
-        ),
         "active": (manager or {}).get("active") is True,
         "intranet": (manager or {}).get("intranet") is True,
         "rule": {
@@ -1717,9 +1714,9 @@ def manager_profile_unavailable_response(manager):
 def manager_profile_from_user(user, manager_id=None):
     manager_id = str(user.get("ID") or manager_id or "")
     competencies = parse_competencies(user.get("UF_SKILLS"))
-    # A production profile is authoritative: clearing UF_SKILLS must revoke
-    # routing immediately.  The legacy local fallback is available only in the
-    # explicitly isolated localhost + DRY_RUN development mode.
+    # Retain skills as profile metadata, without restricting deal selection.
+    # Production metadata comes from Bitrix; legacy local fallback is available
+    # only in the isolated localhost + DRY_RUN development mode.
     local = next((item for item in load_managers() if str(item.get("id")) == manager_id), None)
     used_local_fallback = bool(
         not competencies
@@ -3583,26 +3580,6 @@ def prepare_greeting(
         return greeting_response(entry, send_result=send_result)
 
 
-def deal_score_for_manager(deal, manager):
-    direction_name = deal["classification"]["direction"]
-    if direction_name == "Не определено":
-        return 1
-    competencies = [str(item).strip() for item in manager.get("competencies", []) if str(item).strip()]
-    if not competencies:
-        return 0
-    direction = direction_name
-    text = " ".join(deal.get("messages", []))
-    score = 0
-    for competency in competencies:
-        if keyword_matches(competency, direction):
-            score += 4
-        if keyword_matches(competency, text):
-            score += 2
-    if deal["classification"]["direction"] != "Не определено" and score:
-        score += 1
-    return score
-
-
 def list_allowed_deal_headers():
     now = time.monotonic()
     with DEAL_HEADERS_CACHE_LOCK:
@@ -3888,7 +3865,7 @@ def _search_next_deal_for_manager(manager_id, continuation_token, timings):
     if unavailable:
         return unavailable
     if not manager:
-        return {"deal": None, "reason": "Менеджер не найден в настройке компетенций."}
+        return {"deal": None, "reason": "Профиль сотрудника не найден."}
     if manager.get("active") is not True:
         return {"manager": manager, "deal": None, "reason": "Пользователь деактивирован в Bitrix24."}
     if manager.get("intranet") is not True:
@@ -3973,9 +3950,6 @@ def _search_next_deal_for_manager(manager_id, continuation_token, timings):
             }
         if not deal:
             continue
-        score = deal_score_for_manager(deal, manager)
-        if score <= 0:
-            continue
         rejection_after = header["_rejectionAfter"]
         if STATE_STORE.get_rejection_by_semantic_key(
             rejection_semantic_key(manager_id, header_id, deal.get("version"), rejection_after)
@@ -4013,13 +3987,15 @@ def _search_next_deal_for_manager(manager_id, continuation_token, timings):
                 "checkedCount": header_index + 1, "hasMore": False,
                 "continuationToken": None,
             }
-        deal["matchScore"] = score
+        # Keep the response field compatible; directions no longer restrict
+        # eligibility or priority for any authorized employee.
+        deal["matchScore"] = 1
         if not deal.get("messages"):
             deal["matchReason"] = "Сообщения не найдены, заявка доступна всем менеджерам."
         elif deal["classification"]["direction"] == "Не определено":
             deal["matchReason"] = "Страна не определена, заявка доступна всем менеджерам."
         else:
-            deal["matchReason"] = "Совпало с компетенциями менеджера."
+            deal["matchReason"] = "Заявка доступна всем менеджерам независимо от направления."
         deal["selectionToken"] = issue_selection_token(
             deal.get("id"),
             manager_id,
@@ -4042,10 +4018,7 @@ def _search_next_deal_for_manager(manager_id, continuation_token, timings):
             "reason": "Проверяю следующие заявки...",
             **response_meta,
         }
-    if not manager.get("competencies"):
-        reason = "В карточке сотрудника нет навыков, а общих заявок без страны сейчас нет."
-    else:
-        reason = "Нет доступных сделок по навыкам менеджера или общих заявок без страны."
+    reason = "Сейчас нет доступных сделок."
     return {"manager": manager, "deal": None, "reason": reason, **response_meta}
 
 
@@ -4837,7 +4810,7 @@ def preview_claim(deal_id, manager_id, auth=None, selection_token=None, *, send_
                     "selectionStale": True,
                     "ok": False,
                     "message": (
-                        "Навыки или правила доступа изменились после выбора сделки. "
+                        "Правила доступа изменились после выбора сделки. "
                         "Получите заявку заново."
                     ),
                     "_httpStatus": 409,
@@ -5714,7 +5687,7 @@ def record_rejection(manager_id, payload):
             return {
                 "selectionStale": True,
                 "ok": False,
-                "message": "Навыки или правила доступа изменились. Получите заявку заново.",
+                "message": "Правила доступа изменились. Получите заявку заново.",
             }
         claim_operation = STATE_STORE.get_claim_operation(operation_key)
         claim_result = (claim_operation or {}).get("result") or {}
@@ -6897,7 +6870,7 @@ INDEX_HTML = """<!doctype html>
     <section id="extraClaimBox" class="card extra-claim-box hidden"></section>
     <div id="searchProgress" class="search-progress hidden">
       <div class="search-progress-track"><div class="search-progress-bar"></div></div>
-      <div class="search-progress-text">Ищем подходящую заявку по навыкам менеджера...</div>
+      <div class="search-progress-text">Ищем доступную заявку...</div>
     </div>
     <div id="cards"></div>
     <pre id="result" hidden></pre>
@@ -7069,10 +7042,9 @@ function applyAuthorizedUser(user, manager) {
   if (isCurrentUserAdmin()) loadAdminPanel();
 }
 function renderManagerInfo(manager) {
-  const competencies = manager.competencies || [];
   const isActive = manager.active !== false;
   const isEmployee = manager.intranet === true;
-  canRequestDeal = userVerified && isActive && isEmployee && competencies.length > 0;
+  canRequestDeal = userVerified && isActive && isEmployee;
   document.getElementById('getDealButton').disabled = !canRequestDeal;
   if (!isActive) {
     document.getElementById('managerInfo').textContent = `Пользователь ${manager.name} деактивирован.`;
@@ -7084,12 +7056,8 @@ function renderManagerInfo(manager) {
     document.getElementById('status').textContent = 'Выдача заявок недоступна.';
     return;
   }
-  document.getElementById('managerInfo').textContent = competencies.length
-    ? `Вы вошли как ${manager.name}. Навыки из карточки сотрудника: ${manager.competencies.join(', ')}`
-    : `Вы вошли как ${manager.name}. В карточке сотрудника не заполнено поле “Навыки”.`;
-  document.getElementById('status').textContent = competencies.length
-    ? 'Нажмите “Получить сделку”.'
-    : 'Заполните поле “Навыки” в карточке сотрудника, иначе подбор невозможен.';
+  document.getElementById('managerInfo').textContent = `Вы вошли как ${manager.name}. Доступны заявки всех направлений, включая ранее пропущенные.`;
+  document.getElementById('status').textContent = 'Нажмите “Получить сделку”.';
 }
 function updatePrimaryButton() {
   const button = document.getElementById('getDealButton');
@@ -7303,7 +7271,7 @@ async function bindDealPlacement() {
         PLACEMENT: placement,
         HANDLER: handler,
         TITLE: 'Получить сделку',
-        DESCRIPTION: 'Подбор сделки по навыкам менеджера'
+        DESCRIPTION: 'Получение доступной сделки'
       });
       showResult({ ok: true, placement, message: 'Кнопка закреплена. Обновите страницу сделок.' });
       return;
@@ -7330,7 +7298,7 @@ async function bindLeftMenu() {
         PLACEMENT: placement,
         HANDLER: handler,
         TITLE: 'Получить сделку',
-        DESCRIPTION: 'Подбор сделки по навыкам менеджера'
+        DESCRIPTION: 'Получение доступной сделки'
       });
       showResult({ ok: true, placement, message: 'Пункт закреплен в левом меню. Обновите Битрикс.' });
       return;
@@ -7384,7 +7352,7 @@ function setSearching(isSearching, text) {
 async function getDeal() {
   if (isDealSearchRunning) return;
   if (!userVerified || !canRequestDeal) {
-    document.getElementById('status').textContent = 'Сначала подтвердите пользователя и заполните навыки сотрудника.';
+    document.getElementById('status').textContent = 'Получение сделок доступно подтверждённому активному сотруднику.';
     return;
   }
   isDealSearchRunning = true;
@@ -7454,7 +7422,7 @@ async function getDeal() {
   if (data.manager) applyAuthorizedUser({ id: data.manager.id }, data.manager);
   currentDeal = data.deal;
   selectedDealId = currentDeal.id;
-  document.getElementById('status').textContent = 'Найдена сделка по компетенции. Можно взять или отказаться.';
+  document.getElementById('status').textContent = 'Найдена доступная сделка. Можно взять или пропустить.';
   const cards = document.getElementById('cards');
   cards.innerHTML = '';
   cards.appendChild(renderDeal(currentDeal));
@@ -7599,7 +7567,7 @@ async function loadAdminPanel() {
 function renderAdminRows(rows, warnings) {
   const target = document.getElementById('adminRows');
   if (!rows.length) {
-    target.innerHTML = '<div class="status">Пока нет менеджеров с навыками или статистикой.</div>';
+    target.innerHTML = '<div class="status">Пока нет сотрудников или статистики.</div>';
     return;
   }
   const warningHtml = (warnings || []).length
@@ -7610,7 +7578,6 @@ function renderAdminRows(rows, warnings) {
       <thead>
         <tr>
           <th>Менеджер</th>
-          <th>Навыки</th>
           <th>Доступ</th>
           <th>Лимит в день</th>
           <th>Взято через приложение за период</th>
@@ -7625,7 +7592,6 @@ function renderAdminRows(rows, warnings) {
         ${rows.map((row) => `
           <tr data-manager-id="${escapeHtml(row.id)}">
             <td><strong>${escapeHtml(row.name)}</strong><br><span class="meta">ID ${escapeHtml(row.id)}</span></td>
-            <td>${escapeHtml((row.competencies || []).join(', ') || 'Не заполнено')}</td>
             <td><input type="checkbox" class="rule-enabled" ${row.rule && row.rule.enabled === false ? '' : 'checked'}></td>
             <td><input type="number" class="rule-limit" min="0" value="${row.rule && row.rule.dailyLimit !== null && row.rule.dailyLimit !== undefined ? escapeHtml(row.rule.dailyLimit) : ''}" placeholder="без лимита"></td>
             <td>${escapeHtml(row.takenInPeriod || 0)}</td>
