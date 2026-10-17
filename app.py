@@ -4212,6 +4212,7 @@ def process_actor_greeting_outbox_job(job, worker_token, auth, manager):
         dispatching = STATE_STORE.mark_greeting_outbox_dispatching(
             operation_key,
             worker_token,
+            chat_id=chat_context["chatId"],
         )
         if not dispatching.get("transitioned"):
             return dispatching
@@ -4464,6 +4465,7 @@ def process_greeting_outbox_job(job, worker_token):
     dispatching = STATE_STORE.mark_greeting_outbox_dispatching(
         operation_key,
         worker_token,
+        chat_id=target["chatId"],
     )
     if not dispatching.get("transitioned"):
         return dispatching
@@ -6176,6 +6178,18 @@ def readiness_state(*, force=False):
 
 def baza_picker_action(action, payload):
     """Use the existing allocator as the trusted Baza actor, never browser OAuth."""
+    if action == "message-origins":
+        # The authenticated Baza backend has already checked the viewer's ACL
+        # and the current deal/session binding. Never resolve or change it here.
+        if set(payload) != {"bitrixDealId", "sessionId", "chatId", "messageIds"}:
+            return {"ok": False, "error": "invalid_payload"}, 400
+        try:
+            return STATE_STORE.message_origins(
+                deal_id=payload["bitrixDealId"], session_id=payload["sessionId"],
+                chat_id=payload["chatId"], message_ids=payload["messageIds"],
+            ), 200
+        except ValueError:
+            return {"ok": False, "error": "invalid_payload"}, 400
     if action == "claim-history":
         # Analytics reads the complete canonical journal, including history
         # deliberately deferred by the operational claim-event export cutoff.
@@ -6720,7 +6734,8 @@ class Handler(BaseHTTPRequestHandler):
         client_key = self.client_key()
         # History pagination must not spend the same caller's live allocation
         # budget, or allocations could fail while an admin loads a report.
-        rate_key = f"baza-history:{client_key}" if action == "claim-history" else client_key
+        read_namespace = {"claim-history": "baza-history", "message-origins": "baza-origins"}.get(action)
+        rate_key = f"{read_namespace}:{client_key}" if read_namespace else client_key
         if not rate_limit_allowed(rate_key):
             self.send_json({"ok": False, "error": "rate_limited"}, 429)
             return
