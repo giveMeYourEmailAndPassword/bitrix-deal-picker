@@ -151,11 +151,12 @@ class TestRejectionRetry(fixtures.ClaimWorkflowTestCase):
 
     def test_fresh_reoffer_can_be_claimed_but_original_selection_cannot(self):
         header = self.source_deal()
-        current_time = app.time.time()
         with self.search_context([header]):
             original = app._get_next_deal_for_manager("42")["deal"]
             self.assertTrue(self.reject_offer(original)["ok"])
             reoffer = app._get_next_deal_for_manager("42")["deal"]
+        # Do not rewind to before token issuance across a wall-clock second.
+        current_time = app.time.time()
         with (
             self.common_claim_context(),
             patch.object(app.time, "time", return_value=current_time),

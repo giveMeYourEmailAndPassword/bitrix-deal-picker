@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import secrets
@@ -37,6 +38,47 @@ LEGACY_FILES = {
 }
 
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _message_origin_id(value: Any) -> Optional[str]:
+    value = str(value) if type(value) is int else value
+    return value if isinstance(value, str) and re.fullmatch(r"[1-9][0-9]{0,19}", value) else None
+
+
+def _legacy_manual_target_chats(payload: Mapping[str, Any]) -> Optional[set[str]]:
+    """Recover only the exact attempted targets in the pre-outbox audit format.
+
+    The old sender (dacf677) recorded every failed loop iteration in errors.
+    An OAuth timeout could be followed by a failed webhook fallback, so even
+    a definitive provider error is NOT evidence that nothing was delivered.
+    Only two exact local pre-send branches prove there was no message call.
+    None means incomplete evidence; an empty set means a proven non-send.
+    """
+    result = payload.get("sendResult")
+    if (
+        payload.get("status") != "manual" or payload.get("autoSent") is not False
+        or not isinstance(result, dict) or result.get("ok") is not False
+        or result.get("method") != "imopenlines.operator.answer + im.message.add"
+        or any(result.get(key) is not None for key in ("messageId", "messageResult", "chat"))
+    ):
+        return None
+    errors = result.get("errors")
+    if not isinstance(errors, list) or not 1 <= len(errors) <= 200:
+        return None
+    if errors == [{"error": "У сделки не найдена открытая линия для автоотправки."}]:
+        return set()
+    chats = set()
+    for error in errors:
+        if not isinstance(error, dict) or not _message_origin_id(error.get("sessionId")):
+            return None
+        chat_id = _message_origin_id(error.get("chatId"))
+        if chat_id and isinstance(error.get("error"), str) and error["error"]:
+            chats.add(chat_id)
+        elif ("chatId" not in error and error.get("error") == "Не удалось получить chatId открытой линии."):
+            continue
+        else:
+            return None
+    return chats
 
 
 class StateStoreError(RuntimeError):
@@ -360,6 +402,16 @@ class StateStore:
                 CREATE INDEX IF NOT EXISTS idx_baza_bridge_nonce_expiry
                     ON baza_bridge_nonces(expires_at);
 
+                CREATE TABLE IF NOT EXISTS message_origin_session_chats (
+                    session_id TEXT PRIMARY KEY,
+                    chat_id TEXT NOT NULL DEFAULT '',
+                    state TEXT NOT NULL DEFAULT 'pending'
+                        CHECK (state IN ('pending', 'verified', 'conflict')),
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    next_check_at REAL NOT NULL DEFAULT 0,
+                    checked_at TEXT NOT NULL DEFAULT ''
+                );
+
                 CREATE TABLE IF NOT EXISTS greeting_outbox (
                     operation_key TEXT PRIMARY KEY
                         REFERENCES claim_operations(operation_key),
@@ -517,6 +569,7 @@ class StateStore:
             connection.execute("CREATE INDEX IF NOT EXISTS idx_greeting_events_provider_message ON greeting_events(provider_message_id)")
             connection.execute("CREATE INDEX IF NOT EXISTS idx_greeting_outbox_provider_message ON greeting_outbox(message_id)")
             connection.execute("CREATE INDEX IF NOT EXISTS idx_greeting_outbox_chat_status ON greeting_outbox(chat_id, status)")
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_greeting_outbox_origin_recovery ON greeting_outbox(session_id) WHERE chat_id = '' AND status = 'uncertain'")
             outbox_columns = {
                 row["name"] for row in connection.execute("PRAGMA table_info(integration_outbox)")
             }
@@ -701,6 +754,66 @@ class StateStore:
             )
             return cursor.rowcount == 1
 
+    def reserve_message_origin_session(self, *, now: float) -> Optional[str]:
+        """Reserve at most one old terminal attempt's historical scope read.
+
+        These rows only schedule read-only provenance recovery. They never
+        change a greeting job, its send status, lease or retry eligibility.
+        """
+        self._ensure_ready()
+        if not math.isfinite(now):
+            raise ValueError("invalid origin recovery time")
+        with self._transaction(immediate=True) as connection:
+            row = connection.execute(
+                "SELECT j.session_id, COALESCE(s.attempt_count, 0) AS attempts "
+                "FROM greeting_outbox j LEFT JOIN message_origin_session_chats s ON s.session_id=j.session_id "
+                "WHERE j.chat_id='' AND j.status='uncertain' "
+                "AND length(j.session_id) BETWEEN 1 AND 20 AND j.session_id NOT GLOB '*[^0-9]*' "
+                "AND substr(j.session_id, 1, 1) BETWEEN '1' AND '9' "
+                "AND (s.session_id IS NULL OR (s.state='pending' AND s.next_check_at <= ?)) "
+                "ORDER BY COALESCE(s.next_check_at, 0), j.session_id LIMIT 1", (now,),
+            ).fetchone()
+            if row is None:
+                return None
+            attempts = min(16, row["attempts"] + 1)
+            next_check = now + min(3600, 60 * 2 ** min(6, attempts - 1))
+            connection.execute(
+                "INSERT INTO message_origin_session_chats(session_id, attempt_count, next_check_at) VALUES(?, ?, ?) "
+                "ON CONFLICT(session_id) DO UPDATE SET attempt_count=excluded.attempt_count, next_check_at=excluded.next_check_at",
+                (row["session_id"], attempts, next_check),
+            )
+            return row["session_id"]
+
+    def record_message_origin_session_history(self, session_id: str, history: Any) -> bool:
+        """Persist only an exact SESSION_ID -> CHAT_ID response, never messages."""
+        self._ensure_ready()
+        if not _message_origin_id(session_id) or not isinstance(history, dict):
+            return False
+        if _message_origin_id(history.get("sessionId")) != session_id:
+            return False
+        chat_id = _message_origin_id(history.get("chatId"))
+        chats = history.get("chat")
+        if not chat_id or not isinstance(chats, dict):
+            return False
+        chat = chats.get(chat_id) or chats.get(int(chat_id)) or chats
+        if (
+            not isinstance(chat, dict) or _message_origin_id(chat.get("id")) != chat_id
+            or str(chat.get("entityType") or "").upper() != "LINES"
+        ):
+            return False
+        with self._transaction(immediate=True) as connection:
+            prior = connection.execute("SELECT chat_id, state FROM message_origin_session_chats WHERE session_id=?", (session_id,)).fetchone()
+            contradiction = connection.execute(
+                "SELECT 1 FROM greeting_outbox WHERE session_id=? AND chat_id<>'' AND chat_id<>? LIMIT 1", (session_id, chat_id),
+            ).fetchone()
+            conflict = bool(contradiction or (prior and (prior["state"] == "conflict" or (prior["chat_id"] and prior["chat_id"] != chat_id))))
+            connection.execute(
+                "INSERT INTO message_origin_session_chats(session_id, chat_id, state, checked_at) VALUES(?, ?, ?, ?) "
+                "ON CONFLICT(session_id) DO UPDATE SET chat_id=excluded.chat_id, state=excluded.state, checked_at=excluded.checked_at",
+                (session_id, prior["chat_id"] if conflict and prior else chat_id, "conflict" if conflict else "verified", self._now_iso()),
+            )
+            return not conflict
+
     def message_origins(self, *, deal_id: str, session_id: str, chat_id: str, message_ids: list[str]) -> Dict[str, Any]:
         """Read a single provenance snapshot; never enqueue, repair or send.
 
@@ -727,10 +840,14 @@ class StateStore:
                 "SELECT value FROM meta WHERE key = ?", (MESSAGE_ORIGIN_COVERAGE,),
             ).fetchone()
             jobs = connection.execute(
-                "SELECT operation_key, session_id, status, message_id, finalized_at "
-                "FROM greeting_outbox WHERE chat_id = ? OR session_id = ? OR deal_id = ? "
-                "OR (chat_id = '' AND (status IN ('pending','checking','dispatching','uncertain') "
-                "OR (status = 'sent' AND message_id = '')))", (chat_id, session_id, deal_id),
+                "SELECT j.operation_key, j.session_id, j.chat_id, j.status, j.message_id, j.finalized_at, "
+                "s.chat_id AS recovered_chat_id, s.state AS recovery_state, "
+                "EXISTS(SELECT 1 FROM greeting_outbox other WHERE other.session_id=j.session_id "
+                "AND other.chat_id<>'' AND other.chat_id<>s.chat_id) AS scope_conflict "
+                "FROM greeting_outbox j LEFT JOIN message_origin_session_chats s ON s.session_id=j.session_id "
+                "WHERE j.chat_id = ? OR j.session_id = ? OR j.deal_id = ? "
+                "OR (j.chat_id = '' AND (j.status IN ('pending','checking','dispatching','uncertain') "
+                "OR (j.status = 'sent' AND j.message_id = '')))", (chat_id, session_id, deal_id),
             ).fetchall()
             events = connection.execute(
                 "SELECT id, operation_key, timestamp, status, auto_sent, payload_json FROM greeting_events e "
@@ -777,6 +894,11 @@ class StateStore:
             if message_id:
                 known.add(message_id)
             status = row["status"]
+            target_chat = provider_id(row["chat_id"])
+            if not target_chat and status == "uncertain" and row["recovery_state"] == "verified" and not row["scope_conflict"]:
+                target_chat = provider_id(row["recovered_chat_id"])
+            if target_chat and target_chat != chat_id:
+                continue
             if status in {"pending", "checking", "dispatching"}:
                 complete = False
             elif status == "uncertain":
@@ -809,7 +931,9 @@ class StateStore:
             elif status == "sent" and row["auto_sent"] and predates_horizon(row["timestamp"]):
                 continue
             else:
-                complete = False
+                legacy_targets = _legacy_manual_target_chats(payload)
+                if legacy_targets is None or chat_id in legacy_targets:
+                    complete = False
         return {
             "ok": True, "bitrixDealId": deal_id, "sessionId": session_id, "chatId": chat_id,
             "checkedIds": list(message_ids),

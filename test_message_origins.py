@@ -91,6 +91,7 @@ class TestMessageOrigins(TemporaryStateTestCase):
             connection.execute("DROP INDEX idx_greeting_events_provider_message")
             connection.execute("ALTER TABLE greeting_events DROP COLUMN provider_message_id")
             connection.execute("DROP INDEX idx_greeting_outbox_chat_status")
+            connection.execute("DROP INDEX idx_greeting_outbox_origin_recovery")
             connection.execute("ALTER TABLE greeting_outbox DROP COLUMN chat_id")
         reopened = StateStore(self.data_dir)
         result = reopened.message_origins(deal_id="100", session_id="321", chat_id="1763", message_ids=["800", "801"])
@@ -249,6 +250,169 @@ class TestMessageOrigins(TemporaryStateTestCase):
         self.assertEqual(result["coveredSince"], HORIZON)
         self.event(operationKey="new-unknown")
         self.assertFalse(self.query()["complete"])
+
+    def legacy_error(self, errors, **fields):
+        self.event(status="manual", autoSent=False, autoAttempted=None,
+                   sendResult={"ok": False, "method": "imopenlines.operator.answer + im.message.add", "errors": errors}, **fields)
+
+    @staticmethod
+    def history(session="998", chat="777"):
+        return {"sessionId": int(session), "chatId": int(chat), "userId": f"chat{chat}",
+                "chat": {chat: {"id": chat, "entityType": "LINES"}},
+                "message": {"999": {"text": "Private history must never be saved"}}}
+
+    def test_legacy_provider_failure_scopes_every_attempt_without_claiming_non_delivery(self):
+        self.legacy_error([
+            {"sessionId": "998", "chatId": "777", "error": "ACCESS_DENIED: webhook fallback rejected"},
+            {"sessionId": "999", "chatId": "778", "error": "timed out"},
+        ], openlineSessionIds=["123"])
+        # Old retry copied openlineSessionIds from the earlier attempt. Actual
+        # errors are exhaustive; that stale field is not target evidence.
+        self.assertTrue(self.query()["complete"])
+        for chat in ("777", "778"):
+            self.assertFalse(self.query(chat_id=chat)["complete"])
+
+    def test_exact_legacy_pre_send_branches_do_not_block(self):
+        self.legacy_error([{"sessionId": "998", "error": "Не удалось получить chatId открытой линии."}], operationKey="lookup")
+        self.legacy_error([{"error": "У сделки не найдена открытая линия для автоотправки."}], operationKey="empty")
+        self.assertTrue(self.query()["complete"])
+
+    def test_mixed_known_and_unknown_legacy_targets_keep_global_block(self):
+        self.legacy_error([
+            {"sessionId": "998", "chatId": "777", "error": "timed out"},
+            {"sessionId": "999", "error": "unrecognized failure"},
+        ])
+        self.assertFalse(self.query()["complete"])
+
+    def test_malformed_legacy_scope_is_not_negative_proof(self):
+        for errors in ([], None, [{"sessionId": "998", "chatId": "0", "error": "failed"}],
+                       [{"chatId": "777", "error": "failed"}],
+                       [{"sessionId": "998", "error": "Не удалось получить chatId открытой линии. ",}],
+                       [{"error": "У сделки не найдена открытая линия для автоотправки.", "chatId": "777"}]):
+            with self.subTest(errors=errors):
+                self.legacy_error(errors)
+                self.assertFalse(self.query()["complete"])
+
+    def test_failed_legacy_method_cannot_impersonate_a_known_no_send_branch(self):
+        self.event(status="manual", autoSent=False, autoAttempted=None, sendResult={
+            "ok": False, "method": "other sender", "errors": [{"error": "У сделки не найдена открытая линия для автоотправки."}],
+        })
+        self.assertFalse(self.query()["complete"])
+
+    def test_historical_session_proof_scopes_uncertain_job_without_changing_send_state(self):
+        self.job(deal="101", session="998", chat="", status="uncertain", message="")
+        before = self.store.get_greeting_outbox("operation")
+        self.assertFalse(self.query()["complete"])
+        with patch.object(app, "bitrix_call", return_value=self.history()) as provider:
+            self.assertEqual(app.reconcile_message_origin_scope_once(), {"checked": True, "resolved": True})
+        provider.assert_called_once_with("imopenlines.session.history.get", {"SESSION_ID": "998"}, timeout=min(5, app.BITRIX_FAST_TIMEOUT_SECONDS))
+        self.assertEqual(self.store.get_greeting_outbox("operation"), before)
+        self.assertTrue(self.query()["complete"])
+        self.assertFalse(self.query(chat_id="777")["complete"])
+        # Exact target wins over a stale deal or saved session relationship.
+        self.assertTrue(self.query(deal_id="101", session_id="998")["complete"])
+        reopened = StateStore(self.data_dir)
+        self.assertTrue(reopened.message_origins(deal_id="100", session_id="321", chat_id="1763", message_ids=["800"])["complete"])
+        with patch.object(app, "bitrix_call") as provider:
+            self.assertEqual(app.reconcile_message_origin_scope_once(), {"checked": False, "resolved": False})
+        provider.assert_not_called()
+        with self.store._connect() as connection:
+            cached = dict(connection.execute("SELECT * FROM message_origin_session_chats").fetchone())
+        self.assertNotIn("Private history", json.dumps(cached))
+
+    def test_scope_recovery_does_not_run_under_a_database_transaction(self):
+        self.job(session="998", chat="", status="uncertain", message="")
+        def read(method, params, **kwargs):
+            with self.store._transaction(immediate=True) as connection:
+                connection.execute("INSERT INTO meta(key,value,updated_at) VALUES('independent-read','ok','now')")
+            return self.history()
+        with patch.object(app, "bitrix_call", side_effect=read):
+            self.assertTrue(app.reconcile_message_origin_scope_once()["resolved"])
+
+    def test_missing_malformed_and_mismatched_native_proof_remains_global(self):
+        self.job(session="998", chat="", status="uncertain", message="")
+        bad = [None, {}, self.history(session="999"), {**self.history(), "sessionId": None},
+               {**self.history(), "chatId": "0777"}, {**self.history(), "chat": {"777": {"id": "778", "entityType": "LINES"}}},
+               {**self.history(), "chat": {"777": {"id": "777", "entityType": "OTHER"}}}]
+        for proof in bad:
+            with self.subTest(proof=proof):
+                self.assertFalse(self.store.record_message_origin_session_history("998", proof))
+                self.assertFalse(self.query()["complete"])
+
+    def test_flat_native_chat_shape_requires_the_same_explicit_identity(self):
+        self.job(session="998", chat="", status="uncertain", message="")
+        proof = {"sessionId": "998", "chatId": "777", "chat": {"id": "777", "entityType": "LINES"}}
+        self.assertTrue(self.store.record_message_origin_session_history("998", proof))
+        self.assertTrue(self.query()["complete"])
+        self.assertFalse(self.query(chat_id="777")["complete"])
+
+    def test_contradictory_session_scope_is_quarantined_and_cannot_be_overwritten(self):
+        self.job(session="998", chat="", status="uncertain", message="")
+        self.assertTrue(self.store.record_message_origin_session_history("998", self.history()))
+        self.assertTrue(self.query()["complete"])
+        self.assertFalse(self.store.record_message_origin_session_history("998", self.history(chat="778")))
+        self.assertFalse(self.query()["complete"])
+        self.assertFalse(self.store.record_message_origin_session_history("998", self.history()))
+        self.assertFalse(self.query()["complete"])
+        self.assertIsNone(self.store.reserve_message_origin_session(now=10_000))
+
+    def test_new_actual_chat_conflict_invalidates_older_session_proof(self):
+        self.job(session="998", chat="", status="uncertain", message="")
+        self.assertTrue(self.store.record_message_origin_session_history("998", self.history()))
+        self.job(deal="101", session="998", chat="778", status="sent", key="new-job")
+        self.assertFalse(self.query()["complete"])
+        self.assertEqual(self.query()["automaticMessageIds"], ["800"])
+
+    def test_worker_retries_failed_history_with_persistent_backoff_and_fairness(self):
+        self.job(session="998", chat="", status="uncertain", message="")
+        self.job(deal="101", session="999", chat="", status="uncertain", message="", key="second")
+        with patch.object(app.time, "time", return_value=100), patch.object(app, "bitrix_call", side_effect=TimeoutError) as provider:
+            self.assertEqual(app.reconcile_message_origin_scope_once(), {"checked": True, "resolved": False})
+            provider.assert_called_once()
+        # The failed session cannot starve another old attempt or retry early.
+        self.assertEqual(self.store.reserve_message_origin_session(now=110), "999")
+        reopened = StateStore(self.data_dir)
+        self.assertIsNone(reopened.reserve_message_origin_session(now=159))
+        self.assertEqual(reopened.reserve_message_origin_session(now=160), "998")
+        self.assertIsNone(reopened.reserve_message_origin_session(now=169))
+        self.assertEqual(reopened.reserve_message_origin_session(now=170), "999")
+        self.assertIsNone(reopened.reserve_message_origin_session(now=279))
+        self.assertEqual(reopened.reserve_message_origin_session(now=280), "998")
+
+    def test_worker_never_recovers_inflight_or_invalid_saved_sessions(self):
+        for index, status in enumerate(("pending", "checking", "dispatching", "sent", "manual")):
+            self.job(deal=str(101 + index), chat="", status=status, message="", key=f"job-{index}")
+        self.job(deal="200", session="", chat="", status="uncertain", message="", key="invalid")
+        with patch.object(app, "bitrix_call") as provider:
+            self.assertEqual(app.reconcile_message_origin_scope_once(), {"checked": False, "resolved": False})
+        provider.assert_not_called()
+
+    def test_background_loop_has_one_bounded_read_per_ten_second_turn(self):
+        with patch.object(app, "reconcile_message_origin_scope_once") as recover, patch.object(app.time, "sleep", side_effect=KeyboardInterrupt) as sleep:
+            with self.assertRaises(KeyboardInterrupt):
+                app.message_origin_scope_loop()
+        recover.assert_called_once_with()
+        sleep.assert_called_once_with(10)
+
+    def test_49_historical_blockers_only_block_their_proven_target_chats(self):
+        for index in range(13):
+            self.job(deal=str(1000 + index), session=str(2000 + index), chat="", status="uncertain", message="", key=f"job-{index}")
+        for index in range(30):
+            self.legacy_error([{"sessionId": str(3000 + index), "chatId": str(4000 + index), "error": "provider error"}], operationKey=f"legacy-{index}")
+        for index in range(5):
+            self.legacy_error([{"sessionId": str(5000 + index), "error": "Не удалось получить chatId открытой линии."}], operationKey=f"preflight-{index}")
+        self.legacy_error([{"error": "У сделки не найдена открытая линия для автоотправки."}], operationKey="no-session")
+        original_jobs, original_events = self.store.list_greeting_outbox(), self.store.list_greetings()
+        self.assertFalse(self.query()["complete"])
+        with patch.object(app, "bitrix_call", side_effect=lambda method, params, **kwargs: self.history(params["SESSION_ID"], str(6000 + (int(params["SESSION_ID"]) - 2000) % 12))) as provider:
+            for _ in range(13):
+                self.assertTrue(app.reconcile_message_origin_scope_once()["resolved"])
+            self.assertEqual(provider.call_count, 13)
+        self.assertTrue(self.query()["complete"])
+        for chat in [str(4000 + index) for index in range(30)] + [str(6000 + index) for index in range(12)]:
+            self.assertFalse(self.query(chat_id=chat)["complete"])
+        self.assertEqual(self.store.list_greeting_outbox(), original_jobs)
+        self.assertEqual(self.store.list_greetings(), original_events)
 
     def test_corrupt_boundary_fails_closed(self):
         with self.store._transaction(immediate=True) as connection:
