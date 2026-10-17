@@ -25,6 +25,7 @@ from typing import Any, Dict, Iterable, Iterator, Mapping, Optional
 SCHEMA_VERSION = 2
 DEFAULT_DB_FILENAME = "state.sqlite3"
 MIGRATION_MARKER = "legacy_json_migration_v1"
+MESSAGE_ORIGIN_COVERAGE = "message_origin_coverage_started_at_v1"
 LOST_DEAL_AUTOCLOSE_WATERMARK = "lost_deal_autoclose_watermark_v1"
 LOST_DEAL_AUTOCLOSE_ARMED = "lost_deal_autoclose_armed_v1"
 
@@ -278,6 +279,7 @@ class StateStore:
                     text TEXT NOT NULL DEFAULT '',
                     status TEXT NOT NULL DEFAULT 'manual',
                     auto_sent INTEGER NOT NULL DEFAULT 0 CHECK (auto_sent IN (0, 1)),
+                    provider_message_id TEXT NOT NULL DEFAULT '',
                     payload_json TEXT NOT NULL,
                     source TEXT NOT NULL DEFAULT 'app',
                     created_at TEXT NOT NULL
@@ -364,6 +366,7 @@ class StateStore:
                     deal_id TEXT NOT NULL,
                     manager_id TEXT NOT NULL,
                     session_id TEXT NOT NULL,
+                    chat_id TEXT NOT NULL DEFAULT '',
                     direction TEXT NOT NULL,
                     status TEXT NOT NULL DEFAULT 'pending'
                         CHECK (status IN (
@@ -445,6 +448,10 @@ class StateStore:
                     ON greeting_outbox(status, next_attempt_at, lease_expires_at, created_at);
                 CREATE INDEX IF NOT EXISTS idx_greeting_outbox_manager_status
                     ON greeting_outbox(manager_id, status);
+                CREATE INDEX IF NOT EXISTS idx_greeting_outbox_deal_session
+                    ON greeting_outbox(deal_id, session_id);
+                CREATE INDEX IF NOT EXISTS idx_greeting_outbox_session
+                    ON greeting_outbox(session_id);
                 CREATE INDEX IF NOT EXISTS idx_lost_deal_close_deal
                     ON lost_deal_close_operations(deal_id, transition_time DESC);
                 CREATE INDEX IF NOT EXISTS idx_lost_deal_close_status
@@ -496,6 +503,20 @@ class StateStore:
                     "ALTER TABLE greeting_events "
                     "ADD COLUMN operation_key TEXT NOT NULL DEFAULT ''"
                 )
+            if "provider_message_id" not in greeting_columns:
+                connection.execute("ALTER TABLE greeting_events ADD COLUMN provider_message_id TEXT NOT NULL DEFAULT ''")
+                for greeting in connection.execute("SELECT id, payload_json FROM greeting_events").fetchall():
+                    payload = self._payload_from_row(greeting)
+                    result = payload.get("sendResult")
+                    message_id = str(result.get("messageId") or "") if isinstance(result, dict) else ""
+                    if re.fullmatch(r"[1-9][0-9]{0,19}", message_id):
+                        connection.execute("UPDATE greeting_events SET provider_message_id=? WHERE id=?", (message_id, greeting["id"]))
+            greeting_job_columns = {row["name"] for row in connection.execute("PRAGMA table_info(greeting_outbox)")}
+            if "chat_id" not in greeting_job_columns:
+                connection.execute("ALTER TABLE greeting_outbox ADD COLUMN chat_id TEXT NOT NULL DEFAULT ''")
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_greeting_events_provider_message ON greeting_events(provider_message_id)")
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_greeting_outbox_provider_message ON greeting_outbox(message_id)")
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_greeting_outbox_chat_status ON greeting_outbox(chat_id, status)")
             outbox_columns = {
                 row["name"] for row in connection.execute("PRAGMA table_info(integration_outbox)")
             }
@@ -648,6 +669,12 @@ class StateStore:
                 """,
                 (LOST_DEAL_AUTOCLOSE_WATERMARK, now, now),
             )
+            # A stable deployment boundary makes new messages classifiable
+            # without pretending that legacy greetings all retained their IDs.
+            connection.execute(
+                "INSERT OR IGNORE INTO meta(key, value, updated_at) VALUES(?, ?, ?)",
+                (MESSAGE_ORIGIN_COVERAGE, datetime.fromisoformat(now).astimezone(timezone.utc).isoformat(timespec="microseconds"), now),
+            )
             connection.commit()
         except BaseException:
             connection.rollback()
@@ -673,6 +700,122 @@ class StateStore:
                 (key_id, nonce, expires_at),
             )
             return cursor.rowcount == 1
+
+    def message_origins(self, *, deal_id: str, session_id: str, chat_id: str, message_ids: list[str]) -> Dict[str, Any]:
+        """Read a single provenance snapshot; never enqueue, repair or send.
+
+        Negative evidence is usable only for provider messages at/after
+        coveredSince, and only when complete is true. Exact positive matches
+        remain valid for older messages. Baza must verify the live deal/session
+        binding and access before calling this private bridge.
+        """
+        def valid_id(value):
+            return isinstance(value, str) and re.fullmatch(r"[1-9][0-9]{0,19}", value) is not None
+
+        if (
+            not valid_id(deal_id) or not valid_id(session_id) or not valid_id(chat_id)
+            or not isinstance(message_ids, list) or not 1 <= len(message_ids) <= 200
+            or any(not valid_id(value) for value in message_ids)
+            or len(set(message_ids)) != len(message_ids)
+        ):
+            raise ValueError("invalid message origin scope")
+        self._ensure_ready()
+        with self._transaction() as connection:
+            # All three reads share a snapshot: a dispatching job cannot be
+            # missed while its final event is observed (or vice versa).
+            boundary = connection.execute(
+                "SELECT value FROM meta WHERE key = ?", (MESSAGE_ORIGIN_COVERAGE,),
+            ).fetchone()
+            jobs = connection.execute(
+                "SELECT operation_key, session_id, status, message_id, finalized_at "
+                "FROM greeting_outbox WHERE chat_id = ? OR session_id = ? OR deal_id = ? "
+                "OR (chat_id = '' AND (status IN ('pending','checking','dispatching','uncertain') "
+                "OR (status = 'sent' AND message_id = '')))", (chat_id, session_id, deal_id),
+            ).fetchall()
+            events = connection.execute(
+                "SELECT id, operation_key, timestamp, status, auto_sent, payload_json FROM greeting_events e "
+                "WHERE NOT EXISTS (SELECT 1 FROM greeting_outbox j WHERE j.operation_key=e.operation_key) "
+                "AND (e.operation_key='' OR NOT EXISTS (SELECT 1 FROM greeting_events newer "
+                "WHERE newer.operation_key=e.operation_key AND newer.id>e.id)) ORDER BY id",
+            ).fetchall()
+            placeholders = ",".join("?" for _ in message_ids)
+            known_rows = connection.execute(
+                f"SELECT message_id AS id FROM greeting_outbox WHERE message_id IN ({placeholders}) "
+                f"UNION SELECT provider_message_id AS id FROM greeting_events WHERE provider_message_id IN ({placeholders})",
+                (*message_ids, *message_ids),
+            ).fetchall()
+
+        def instant(value):
+            if not isinstance(value, str):
+                return None
+            try:
+                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                return parsed if parsed.tzinfo is not None and parsed.utcoffset() is not None else None
+            except ValueError:
+                return None
+
+        covered_since = boundary["value"] if boundary else None
+        horizon = instant(covered_since)
+        if horizon is None:
+            raise StateStoreError("message origin coverage boundary is missing or invalid")
+
+        def predates_horizon(value):
+            parsed = instant(value)
+            return parsed is not None and parsed < horizon
+
+        def provider_id(value):
+            value = str(value) if type(value) is int else value
+            return value if valid_id(value) else None
+
+        known = {row["id"] for row in known_rows}
+        complete = True
+        for row in jobs:
+            # The producer sends to CHAT_ID, while its saved session can roll
+            # over before dispatch. Neither another saved session in this deal
+            # nor another deal in this session proves a different target chat.
+            message_id = provider_id(row["message_id"])
+            if message_id:
+                known.add(message_id)
+            status = row["status"]
+            if status in {"pending", "checking", "dispatching"}:
+                complete = False
+            elif status == "uncertain":
+                # A local timeout does not cancel remote execution, even if
+                # this attempt predates the deployment boundary.
+                complete = False
+            elif status == "sent" and not message_id:
+                # Confirmed old sends existed before the boundary; the caller
+                # still cannot use negative evidence for those old messages.
+                if not predates_horizon(row["finalized_at"]):
+                    complete = False
+            elif status not in {"sent", "manual"}:
+                complete = False
+
+        for row in events:
+            # SQL keeps only the final legacy event per operation, excludes
+            # audit rows owned by canonical jobs, and never pairs unkeyed rows.
+            payload = self._payload_from_row(row)
+            send_result = payload.get("sendResult")
+            message_id = provider_id(send_result.get("messageId")) if isinstance(send_result, dict) else None
+            if message_id:
+                known.add(message_id)
+            status = row["status"]
+            if status == "sending":
+                complete = False
+            elif message_id:
+                continue
+            elif status == "manual" and not row["auto_sent"] and payload.get("autoAttempted") is False:
+                continue
+            elif status == "sent" and row["auto_sent"] and predates_horizon(row["timestamp"]):
+                continue
+            else:
+                complete = False
+        return {
+            "ok": True, "bitrixDealId": deal_id, "sessionId": session_id, "chatId": chat_id,
+            "checkedIds": list(message_ids),
+            "automaticMessageIds": [value for value in message_ids if value in known],
+            "complete": complete, "coveredSince": covered_since,
+        }
 
     def _migration_marker_from_connection(
         self,
@@ -1369,12 +1512,16 @@ class StateStore:
             }
         )
         auto_sent = payload.get("autoSent", payload.get("auto_sent", False))
+        send_result = payload.get("sendResult")
+        provider_message_id = str(send_result.get("messageId") or "") if isinstance(send_result, dict) else ""
+        if not re.fullmatch(r"[1-9][0-9]{0,19}", provider_message_id):
+            provider_message_id = ""
         cursor = connection.execute(
             """
             INSERT INTO greeting_events(
                 timestamp, event_date, manager_id, manager_name, deal_id, operation_key, direction,
-                confidence, text, status, auto_sent, payload_json, source, created_at
-            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                confidence, text, status, auto_sent, provider_message_id, payload_json, source, created_at
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 timestamp,
@@ -1388,6 +1535,7 @@ class StateStore:
                 str(payload.get("text") or ""),
                 str(payload.get("status") or "manual"),
                 1 if auto_sent else 0,
+                provider_message_id,
                 _json_dumps(payload),
                 source,
                 self._now_iso(),
@@ -2733,6 +2881,7 @@ class StateStore:
             "dealId": row["deal_id"],
             "managerId": row["manager_id"],
             "sessionId": row["session_id"],
+            "chatId": row["chat_id"],
             "direction": row["direction"],
             "status": row["status"],
             "text": row["text"],
@@ -3121,6 +3270,7 @@ class StateStore:
         *,
         status: str,
         error_code: Any = "",
+        chat_id: Optional[Any] = None,
     ) -> Dict[str, Any]:
         self._ensure_ready()
         operation_key = str(operation_key)
@@ -3142,11 +3292,14 @@ class StateStore:
                 not row["session_id"] or not row["direction"] or not row["text"]
             ):
                 raise StateStoreError("checked greeting target and text are required before dispatch")
+            target_chat_id = row["chat_id"] if chat_id is None else str(chat_id)
+            if chat_id is not None and not re.fullmatch(r"[1-9][0-9]{0,19}", target_chat_id):
+                raise ValueError("chat_id must be a positive provider identifier")
             connection.execute(
                 """
                 UPDATE greeting_outbox SET
                     status=?, lease_token=?, lease_expires_at=NULL, next_attempt_at=NULL,
-                    error_code=?, updated_at=?, dispatching_at=?, finalized_at=?
+                    error_code=?, updated_at=?, dispatching_at=?, finalized_at=?, chat_id=?
                 WHERE operation_key=? AND status='checking' AND lease_token=?
                 """,
                 (
@@ -3156,6 +3309,7 @@ class StateStore:
                     now,
                     now if status == "dispatching" else None,
                     now if status == "manual" else None,
+                    target_chat_id,
                     operation_key,
                     worker_token,
                 ),
@@ -3170,6 +3324,8 @@ class StateStore:
         self,
         operation_key: Any,
         worker_token: Any,
+        *,
+        chat_id: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """Durably cross the no-automatic-retry boundary before remote send."""
 
@@ -3177,6 +3333,7 @@ class StateStore:
             operation_key,
             worker_token,
             status="dispatching",
+            chat_id=chat_id,
         )
 
     def mark_greeting_outbox_manual(

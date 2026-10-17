@@ -3994,6 +3994,9 @@ class TestGreetingOutboxWorker(ClaimWorkflowTestCase):
             if method == "imopenlines.operator.answer":
                 raise RuntimeError("Bitrix API error: ALREADY_RESPONSIBLE")
             if method == "im.message.add":
+                persisted = self.store.get_greeting_outbox(self.operation_key())
+                self.assertEqual(persisted["status"], "dispatching")
+                self.assertEqual(persisted["chatId"], "1763")
                 return 85851
             raise AssertionError(f"unexpected actor method: {method}")
 
@@ -4219,6 +4222,9 @@ class TestGreetingOutboxWorker(ClaimWorkflowTestCase):
             if method == "imopenlines.crm.chat.user.add":
                 return 1763
             if method == "imopenlines.crm.message.add":
+                persisted = self.store.get_greeting_outbox(self.operation_key())
+                self.assertEqual(persisted["status"], "dispatching")
+                self.assertEqual(persisted["chatId"], params["CHAT_ID"])
                 return 85851
             raise AssertionError(f"unsafe or unexpected method: {method}")
 
