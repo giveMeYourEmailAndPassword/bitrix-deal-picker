@@ -4538,6 +4538,38 @@ def process_greeting_outbox_once(worker_token=None, limit=1):
     return {"leased": len(jobs), "processed": processed}
 
 
+def reconcile_message_origin_scope_once():
+    """Recover one historical target without changing or retrying a send."""
+    session_id = STATE_STORE.reserve_message_origin_session(now=time.time())
+    if not session_id:
+        return {"checked": False, "resolved": False}
+    try:
+        # SESSION_ID, not the deal's current/last chat: a historical attempt
+        # must remain attached to its original target after session rollover.
+        history = bitrix_call(
+            "imopenlines.session.history.get", {"SESSION_ID": session_id},
+            timeout=min(5, BITRIX_FAST_TIMEOUT_SECONDS),
+        )
+        resolved = STATE_STORE.record_message_origin_session_history(session_id, history)
+    except Exception:
+        # The reservation has already set durable retry backoff. Do not log
+        # the provider response, message text or private scope identifiers.
+        resolved = False
+    return {"checked": True, "resolved": resolved}
+
+
+def message_origin_scope_loop():
+    while True:
+        try:
+            if BAZA_PICKER_BRIDGE_SECRET and readiness_state().get("ok"):
+                reconcile_message_origin_scope_once()
+        except Exception as exc:
+            sys.stderr.write(f"Message origin scope read failed: {type(exc).__name__}\n")
+        # One bounded read per turn; never a startup scan or a request-path
+        # dependency. Failed sessions additionally back off for 1–60 minutes.
+        time.sleep(10)
+
+
 def greeting_outbox_loop():
     worker_token = secrets.token_hex(16)
     while True:
@@ -7782,6 +7814,12 @@ def main():
         name="greeting-outbox",
         daemon=True,
     ).start()
+    if BAZA_PICKER_BRIDGE_SECRET:
+        threading.Thread(
+            target=message_origin_scope_loop,
+            name="message-origin-scope",
+            daemon=True,
+        ).start()
     if LOST_DEAL_AUTOCLOSE_ENABLED:
         threading.Thread(
             target=lost_deal_autoclose_loop,
