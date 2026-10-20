@@ -5021,6 +5021,54 @@ class TestBazaExtraClaimIntegration(TemporaryStateTestCase):
             pending[0]["dedupeKey"], f"extra-claim-request:{request['requestKey']}"
         )
 
+    def test_current_app_version_delivers_the_same_valid_claim_after_transient_failure(self):
+        self.store.begin_claim_operation("550521", "42", operation_key="claim:version")
+        self.store.finalize_claim_operation(
+            "claim:version",
+            claim={"timestamp": "2026-10-20T12:10:00+06:00"},
+            app_version=app.APP_VERSION,
+        )
+        event = self.store.list_outbox()[0]
+        sent_payloads = []
+
+        def fake_baza(path, payload):
+            self.assertEqual(path, "/integrations/deal-picker/v1/claim-events")
+            self.assertLessEqual(len(payload["appVersion"].encode("utf-16-le")) // 2, 100)
+            sent_payloads.append(app.canonical_json_bytes(payload))
+            if len(sent_payloads) == 1:
+                raise app.BazaIntegrationHttpError(503, {"code": "service_unavailable"})
+            return {"ok": True}
+
+        with (
+            patch.multiple(
+                app,
+                CLAIM_EVENT_EXPORT_ENABLED=True,
+                EXTRA_CLAIM_REQUESTS_ENABLED=False,
+                BAZA_CLAIM_EXPORT_FROM=None,
+                BAZA_API_BASE_URL="https://baza.example.test",
+                BAZA_HMAC_KEY_ID="picker-v1",
+                BAZA_HMAC_SECRET="s" * 32,
+            ),
+            patch.object(app, "baza_post", side_effect=fake_baza),
+        ):
+            first = app.flush_integration_outbox(limit=1)
+            self.assertEqual(first["retried"], 1)
+            self.assertEqual(first["dead"], 0)
+            with sqlite3.connect(self.store.db_path) as connection:
+                connection.execute(
+                    "UPDATE integration_outbox SET next_attempt_at=? WHERE id=?",
+                    ("2000-01-01T00:00:00+00:00", event["id"]),
+                )
+            second = app.flush_integration_outbox(limit=1)
+            self.assertEqual(second["sent"], 1)
+            self.assertEqual(app.flush_integration_outbox(limit=1)["sent"], 0)
+
+        self.assertEqual(len(sent_payloads), 2)
+        self.assertEqual(sent_payloads[0], sent_payloads[1])
+        self.assertEqual(self.store.list_claims()[0]["appVersion"], app.APP_VERSION)
+        self.assertIsNotNone(self.store.list_outbox()[0]["deliveredAt"])
+        self.assertIsNone(self.store.list_outbox()[0]["deadLetterAt"])
+
     def test_baza_credentials_alone_do_not_enable_outbox_delivery(self):
         self.add_taken_claim()
         with (

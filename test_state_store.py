@@ -1,4 +1,5 @@
 import concurrent.futures
+import hashlib
 import json
 import os
 import sqlite3
@@ -17,6 +18,7 @@ from state_store import (
     MIGRATION_MARKER,
     StateStore,
     StateStoreNotReadyError,
+    _claim_export_app_version,
 )
 
 
@@ -1058,6 +1060,107 @@ class TestClaimOperations(StateStoreTestCase):
             store.finalize_claim_operation("missing")
         with self.assertRaisesRegex(Exception, "not found"):
             store.fail_claim_operation("missing", "error")
+
+
+class TestClaimExportAppVersion(StateStoreTestCase):
+    PRODUCTION_VERSION = (
+        "2026-08-18-office-extra-claims-proven-greeting-"
+        "lost-deal-chat-autoclose-inbound-fix-active-dialog-guard"
+    )
+
+    def finalize_claim(self, store, deal_id="550521", version=None):
+        operation_key = f"claim:{deal_id}:42:1"
+        store.begin_claim_operation(deal_id, "42", operation_key=operation_key)
+        store.finalize_claim_operation(
+            operation_key,
+            claim={"timestamp": "2026-10-20T12:10:00+06:00"},
+            app_version=version or self.PRODUCTION_VERSION,
+        )
+        return store.list_outbox()[-1]
+
+    def test_contract_boundary_preserves_fitting_versions_and_unicode(self):
+        for version in ("test-sha", "x" * 100, "я" * 100, "🚀" * 50):
+            with self.subTest(version=version):
+                self.assertEqual(_claim_export_app_version(version), version)
+        for version in (None, ""):
+            self.assertEqual(_claim_export_app_version(version), "unknown")
+
+        self.assertEqual(len(self.PRODUCTION_VERSION), 103)
+        for version in (
+            self.PRODUCTION_VERSION, "x" * 101, "я" * 101,
+            "🚀" * 51, "x" * 86 + "🚀" * 8,
+        ):
+            with self.subTest(version=version):
+                compact = _claim_export_app_version(version)
+                self.assertLessEqual(len(compact.encode("utf-16-le")) // 2, 100)
+                self.assertTrue(compact.endswith(
+                    "~" + hashlib.sha256(version.encode("utf-8")).hexdigest()[:12]
+                ))
+                self.assertTrue(version.startswith(compact.rsplit("~", 1)[0]))
+                self.assertEqual(_claim_export_app_version(version), compact)
+
+        prefix = "x" * 100
+        self.assertNotEqual(
+            _claim_export_app_version(prefix + "release-a"),
+            _claim_export_app_version(prefix + "release-b"),
+        )
+
+    def test_finalized_claim_keeps_original_version_and_stable_export_after_retry(self):
+        store = self.make_store()
+        event = self.finalize_claim(store)
+        self.assertEqual(store.list_claims()[0]["appVersion"], self.PRODUCTION_VERSION)
+        self.assertEqual(event["payload"]["appVersion"],
+                         _claim_export_app_version(self.PRODUCTION_VERSION))
+        self.assertEqual(event["payload"]["eventUuid"], store.list_claims()[0]["eventUuid"])
+        with sqlite3.connect(store.db_path) as connection:
+            original_json = connection.execute(
+                "SELECT payload_json FROM integration_outbox WHERE id=?", (event["id"],)
+            ).fetchone()[0]
+
+        store.mark_outbox_failed(event["id"], "HTTP 503")
+        repeated = store.finalize_claim_operation(
+            event["payload"]["operationKey"],
+            claim={"timestamp": "2026-10-20T13:00:00+06:00"},
+            app_version="a-new-deployment",
+        )
+        self.assertFalse(repeated["transitioned"])
+        restarted = self.make_store()
+        self.assertEqual(len(restarted.list_claims()), 1)
+        self.assertEqual(len(restarted.list_outbox()), 1)
+        self.assertEqual(restarted.list_outbox()[0]["payload"], event["payload"])
+        restarted.mark_outbox_delivered(event["id"], {"ok": True})
+        with sqlite3.connect(store.db_path) as connection:
+            self.assertEqual(connection.execute(
+                "SELECT payload_json FROM integration_outbox WHERE id=?", (event["id"],)
+            ).fetchone()[0], original_json)
+        self.assertEqual(restarted.list_claims()[0]["appVersion"], self.PRODUCTION_VERSION)
+
+    def test_restart_never_rewrites_preexisting_long_version_outbox_rows(self):
+        store = self.make_store()
+        for deal_id, status in enumerate(("pending", "delivered", "dead-letter"), 550521):
+            event = self.finalize_claim(store, str(deal_id))
+            legacy_payload = {**event["payload"], "appVersion": self.PRODUCTION_VERSION}
+            with sqlite3.connect(store.db_path) as connection:
+                connection.execute(
+                    "UPDATE integration_outbox SET payload_json=? WHERE id=?",
+                    (json.dumps(legacy_payload), event["id"]),
+                )
+            if status == "delivered":
+                store.mark_outbox_delivered(event["id"], {"ok": True})
+            elif status == "dead-letter":
+                store.mark_outbox_dead_letter(
+                    event["id"], "invalid_request", {"code": "invalid_request"}
+                )
+        with sqlite3.connect(store.db_path) as connection:
+            before = connection.execute(
+                "SELECT * FROM integration_outbox ORDER BY id"
+            ).fetchall()
+        restarted = self.make_store()
+        self.assertTrue(restarted.readiness_check()["ok"])
+        with sqlite3.connect(store.db_path) as connection:
+            self.assertEqual(connection.execute(
+                "SELECT * FROM integration_outbox ORDER BY id"
+            ).fetchall(), before)
 
 
 class TestSchemaV2IntegrationMigration(StateStoreTestCase):

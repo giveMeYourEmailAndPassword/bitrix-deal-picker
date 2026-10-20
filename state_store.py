@@ -39,6 +39,26 @@ LEGACY_FILES = {
 
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
+# Baza validates this metadata with JS String.length and a PB max=100 field.
+CLAIM_EXPORT_APP_VERSION_MAX_LENGTH = 100
+
+
+def _claim_export_app_version(value: str) -> str:
+    """Freeze bounded version metadata when creating a new outbox event."""
+    version = str(value or "unknown")
+    if sum(2 if ord(char) > 0xFFFF else 1 for char in version) <= CLAIM_EXPORT_APP_VERSION_MAX_LENGTH:
+        return version
+    suffix = "~" + hashlib.sha256(version.encode("utf-8")).hexdigest()[:12]
+    budget = CLAIM_EXPORT_APP_VERSION_MAX_LENGTH - len(suffix)
+    prefix = []
+    for char in version:
+        units = 2 if ord(char) > 0xFFFF else 1
+        if units > budget:
+            break
+        prefix.append(char)
+        budget -= units
+    return "".join(prefix) + suffix
+
 
 def _message_origin_id(value: Any) -> Optional[str]:
     value = str(value) if type(value) is int else value
@@ -1469,7 +1489,7 @@ class StateStore:
             "bitrixUserId": str(manager_id),
             "occurredAt": self._claim_export_timestamp(occurred_at),
             "businessDate": str(business_date),
-            "appVersion": str(app_version or "unknown"),
+            "appVersion": _claim_export_app_version(app_version),
             "recovered": bool(recovered),
         }
         if extra_claim_request_id:
