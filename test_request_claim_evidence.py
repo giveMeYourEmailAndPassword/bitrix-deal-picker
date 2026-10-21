@@ -11,7 +11,7 @@ from request_claim_guard import RequestClaimConflictError, RequestClaimEvidenceE
 NOW = '2026-10-21T08:40:00+00:00'
 CLOSED = '2026-10-21T04:58:00+00:00'
 INBOUND = '2026-10-21T08:00:00+00:00'
-PHONE_HASH = hashlib.sha256(b'996779378485').hexdigest()
+PHONE_HASH = hashlib.sha256(b'996700000001').hexdigest()
 MID = '11111111-2222-4333-8444-555555555555'
 
 
@@ -23,7 +23,7 @@ class Provider:
         self.previous = {'ID': '576891', 'CONTACT_ID': '245', 'CLOSED': 'Y',
                          'STAGE_ID': 'UC_WANTS_HOT', 'STAGE_SEMANTIC_ID': 'F',
                          'CATEGORY_ID': '0', 'MOVED_TIME': CLOSED}
-        self.contacts = {'245': {'ID': '245', 'PHONE': [{'VALUE': '0779 378 485'}]}}
+        self.contacts = {'245': {'ID': '245', 'PHONE': [{'VALUE': '0700 000 001'}]}}
         self.deals = [self.previous, self.current]
         self.conflicts = []
         self.messages = {'23868279': self.message('23868279', '2026-10-20T20:03:00+00:00')}
@@ -31,6 +31,8 @@ class Provider:
                       '412901': {'id': '412901', 'connector': False, 'type': 'user', 'departments': [187]},
                       '262867': {'id': '262867', 'connector': False, 'type': 'bot', 'departments': []}}
         self.sessions = ['627799']
+        self.connector = None
+        self.chat = {}
         self.calls = []
         self.proof = {'providerId': MID, 'state': 'incoming', 'channelId': 'channel-one',
                       'phoneHash': PHONE_HASH, 'createdAt': INBOUND}
@@ -48,7 +50,7 @@ class Provider:
         if method == 'crm.duplicate.findbycomm':
             return {'result': {'CONTACT': list(self.contacts)}}
         if method == 'imopenlines.crm.chat.get':
-            return {'result': [{'CHAT_ID': '555949'}]}
+            return {'result': [{'CHAT_ID': '555949', 'CONNECTOR_ID': self.connector}]}
         if method == 'crm.deal.list':
             return {'result': self.deals, 'total': len(self.deals)}
         if method == 'crm.deal.get':
@@ -63,7 +65,7 @@ class Provider:
             return {'result': rows, 'total': len(rows)}
         if method == 'imopenlines.session.history.get':
             return {'result': {'chatId': '555949', 'sessionId': params['SESSION_ID'],
-                               'users': self.users, 'message': self.messages}}
+                               'users': self.users, 'message': self.messages, 'chat': self.chat}}
         raise AssertionError(method)
 
     def list_request_claim_conflicts(self, keys, *, except_operation_key):
@@ -110,12 +112,12 @@ class RequestClaimEvidenceTests(unittest.TestCase):
 
     def test_current_phone_is_canonicalized_and_never_returned(self):
         self.p.deals = [self.p.current]
-        for phone in ['0779378485', '779378485', '+779378485', '+996 (779) 378-485', '00996779378485']:
+        for phone in ['0700000001', '700000001', '+700000001', '+996 (700) 000-001', '00996700000001']:
             with self.subTest(phone=phone):
                 self.p.contacts['245']['PHONE'][0]['VALUE'] = phone
                 result = self.p.read()
                 self.assertIn('phone:' + PHONE_HASH, result['identityKeys'])
-                self.assertNotIn('779378485', str(result))
+                self.assertNotIn('700000001', str(result))
 
     def test_phone_normalization_matches_baza_russian_prefix(self):
         self.assertEqual(evidence._phone('8 (999) 123-45-67'), '79991234567')
@@ -237,6 +239,106 @@ class RequestClaimEvidenceTests(unittest.TestCase):
         with self.assertRaises(RequestClaimConflictError):
             self.p.read()
 
+    def native_instagram(self):
+        self.p.connector = 'fbinstagramdirect'
+        self.p.chat = {'555949': {'id': '555949', 'entityType': 'LINES',
+                                 'entityId': 'fbinstagramdirect|45|external-client'}}
+        self.p.messages = {'23870000': self.p.message('23870000', INBOUND)}
+        self.p.messages['23870000']['params'] = {}
+
+    def test_native_instagram_new_client_message_allows_renewal_without_wazzup(self):
+        self.native_instagram()
+        result = self.p.read(inbound_origins=None)
+        self.assertEqual(result['inboundAt'], INBOUND)
+        self.assertEqual(result['inboundEventKey'], hashlib.sha256(b'bitrix:fbinstagramdirect:555949:23870000').hexdigest())
+        validate_context(result, NOW)
+
+    def test_native_instagram_proof_does_not_require_a_phone(self):
+        self.native_instagram()
+        self.p.contacts['245']['PHONE'] = []
+        self.p.list_request_claim_conflicts = lambda keys, **kwargs: []
+        self.assertTrue(self.p.read(inbound_origins=None)['inboundEventKey'])
+
+    def test_native_instagram_event_identity_survives_session_rollover(self):
+        self.native_instagram()
+        first = self.p.read(inbound_origins=None)
+        self.p.sessions = ['700000']
+        second = self.p.read(inbound_origins=None)
+        self.assertEqual(first['inboundEventKey'], second['inboundEventKey'])
+
+    def test_native_instagram_same_message_with_conflicting_session_time_is_unproven(self):
+        self.native_instagram()
+        self.p.sessions = ['700000', '627799']
+        base = self.p.call
+        def read(method, params, **kwargs):
+            result = copy.deepcopy(base(method, params, **kwargs))
+            if method == 'imopenlines.session.history.get' and params['SESSION_ID'] == '627799':
+                result['result']['message']['23870000']['date'] = CLOSED
+            return result
+        with self.assertRaises(RequestClaimEvidenceError):
+            self.p.read(call=read, inbound_origins=None)
+
+    def test_native_instagram_requires_exact_source_on_both_independent_reads(self):
+        for connector in ['wz_instagram', 'whatsapp', 'fbinstagramdirect-spoof', None]:
+            for side in ['registry', 'history']:
+                with self.subTest(connector=connector, side=side):
+                    self.native_instagram()
+                    if side == 'registry':
+                        self.p.connector = connector
+                    else:
+                        self.p.chat['555949']['entityId'] = f'{connector}|45|external-client'
+                    with self.assertRaises(RequestClaimEvidenceError):
+                        self.p.read(inbound_origins=None)
+
+    def test_native_instagram_wrong_chat_line_or_entity_type_cannot_authorize(self):
+        for field, value in [('id', '1234'), ('entityType', 'CHAT'), ('entityId', 'fbinstagramdirect|0|client'),
+                             ('entityId', 'fbinstagramdirect|45|'), ('entityId', 'fbinstagramdirect')]:
+            with self.subTest(field=field, value=value):
+                self.native_instagram()
+                self.p.chat['555949'][field] = value
+                with self.assertRaises(RequestClaimEvidenceError):
+                    self.p.read(inbound_origins=None)
+
+    def test_native_instagram_employee_bot_deleted_and_old_customer_cannot_renew(self):
+        for kind in ['employee', 'bot', 'deleted', 'old', 'system']:
+            with self.subTest(kind=kind):
+                self.native_instagram()
+                message = self.p.messages['23870000']
+                if kind == 'employee':
+                    message['senderid'] = '412901'
+                elif kind == 'bot':
+                    message['senderid'] = '262867'
+                elif kind == 'system':
+                    message['senderid'] = '0'
+                elif kind == 'deleted':
+                    message['params']['IS_DELETED'] = True
+                elif kind == 'old':
+                    message['date'] = CLOSED
+                with self.assertRaises(RequestClaimConflictError):
+                    self.p.read(inbound_origins=None)
+
+    def test_native_instagram_unknown_sender_never_uses_text_to_guess_customer(self):
+        self.native_instagram()
+        self.p.messages['23870000']['senderid'] = '999'
+        with self.assertRaises(RequestClaimEvidenceError):
+            self.p.read(inbound_origins=None)
+
+    def test_native_instagram_files_and_shared_posts_count_as_customer_messages(self):
+        for params in [{'fileId': ['1001']}, {'FILE_ID': 1001}, {'fileIds': [1001]},
+                       {'attach': [{'blocks': [{'richLink': {'link': 'https://www.instagram.com/p/Example_1/'}}]}]}]:
+            with self.subTest(params=params):
+                self.native_instagram()
+                self.p.messages['23870000'].update(text='', params=params)
+                self.assertTrue(self.p.read(inbound_origins=None)['inboundEventKey'])
+
+    def test_native_instagram_empty_or_internal_crm_card_does_not_renew(self):
+        for params in [{}, {'fileId': ['0']}, {'attach': [{'blocks': [{'richLink': {'link': 'https://portal.bitrix24.kz/crm/deal/1/'}}]}]}]:
+            with self.subTest(params=params):
+                self.native_instagram()
+                self.p.messages['23870000'].update(text='', params=params)
+                with self.assertRaises(RequestClaimConflictError):
+                    self.p.read(inbound_origins=None)
+
     def test_pending_legacy_allocation_blocks_even_when_previous_deal_closed(self):
         self.new_inbound()
         self.p.conflicts = [{'dealId': '576891', 'status': 'reserved'}]
@@ -275,7 +377,7 @@ class RequestClaimEvidenceTests(unittest.TestCase):
                 self.p.previous[field] = previous
 
     def test_duplicate_contact_same_phone_adds_both_aliases(self):
-        self.p.contacts['246'] = {'ID': '246', 'PHONE': [{'VALUE': '+996779378485'}]}
+        self.p.contacts['246'] = {'ID': '246', 'PHONE': [{'VALUE': '+996700000001'}]}
         self.p.deals = [self.p.current]
         result = self.p.read()
         self.assertEqual(result['identityKeys'], ['chat:555949', 'contact:245', 'contact:246', 'phone:' + PHONE_HASH])

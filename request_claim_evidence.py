@@ -1,14 +1,16 @@
 """Read-only, bounded proof that a CRM card is a new customer request.
 
 Bitrix connector=True is NOT inbound proof: Wazzup sends outgoing echoes to
-OpenLines as customer messages. Renewal therefore needs an authenticated native
-provider UUID join supplied by ``inbound_origins``. Session creation, CRM creation
-and text matching never establish a new request.
+OpenLines as customer messages. Wazzup renewal needs an authenticated native
+provider UUID join supplied by ``inbound_origins``. Exact native Instagram uses
+its independently bound source and connector author. Session creation, CRM
+creation and text matching never establish a new request.
 """
 import hashlib
 import re
 import time
 from datetime import datetime, timezone
+from urllib.parse import urlsplit
 
 from request_claim_guard import RequestClaimConflictError, RequestClaimEvidenceError
 
@@ -80,6 +82,7 @@ class _Reader:
         if not isinstance(timeout, (int, float)) or not 0 < timeout <= READ_BUDGET_SECONDS:
             _error('request_evidence_timeout')
         self.deadline = time.monotonic() + timeout
+        self.chat_connectors = {}
 
     def remaining(self):
         remaining = self.deadline - time.monotonic()
@@ -228,7 +231,68 @@ def _chat_keys(reader, deal_id):
     ids = [_id(row.get('CHAT_ID')) for row in rows]
     if len(set(ids)) != len(ids):
         _error('request_session_unproven')
+    reader.chat_connectors = {chat_id: row.get('CONNECTOR_ID') for chat_id, row in zip(ids, rows)}
     return ['chat:' + value for value in ids]
+
+
+def _native_instagram(reader, history, chat_id):
+    """Require fresh CRM inverse binding and the exact native history source.
+
+    ``fbinstagramdirect`` is used by contracts/messenger-bitrix.ts. Wazzup
+    aliases cannot enter this path. Bitrix documents entityId as a source code:
+    https://apidocs.bitrix24.com/api-reference/imopenlines/openlines/sessions/imopenlines-session-open.html
+    Native portal fixtures also use the three-part direct-chat form.
+    """
+    if reader.chat_connectors.get(chat_id) != 'fbinstagramdirect':
+        return False
+    chats = history.get('chat')
+    chat = chats.get(chat_id) if isinstance(chats, dict) else None
+    if not isinstance(chat, dict) or str(chat.get('id')) != chat_id or chat.get('entityType') != 'LINES':
+        return False
+    code = chat.get('entityId')
+    if not isinstance(code, str) or len(code) > 600:
+        return False
+    parts = code.split('|')
+    return (len(parts) in (3, 4) and parts[0] == 'fbinstagramdirect'
+            and re.fullmatch(r'[1-9]\d{0,19}', parts[1]) is not None
+            and all(value and len(value) <= 256 for value in parts[2:]))
+
+
+def _native_content(message, params):
+    if any(isinstance(message.get(field), str) and message[field].strip() for field in ('text', 'textlegacy')):
+        return True
+    # Known attachment shapes from contracts/messenger-instagram-files.ts.
+    for field in ('FILE_ID', 'fileId', 'fileIds'):
+        value = params.get(field)
+        values = value if isinstance(value, list) else [value]
+        if len(values) > 100:
+            _error('request_history_incomplete')
+        if any(not isinstance(item, bool) and isinstance(item, (int, str))
+               and re.fullmatch(r'[1-9]\d{0,19}', str(item)) for item in values):
+            return True
+    attachments = params.get('attach', [])
+    if not isinstance(attachments, list) or len(attachments) > 20:
+        return False
+    for attachment in attachments:
+        blocks = attachment.get('blocks', []) if isinstance(attachment, dict) else []
+        if not isinstance(blocks, list) or len(blocks) > 20:
+            continue
+        for block in blocks:
+            rich = block.get('richLink') if isinstance(block, dict) else None
+            links = rich if isinstance(rich, list) else [rich]
+            for link in links[:20]:
+                value = link.get('link') if isinstance(link, dict) else None
+                if not isinstance(value, str) or len(value) > 2048:
+                    continue
+                try:
+                    url = urlsplit(value)
+                    if (url.scheme == 'https' and url.hostname in ('instagram.com', 'www.instagram.com')
+                            and not url.username and not url.password and not url.port
+                            and re.fullmatch(r'/(?:p|reel|reels|stories|tv)/[A-Za-z0-9_./-]+', url.path)):
+                        return True
+                except ValueError:
+                    continue
+    return False
 
 
 def _histories(reader, deal_id):
@@ -337,13 +401,15 @@ def read_request_claim_context(deal, *, call, store, operation_key='', observed_
 def _renewal(reader, deal_id, phones, context, cutoff, observed, inbound_origins):
     # The provider callback adapter is intentionally isolated from Bitrix's
     # undocumented connector-specific parameters and from CRM writes.
-    candidates, seen, chats = [], set(), set()
+    candidates, native_events, seen, chats = [], [], set(), set()
+    message_observations = {}
     ambiguous = False
     for history in _histories(reader, deal_id):
         chat_id = _id(history.get('chatId'))
         if 'chat:' + chat_id not in context['identityKeys']:
             _error('request_identity_changed')
         chats.add(chat_id)
+        native_instagram = _native_instagram(reader, history, chat_id)
         users, messages = history.get('users'), history.get('message')
         if users == []:
             users = {}
@@ -360,6 +426,11 @@ def _renewal(reader, deal_id, phones, context, cutoff, observed, inbound_origins
                 _error('request_history_incomplete')
             session_seen.add(message_id)
             stamp = _date(message.get('date'))
+            identity = (chat_id, message_id)
+            observation = (str(message.get('senderid', '')), stamp)
+            if identity in message_observations and message_observations[identity] != observation:
+                _error('request_history_incomplete')
+            message_observations[identity] = observation
             if stamp > observed:
                 _error('request_evidence_stale')
             if stamp <= cutoff:
@@ -383,11 +454,16 @@ def _renewal(reader, deal_id, phones, context, cutoff, observed, inbound_origins
             if not _flag(user.get('connector')) or user.get('departments') not in (None, []):
                 ambiguous = True
                 continue
+            if native_instagram:
+                if not _native_content(message, params):
+                    continue
+                event = hashlib.sha256(('bitrix:fbinstagramdirect:' + chat_id + ':' + message_id).encode()).hexdigest()
+                native_events.append((stamp, event))
+                continue
             mids = params.get('connectorMid')
             if not isinstance(mids, list) or not 1 <= len(mids) <= 20 or any(not isinstance(mid, str) or not re.fullmatch(r'[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}', mid) for mid in mids):
                 ambiguous = True
                 continue
-            identity = (chat_id, message_id)
             if identity in seen:
                 _error('request_history_incomplete')
             seen.add(identity)
@@ -396,6 +472,10 @@ def _renewal(reader, deal_id, phones, context, cutoff, observed, inbound_origins
                                'occurredAt': stamp.isoformat()})
     if len(candidates) > 200:
         _error('request_history_incomplete')
+    if native_events:
+        stamp, event = max(native_events)
+        context['inboundAt'], context['inboundEventKey'] = stamp.isoformat(), event
+        return context
     if candidates:
         return _verified_renewal(reader, deal_id, phones, context, candidates, cutoff, observed, inbound_origins)
     if ambiguous:

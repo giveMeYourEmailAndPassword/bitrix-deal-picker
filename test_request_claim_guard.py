@@ -190,7 +190,7 @@ class RequestClaimGuardTests(unittest.TestCase):
 
     def test_invalid_or_stale_context_rolls_back_claim_contact_and_fence(self):
         invalid = [self.context(observed=self.stamp(-301)),
-                   self.context(keys=['phone:0779378485']),
+                   self.context(keys=['phone:0700000001']),
                    self.context(prior=[{'dealId':'100','closedAt':'2026-01-01'}]),
                    self.context(keys=['contact:245','contact:245'])]
         for context in invalid:
