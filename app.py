@@ -28,6 +28,8 @@ from claim_chat_guard import (
     ClaimChatGuardUnavailable, claim_chat_guard_diagnostic, read_claim_chat_ownership,
 )
 from claim_locks import ClaimLocks, hold_claim_operation
+from request_claim_evidence import read_request_claim_context
+from request_claim_guard import RequestClaimConflictError, RequestClaimEvidenceError
 from search_runtime import (
     SearchTimings, SharedAnalysisPool, SingleFlight, ordered_analysis, read_source_lists_batch,
 )
@@ -167,12 +169,12 @@ LOCAL_TZ = timezone(timedelta(hours=env_int("APP_TZ_OFFSET_HOURS", 6, -12, 14)))
 STATE_STORE = StateStore(APP_DIR, local_timezone=LOCAL_TZ, auto_initialize=False)
 APP_VERSION = (
     "2026-08-18-office-extra-claims-proven-greeting-"
-    "lost-deal-chat-autoclose-inbound-fix-active-dialog-guard"
+    "lost-deal-chat-autoclose-inbound-fix-active-dialog-guard-request-deduplication"
 )
 # Bump whenever classifier, eligibility, source-completeness or oldest-first
 # routing semantics change. Pre-deploy tokens must not authorize post-deploy
 # decisions under a different routing policy.
-ROUTING_POLICY_VERSION = "2026-10-14-routing-v8-all-manager-directions"
+ROUTING_POLICY_VERSION = "2026-10-21-routing-v9-request-deduplication"
 
 SOURCE_STAGES = {
     "UC_ZJ55BR": "Необработанные ЛИДЫ",
@@ -3838,6 +3840,43 @@ def claim_chat_check_response(deal_id, manager_id):
     }
 
 
+def request_claim_context(deal, *, operation_key="", timeout=16):
+    """Read server-side request identity; selection tokens never supply it."""
+    try:
+        deadline = time.monotonic() + timeout
+        if not isinstance(deal, dict):
+            expected = normalize_entity_id(deal)
+            deal = bitrix_call("crm.deal.get", {"id": expected}, timeout=min(8, timeout))
+            if not expected or not isinstance(deal, dict) or normalize_entity_id(deal.get("ID")) != expected:
+                raise RequestClaimEvidenceError()
+        return read_request_claim_context(
+            deal, call=bitrix_call_full, store=STATE_STORE, operation_key=operation_key,
+            timeout=deadline - time.monotonic(),
+            inbound_origins=lambda payload, timeout: baza_post(
+                "/integrations/deal-picker/v1/incoming-provenance/query", payload, timeout=timeout,
+            ),
+        )
+    except (RequestClaimConflictError, RequestClaimEvidenceError):
+        raise
+    except Exception:
+        # Provider errors can contain credentials or client text. Only a stable
+        # diagnostic code is allowed to reach responses/logs.
+        raise RequestClaimEvidenceError("request_history_unavailable") from None
+
+
+def request_claim_error_response(error):
+    if isinstance(error, RequestClaimConflictError):
+        return {
+            "ok": False, "_httpStatus": 409, "selectionStale": True,
+            "code": error.code,
+            "message": "Этот запрос уже выдавался менеджеру. Повторная выдача возможна после завершения прежней сделки и нового сообщения клиента. Получите другую заявку.",
+        }
+    return {
+        "ok": False, "_httpStatus": 503, "code": error.code,
+        "message": "Не удалось подтвердить, что это новый запрос клиента. Назначение не выполнено; повторите проверку позже.",
+    }
+
+
 def require_available_greeting_chat(deal_id, manager_id):
     try:
         occupied = claim_chat_occupied(deal_id, manager_id)
@@ -3928,6 +3967,9 @@ def _search_next_deal_for_manager(manager_id, continuation_token, timings):
     }
 
     ownership_checks = 0
+    # Leave headroom inside Baza's 55-second request timeout. Confirmed skipped
+    # cards resume through the signed cursor instead of restarting the queue.
+    ownership_deadline = time.monotonic() + 30
     for header_index, (header, deal, analysis_error) in enumerate(analysis_rows):
         response_meta["checkedCount"] = header_index + 1
         header_id = str(header.get("ID") or "")
@@ -3959,7 +4001,7 @@ def _search_next_deal_for_manager(manager_id, continuation_token, timings):
             continue
         # Bound extra REST work per response. Resume after confirmed skipped
         # candidates, so many occupied dialogs cannot restart/starve the queue.
-        if ownership_checks >= 3:
+        if ownership_checks >= 3 or ownership_deadline - time.monotonic() < 8:
             return {
                 "manager": manager, "deal": None,
                 "reason": "Проверяю следующие заявки...",
@@ -3986,6 +4028,20 @@ def _search_next_deal_for_manager(manager_id, continuation_token, timings):
                 "code": "chat_ownership_unavailable", "_httpStatus": 503,
                 "checkedCount": header_index + 1, "hasMore": False,
                 "continuationToken": None,
+            }
+        try:
+            timings.call("ownership", request_claim_context, header_id,
+                         timeout=min(16, ownership_deadline - time.monotonic()))
+        except RequestClaimConflictError:
+            # A duplicate card must not block unrelated requests behind it.
+            continue
+        except RequestClaimEvidenceError as error:
+            response = request_claim_error_response(error)
+            return {
+                "manager": manager, "deal": None,
+                "reason": response["message"], "code": response["code"],
+                "_httpStatus": 503, "checkedCount": header_index + 1,
+                "hasMore": False, "continuationToken": None,
             }
         # Keep the response field compatible; directions no longer restrict
         # eligibility or priority for any authorized employee.
@@ -5056,6 +5112,12 @@ def preview_claim(deal_id, manager_id, auth=None, selection_token=None, *, send_
             if chat_check:
                 return chat_check
 
+        if success_result is None:
+            try:
+                request_evidence = request_claim_context(deal, operation_key=operation_key)
+            except (RequestClaimConflictError, RequestClaimEvidenceError) as error:
+                return request_claim_error_response(error)
+
         if success_result is None and DRY_RUN:
             return {
                 "ok": True,
@@ -5143,6 +5205,7 @@ def preview_claim(deal_id, manager_id, auth=None, selection_token=None, *, send_
                     return {"ok": False, "message": "Не удалось проверить ответственного контакта. Повторите получение этой заявки.",
                             "_httpStatus": 503}
             request_context = dict((existing_operation or {}).get("request") or {})
+            request_context["requestClaimContext"] = request_evidence
             request_context.pop("contactOwnerContext", None)
             if contact_context:
                 request_context["contactOwnerContext"] = contact_context
@@ -5197,6 +5260,8 @@ def preview_claim(deal_id, manager_id, auth=None, selection_token=None, *, send_
                     )
             except DealAlreadyClaimedError:
                 return already_claimed_response()
+            except (RequestClaimConflictError, RequestClaimEvidenceError) as error:
+                return request_claim_error_response(error)
             except IdempotencyConflictError:
                 return {
                     "recoveryPending": True,
@@ -5268,6 +5333,19 @@ def preview_claim(deal_id, manager_id, auth=None, selection_token=None, *, send_
             # Re-read only after a durable attempt-specific operation lease is
             # reserved. Manager/deal fences serialize conflicting operations;
             # SQLite and the CRM marker protect restart/race recovery.
+            # Contact phones and OpenLine bindings can change without touching
+            # the deal version. Recheck the request after acquiring its durable
+            # reservation, so such a change cannot bypass another allocation.
+            try:
+                final_evidence = request_claim_context(deal, operation_key=operation_key)
+                frozen = {k: v for k, v in request_evidence.items() if k != "observedAt"}
+                current = {k: v for k, v in final_evidence.items() if k != "observedAt"}
+                if current != frozen:
+                    raise RequestClaimEvidenceError("request_identity_changed")
+            except (RequestClaimConflictError, RequestClaimEvidenceError) as error:
+                fail_claim_operation_safely(operation_key, error.code, {"remoteUpdated": False})
+                return request_claim_error_response(error)
+
             # Native Bitrix acceptance need not change the CRM deal version.
             # Check again after the lease and immediately before the write.
             chat_check = claim_chat_check_response(deal_id, manager_id)
@@ -5279,7 +5357,7 @@ def preview_claim(deal_id, manager_id, auth=None, selection_token=None, *, send_
 
             live_deal = bitrix_call("crm.deal.get", {"id": deal_id})
             if not live_deal or str(live_deal.get("STAGE_ID") or "") not in SOURCE_STAGES:
-                fail_claim_operation_safely(operation_key, "stage_changed_before_update")
+                fail_claim_operation_safely(operation_key, "stage_changed_before_update", {"remoteUpdated": False})
                 return {
                     "selectionStale": True,
                     "ok": False,
@@ -5326,6 +5404,7 @@ def preview_claim(deal_id, manager_id, auth=None, selection_token=None, *, send_
                     "message": "Сделка изменилась до назначения. Получите её заново.",
                     "_httpStatus": 409,
                 }
+
 
             update_warning = None
             try:
