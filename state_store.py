@@ -16,6 +16,7 @@ import re
 import secrets
 import sqlite3
 import contact_owner_sync
+import request_claim_guard
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone, tzinfo
@@ -530,7 +531,7 @@ class StateStore:
                     ON lost_deal_close_operations(status, updated_at);
                 """
             )
-            for statement in (schema_sql + contact_owner_sync.SCHEMA).split(";"):
+            for statement in (schema_sql + contact_owner_sync.SCHEMA + request_claim_guard.SCHEMA).split(";"):
                 if statement.strip():
                     connection.execute(statement)
             operation_columns = {
@@ -1060,6 +1061,8 @@ class StateStore:
                         "integration_outbox",
                         "greeting_outbox",
                         "contact_owner_jobs",
+                        "request_claim_allocations",
+                        "request_claim_aliases",
                         "lost_deal_close_operations",
                     )
                 )
@@ -1225,6 +1228,8 @@ class StateStore:
                     "integration_outbox",
                     "greeting_outbox",
                     "contact_owner_jobs",
+                    "request_claim_allocations",
+                    "request_claim_aliases",
                 )
             }
             if any(state_counts.values()):
@@ -3850,6 +3855,7 @@ class StateStore:
                     row = connection.execute(
                         "SELECT * FROM claim_operations WHERE operation_key = ?", (operation_key,)
                     ).fetchone()
+                    request_claim_guard.reserve(connection, row, now)
                     contact_owner_sync.reserve(connection, row, now)
                     operation = self._operation_row(row, created=False)
                     operation["retried"] = True
@@ -3887,6 +3893,7 @@ class StateStore:
             row = connection.execute(
                 "SELECT * FROM claim_operations WHERE operation_key = ?", (operation_key,)
             ).fetchone()
+            request_claim_guard.reserve(connection, row, now)
             contact_owner_sync.reserve(connection, row, now)
             operation = self._operation_row(row, created=True)
             operation["retried"] = False
@@ -4025,6 +4032,7 @@ class StateStore:
             row = connection.execute(
                 "SELECT * FROM claim_operations WHERE operation_key = ?", (operation_key,)
             ).fetchone()
+            request_claim_guard.reserve(connection, row, now)
             contact_owner_sync.reserve(connection, row, now)
             operation = self._operation_row(row, created=False)
             operation["reassigned"] = True
@@ -4242,6 +4250,7 @@ class StateStore:
                     operation_key,
                 ),
             )
+            request_claim_guard.confirm(connection, operation_key, now)
             contact_owner_sync.activate(connection, operation_key, current_request.get("claimMarker"), now)
             greeting_queued = self._enqueue_greeting_from_request(
                 connection,
@@ -4280,6 +4289,7 @@ class StateStore:
                 return operation
             now = self._now_iso()
             result_payload = dict(result) if result is not None else {}
+            request_claim_guard.fail(connection, operation_key, result_payload, now)
             uncertainty_holds_grant = bool(
                 result_payload.get("remoteUpdated") is True
                 or result_payload.get("remoteUpdateUncertain")
@@ -4334,6 +4344,12 @@ class StateStore:
             operation = self._operation_row(row)
             operation["transitioned"] = True
             return operation
+
+    def list_request_claim_conflicts(self, identity_keys, except_operation_key=""):
+        """Read request ownership without entering any assignment/send flow."""
+        self._ensure_ready()
+        with self._transaction() as connection:
+            return request_claim_guard.list_conflicts(connection, identity_keys, except_operation_key)
 
     def list_claim_operations(self, *, status: Optional[str] = None) -> list[Dict[str, Any]]:
         self._ensure_ready()

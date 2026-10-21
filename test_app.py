@@ -114,6 +114,16 @@ class TemporaryStateTestCase(unittest.TestCase):
         self._chat_guard_patch = patch.object(app, "claim_chat_occupied", return_value=False)
         self._chat_guard_patch.start()
         self.addCleanup(self._chat_guard_patch.stop)
+        # Provider evidence has its own fixtures and workflow regressions. Keep
+        # unrelated claim/recovery tests isolated from additional REST reads.
+        def request_evidence(deal, **kwargs):
+            identity = str(deal.get("CONTACT_ID") or deal.get("ID")) if isinstance(deal, dict) else str(deal)
+            return {"identityKeys": ["contact:" + identity], "inboundEventKey": "",
+                    "inboundAt": "", "checkedPrior": [],
+                    "observedAt": self.store._now_iso()}
+        self._request_guard_patch = patch.object(app, "request_claim_context", side_effect=request_evidence)
+        self._request_guard_patch.start()
+        self.addCleanup(self._request_guard_patch.stop)
         # Parsing/fallback regressions retain individual source fixtures; the
         # batch transport and real streaming path are covered in test_search_speed.
         for name, value in (("BITRIX_SOURCE_BATCH_ENABLED", False), ("SEARCH_TIMING_LOG_ENABLED", False)):
