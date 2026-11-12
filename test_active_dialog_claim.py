@@ -143,13 +143,14 @@ class TestActiveDialogClaim(fixtures.ClaimWorkflowTestCase):
         self.assertEqual(self.search(self.manager_id)["deal"]["id"], "100")
         self.assertEqual(self.search("33")["deal"]["id"], "101")
 
-    def search_zero_owner_session(self, operator_id, *, bot):
+    def search_zero_owner_session(self, operator_id, *, bot, old_session=False):
         headers = [{"ID": i, "DATE_MODIFY": self.version} for i in ("100", "101")]
         deals = {header["ID"]: {"id": header["ID"], "version": self.version, "messages": [],
                                   "classification": {"direction": "Не определено"}}
                  for header in headers}
         source = "wz_whatsapp_synthetic"
-        created = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        created = "2020-01-01T12:00:00+00:00" if old_session else datetime.now(timezone.utc).isoformat(timespec="seconds")
+        hint = str(int(datetime.fromisoformat(created).timestamp())) if old_session else "0"
         session = {"id": 321, "chatId": 570831, "configId": 33, "source": source,
                    "crmEntityType": "deal", "crmEntityId": 100, "operatorId": int(operator_id),
                    "status": "answered", "dateCreate": created,
@@ -163,11 +164,13 @@ class TestActiveDialogClaim(fixtures.ClaimWorkflowTestCase):
             if method == "imopenlines.dialog.get":
                 return {"id": 570831, "type": "lines", "entity_type": "LINES",
                         "entity_id": f"{source}|33|synthetic-chat|synthetic-user",
-                        "entity_data_1": "Y|DEAL|100|N|N|321|0|0|0|0",
+                        "entity_data_1": f"Y|DEAL|100|N|N|321|{hint}|0|0|0",
                         "entity_data_2": "DEAL|100", "owner": 0}
             if method == "imopenlines.v2.Session.list":
                 self.assertEqual(str(params["configId"]), "33")
                 self.assertEqual(params["source"], source)
+                if old_session:
+                    self.assertIn("dateCreateFrom", params, "Old session is outside the recent 800")
                 return {"sessions": [dict(session)], "hasNextPage": False}
             if method == "im.user.get":
                 self.assertEqual(str(params["ID"]), str(operator_id))
@@ -202,6 +205,14 @@ class TestActiveDialogClaim(fixtures.ClaimWorkflowTestCase):
         self.assertEqual(result["checkedCount"], 2)
         self.assertEqual([call.args[1]["CRM_ENTITY"] for call in remote.call_args_list
                           if call.args[0] == "imopenlines.crm.chat.get"], ["100", "101"])
+
+    def test_old_zero_owner_session_does_not_block_next_free_deal(self):
+        result, remote = self.search_zero_owner_session("33", bot=False, old_session=True)
+        self.assertEqual(result["deal"]["id"], "101")
+        self.assertTrue(result["deal"]["selectionToken"])
+        self.assertEqual(result["checkedCount"], 2)
+        self.assertEqual(sum(call.args[0] == "imopenlines.v2.Session.list"
+                             for call in remote.call_args_list), 2)
 
     def test_many_occupied_candidates_resume_without_starving_free_leads(self):
         headers = [{"ID": str(i), "DATE_MODIFY": self.version} for i in range(100, 106)]

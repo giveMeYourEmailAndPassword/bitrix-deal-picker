@@ -3,7 +3,7 @@
 import math
 import re
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 
 MAX_ACTIVE_CLAIM_CHATS = 10
@@ -196,7 +196,24 @@ def _session_proof(row, address, chat_id, deal_id):
             _session_date(row["dateCreate"]), operator_id, row["status"], answer, None)
 
 
-def _read_session_proof(call, params, address, chat_id, deal_id, *, complete):
+def _session_time_hint(dialog):
+    # Some Bitrix dialogs include a Unix timestamp after the documented session
+    # ID. It is only a discovery hint, never ownership or session evidence.
+    # Missing/changed metadata keeps the bounded compatibility lookup available.
+    fields = str(dialog.get("entity_data_1") or "").split("|")
+    if len(fields) < 7 or not re.fullmatch(r"[1-9][0-9]{8,10}", fields[6]):
+        return None
+    try:
+        created = datetime.fromtimestamp(int(fields[6]), timezone.utc)
+        return {
+            "dateCreateFrom": (created - timedelta(seconds=1)).isoformat(),
+            "dateCreateTo": (created + timedelta(seconds=1)).isoformat(),
+        }
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
+def _read_session_proof(call, params, address, chat_id, deal_id, *, complete, allow_missing=False):
     matches = []
     for page in range(MAX_SESSION_PROOF_PAGES):
         result = call("imopenlines.v2.Session.list", {
@@ -215,6 +232,8 @@ def _read_session_proof(call, params, address, chat_id, deal_id, *, complete):
         if len(matches) > 1:
             raise ClaimChatGuardUnavailable("zero_owner_session_unavailable")
         if not result["hasNextPage"] or (matches and not complete):
+            if not matches and not result["hasNextPage"] and allow_missing:
+                return None
             if len(matches) != 1:
                 raise ClaimChatGuardUnavailable("zero_owner_session_unavailable")
             return matches[0]
@@ -224,9 +243,17 @@ def _read_session_proof(call, params, address, chat_id, deal_id, *, complete):
 def _zero_owner_occupied(dialog, chat_id, deal_id, manager_id, call):
     address = _zero_owner_address(dialog)
     params = {"configId": address[1], "source": address[0]}
-    # A bounded broad scan only locates this exact session and its date. It
-    # never proves availability, including when no matching row was returned.
-    observed = _read_session_proof(call, params, address, chat_id, deal_id, complete=False)
+    observed = None
+    hint = _session_time_hint(dialog)
+    if hint is not None:
+        observed = _read_session_proof(
+            call, {**params, **hint}, address, chat_id, deal_id,
+            complete=True, allow_missing=True,
+        )
+    if observed is None:
+        # A stale hint or older metadata can still use the bounded broad scan.
+        # Neither an empty hint window nor a missing broad result means free.
+        observed = _read_session_proof(call, params, address, chat_id, deal_id, complete=False)
     created, operator_id = observed[6], observed[7]
     staff = _owner_is_staff(call("im.user.get", {"ID": operator_id}), operator_id) if operator_id != "0" else False
     try:
