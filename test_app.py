@@ -40,6 +40,11 @@ _TEST_ENV = {
     "DRY_RUN": "1",
     "BITRIX_CLAIM_MARKER_FIELD": "UF_CRM_TEST_CLAIM_MARKER",
     "GREETING_AUTO_SEND": "0",
+    "OPENLINE_DEAL_ROUTING_ENABLED": "0",
+    "OPENLINE_LOST_RESTART_ENABLED": "0",
+    "OPENLINE_DEAL_ROUTING_LINES": "{}",
+    "OPENLINE_DEAL_ROUTING_BOT_ID": "",
+    "OPENLINE_DEAL_ROUTING_CLIENT_ID": "",
     "CLAIM_EVENT_EXPORT_ENABLED": "0",
     "EXTRA_CLAIM_REQUESTS_ENABLED": "0",
     "BAZA_PICKER_BRIDGE_SECRET": "",
@@ -967,6 +972,30 @@ class TestReadiness(TemporaryStateTestCase):
         self.assertTrue(result["ok"], result["errors"])
         self.assertTrue(result["storage"]["ok"])
         self.assertEqual(result["storage"]["journalMode"], "wal")
+
+    def test_enabled_router_requires_explicit_scope_and_bot_credentials(self):
+        with self._ready_patches(OPENLINE_DEAL_ROUTING_ENABLED=True):
+            result = app.readiness_state(force=True)
+        self.assertFalse(result["ok"])
+        self.assertTrue(any("OPENLINE_DEAL_ROUTING_LINES" in value for value in result["errors"]))
+        self.assertTrue(any("бот" in value for value in result["errors"]))
+
+    def test_valid_router_configuration_is_ready_without_disclosing_secret(self):
+        with self._ready_patches(
+            OPENLINE_DEAL_ROUTING_ENABLED=True, OPENLINE_LOST_RESTART_ENABLED=True,
+            OPENLINE_DEAL_ROUTING_LINES='{"103":["thoth_waba"]}',
+            OPENLINE_DEAL_ROUTING_BOT_ID="262867",
+            OPENLINE_DEAL_ROUTING_CLIENT_ID="private-test-bot-credential",
+        ):
+            result = app.readiness_state(force=True)
+        self.assertTrue(result["ok"], result["errors"])
+        self.assertNotIn("private-test-bot-credential", json.dumps(result))
+
+    def test_lost_restart_cannot_be_enabled_without_routing(self):
+        with self._ready_patches(OPENLINE_LOST_RESTART_ENABLED=True,
+                                 OPENLINE_DEAL_ROUTING_ENABLED=False):
+            result = app.readiness_state(force=True)
+        self.assertFalse(result["ok"])
 
     def test_unsupported_stats_source_fails_closed(self):
         with self._ready_patches(CLAIM_STATS_SOURCE="crm_guess"):
