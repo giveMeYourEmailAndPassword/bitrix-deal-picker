@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from contact_owner_sync import ContactOwnerSync
+from native_acceptance_sync import NativeAcceptanceSync
 from state_store import StateStore
 
 
@@ -243,6 +244,52 @@ class ContactOwnerTests(unittest.TestCase):
         self.remote["owner"] = "42"
         self.sync.process(key)
         self.assertEqual(self.sync.status(key), {"status": "ready"})
+        self.assertEqual(self.remote["writes"], [])
+
+    def queued_contact_after_native_deal_readback(self, previous_deal_owner):
+        # Rebuild the durable state left by the previous version, without
+        # sending a deal update or running the contact worker during setup.
+        self.claim("101", context=False)
+        self.remote["deals"]["101"]["ASSIGNED_BY_ID"] = "43"
+        self.remote["deals"]["101"]["UF_MARKER"] = ""
+        native = NativeAcceptanceSync(self.store, self.call, None, self.sync, "UF_CRM_MARKER")
+        native.observe({"id": 900, "chatId": 123, "configId": 33, "source": "fbinstagramdirect",
+                        "dateCreate": self.store._now_iso(), "status": "answered",
+                        "operatorId": 43, "crmEntityType": "deal", "crmEntityId": 101})
+        key = "native:900:1"
+        generation = self.sync.reserve_native(key, "101", "43", "7", "9", "")
+        with self.store._transaction(immediate=True) as db:
+            self.assertEqual(db.execute("""UPDATE native_acceptance_jobs SET status='ready',dispatched=1,
+                acknowledged=1,previous_owner=?,contact_id='7',contact_generation=? WHERE operation_key=?""",
+                (previous_deal_owner, generation, key)).rowcount, 1)
+        self.sync.confirm_native(generation)
+        return key
+
+    def test_preexisting_native_takeover_cannot_start_contact_write(self):
+        key = self.queued_contact_after_native_deal_readback("42")
+        self.sync.process(key)
+        self.sync.process(key)
+        self.assertEqual(self.sync.status(key), {"status": "conflict", "code": "native_picker_owner_protected"})
+        self.assertEqual(self.remote["writes"], [])
+        self.assertEqual(self.remote["owner"], "9")
+
+    def test_preexisting_native_acceptance_by_actual_deal_owner_can_sync_contact(self):
+        key = self.queued_contact_after_native_deal_readback("43")
+        self.sync.process(key)
+        self.assertEqual(self.sync.status(key), {"status": "ready"})
+        self.assertEqual(self.remote["writes"], [{"id": "7", "fields[ASSIGNED_BY_ID]": "43"}])
+
+    def test_preexisting_dispatched_native_contact_is_only_read_back(self):
+        key = self.queued_contact_after_native_deal_readback("42")
+        with self.store._transaction(immediate=True) as db:
+            db.execute("UPDATE contact_owner_jobs SET dispatched=1,dispatch_owner='9' WHERE operation_key=?", (key,))
+        self.sync.process(key)
+        self.assertEqual(self.sync.status(key), {"status": "pending", "code": "contact_update_uncertain"})
+        self.remote["owner"] = "43"
+        self.due()
+        self.sync.process(key)
+        self.assertEqual(self.sync.status(key), {"status": "ready"})
+        self.assertEqual(self.remote["calls"], ["crm.contact.get", "crm.contact.get"])
         self.assertEqual(self.remote["writes"], [])
 
     def test_native_and_picker_share_ordering_and_allow_empty_preserved_marker(self):
