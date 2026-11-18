@@ -460,6 +460,16 @@ class StateStore:
                     finalized_at TEXT
                 );
 
+                CREATE TABLE IF NOT EXISTS greeting_actor_pins (
+                    operation_key TEXT PRIMARY KEY REFERENCES greeting_outbox(operation_key),
+                    deal_id TEXT NOT NULL,
+                    manager_id TEXT NOT NULL,
+                    chat_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    reserved_at TEXT NOT NULL,
+                    acknowledged_at TEXT
+                );
+
                 CREATE TABLE IF NOT EXISTS lost_deal_close_operations (
                     transition_id TEXT PRIMARY KEY,
                     deal_id TEXT NOT NULL,
@@ -3422,8 +3432,8 @@ class StateStore:
         if status not in {"dispatching", "manual"}:
             raise ValueError("invalid checking transition")
         code = "" if status == "dispatching" else self._outbox_error_code(error_code)
-        now = self._now_iso()
         with self._transaction(immediate=True) as connection:
+            now = self._now_iso()
             row = connection.execute(
                 "SELECT * FROM greeting_outbox WHERE operation_key = ?",
                 (operation_key,),
@@ -3439,6 +3449,17 @@ class StateStore:
             target_chat_id = row["chat_id"] if chat_id is None else str(chat_id)
             if chat_id is not None and not re.fullmatch(r"[1-9][0-9]{0,19}", target_chat_id):
                 raise ValueError("chat_id must be a positive provider identifier")
+            # A session can be linked to a later claim. Reserve the right to send
+            # under the same SQLite write lock used to mark the durable dispatch.
+            session_contacted = status == "dispatching" and connection.execute(
+                """SELECT 1 FROM greeting_outbox WHERE session_id=?
+                   AND (status IN ('sent','dispatching','uncertain') OR NULLIF(dispatching_at,'') IS NOT NULL)
+                   LIMIT 1""",
+                (row["session_id"],),
+            ).fetchone() is not None
+            if session_contacted:
+                status = "manual"
+                code = "greeting_session_already_contacted"
             connection.execute(
                 """
                 UPDATE greeting_outbox SET
@@ -3451,7 +3472,7 @@ class StateStore:
                     worker_token if status == "dispatching" else "",
                     code,
                     now,
-                    now if status == "dispatching" else None,
+                    now if status == "dispatching" else row["dispatching_at"],
                     now if status == "manual" else None,
                     target_chat_id,
                     operation_key,
@@ -3462,7 +3483,7 @@ class StateStore:
                 "SELECT * FROM greeting_outbox WHERE operation_key = ?",
                 (operation_key,),
             ).fetchone()
-            return self._greeting_outbox_row(row, transitioned=True)
+            return self._greeting_outbox_row(row, transitioned=not session_contacted)
 
     def mark_greeting_outbox_dispatching(
         self,
@@ -3633,6 +3654,13 @@ class StateStore:
                 "sessionId": str(context.get("sessionId") or "").strip(),
                 "direction": str(context.get("direction") or "").strip(),
             }
+            if type(context.get("deliveryVersion")) is int and context["deliveryVersion"] == 2:
+                prepared["greetingContext"]["deliveryVersion"] = 2
+                if context.get("entrypoint") in ("bitrix", "baza"):
+                    prepared["greetingContext"]["entrypoint"] = context["entrypoint"]
+                category = str(context.get("categoryId", ""))
+                if re.fullmatch(r"\d{1,19}", category):
+                    prepared["greetingContext"]["categoryId"] = category
         elif "greetingContext" in prepared:
             prepared.pop("greetingContext", None)
         return prepared
@@ -4041,13 +4069,22 @@ class StateStore:
             operation["reassigned"] = True
             return operation
 
-    def get_claim_operation(self, operation_key: Any) -> Optional[Dict[str, Any]]:
+    def get_claim_operation(self, operation_key: Any, *, for_greeting: bool = False) -> Optional[Dict[str, Any]]:
         self._ensure_ready()
         with self._connect() as connection:
             row = connection.execute(
                 "SELECT * FROM claim_operations WHERE operation_key = ?", (str(operation_key),)
             ).fetchone()
-        return self._operation_row(row) if row else None
+        if not row:
+            return None
+        operation = self._operation_row(row)
+        if for_greeting:
+            # Internal worker only. Public status and attempt history keep the
+            # existing redaction of private greeting routing metadata.
+            context = json.loads(row["request_json"] or "{}").get("greetingContext")
+            if isinstance(context, dict):
+                operation["request"]["greetingContext"] = context
+        return operation
 
     def find_succeeded_claim_operation_by_marker(
         self,
