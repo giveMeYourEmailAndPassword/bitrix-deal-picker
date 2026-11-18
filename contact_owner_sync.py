@@ -77,9 +77,35 @@ def cancel_unapplied(connection, operation_key, marker, now):
 
 
 class ContactOwnerSync:
-    def __init__(self, store, call, marker_field, *, locks=None):
+    def __init__(self, store, call, marker_field, *, locks=None, enforce_active_policy=False):
         self.store, self.call, self.marker_field = store, call, marker_field
         self.locks = locks
+        self.enforce_active_policy = enforce_active_policy
+
+    def reserve_crm(self, operation_key, deal_id, manager_id, contact_id,
+                    previous_owner, expected_claim_marker, *, snapshot_started_at=None):
+        """Queue a fresh CRM observation in the SAME serialized contact lane.
+
+        A replay keeps its generation; neither scanner retries nor restarts can
+        promote an old observation over a newer confirmed claim.
+        """
+        if (not self.enforce_active_policy or not str(operation_key).startswith("crm:")
+                or not all(entity_id(value) for value in (deal_id, manager_id, contact_id))
+                or not entity_id(previous_owner, allow_zero=True)):
+            raise ValueError("invalid_crm_contact_intent")
+        now = self.store._now_iso()
+        snapshot = self.store._outbox_time(self.store._outbox_datetime(snapshot_started_at or now))
+        values = (str(operation_key), str(expected_claim_marker or ""), str(deal_id),
+                  str(contact_id), str(manager_id), str(previous_owner))
+        with self.store._transaction(immediate=True) as db:
+            db.execute("""INSERT OR IGNORE INTO contact_owner_jobs(
+                operation_key,claim_marker,deal_id,contact_id,manager_id,previous_owner,
+                snapshot_started_at,confirmed,status,next_attempt_at,created_at,updated_at)
+                VALUES(?,?,?,?,?,?,?,1,'pending',?,?,?)""", (*values, snapshot, now, now, now))
+            row = db.execute("SELECT * FROM contact_owner_jobs WHERE operation_key=? AND claim_marker=?", values[:2]).fetchone()
+            if tuple(row[name] for name in ("operation_key", "claim_marker", "deal_id", "contact_id", "manager_id", "previous_owner")) != values:
+                raise ValueError("crm_contact_intent_conflict")
+            return row["generation"]
 
     def reserve_native(self, operation_key, deal_id, manager_id, contact_id,
                        previous_owner, expected_claim_marker, *, snapshot_started_at=None,
@@ -231,10 +257,24 @@ class ContactOwnerSync:
 
     def read_deal(self, job):
         deal = self.call("crm.deal.get", {"id": job["deal_id"]}, timeout=8) or {}
-        return (entity_id(deal.get("ID")) == job["deal_id"]
+        ordinary = not job["operation_key"].startswith("crm:")
+        identity = (entity_id(deal.get("ID")) == job["deal_id"]
                 and entity_id(deal.get("ASSIGNED_BY_ID")) == job["manager_id"]
-                and entity_id(deal.get("CONTACT_ID")) == job["contact_id"]
+                and (not ordinary or entity_id(deal.get("CONTACT_ID")) == job["contact_id"])
                 and str(deal.get(self.marker_field) or "") == job["claim_marker"])
+        if not identity:
+            return False
+        if not self.enforce_active_policy:
+            # A new CRM job must never run after the feature was disabled.
+            return ordinary
+        from contact_owner_policy import eligible_deal, latest_eligible_deal
+        if not eligible_deal(deal):
+            return False
+        winner = latest_eligible_deal(self.call, job["contact_id"])
+        return bool(winner and entity_id(winner.get("ID")) == job["deal_id"]
+                    and entity_id(winner.get("ASSIGNED_BY_ID")) == job["manager_id"]
+                    and str(winner.get(self.marker_field) or "") == job["claim_marker"]
+                    and (not ordinary or entity_id(winner.get("CONTACT_ID")) == job["contact_id"]))
 
     def read_contact_owner(self, job):
         contact = self.call("crm.contact.get", {"id": job["contact_id"]}, timeout=8) or {}
