@@ -327,6 +327,23 @@ class NativeAcceptanceSync:
         return (entity_id(deal.get("ASSIGNED_BY_ID"), allow_zero=True),
                 deal.get("DATE_MODIFY"), marker, entity_id(deal.get("CONTACT_ID")))
 
+    def check_picker_owner(self, job, owner):
+        if owner != job["manager_id"] and self.store.deal_was_claimed(job["deal_id"]):
+            raise Conflict("native_picker_owner_protected")
+
+    def mark_dispatched(self, job):
+        # Check the picker journal in the same transaction as the dispatch flag.
+        # A legacy claim event can arrive after the remote proof or reservation.
+        with self.store._transaction(immediate=True) as db:
+            changed = db.execute("""UPDATE native_acceptance_jobs SET dispatched=1,next_at=?,error_code=''
+                WHERE operation_key=? AND status='pending' AND dispatched=0""",
+                (self.time() + 60, job["operation_key"])).rowcount
+            if not changed:
+                return False
+            if job["previous_owner"] != job["manager_id"] and self.store._deal_was_claimed(db, job["deal_id"], ""):
+                raise Conflict("native_picker_owner_protected")
+        return True
+
     def confirmed(self, job):
         if job["contact_generation"]:
             self.contacts.confirm_native(job["contact_generation"])
@@ -347,6 +364,9 @@ class NativeAcceptanceSync:
             if marker != job["expected_marker"] or contact != job["contact_id"]:
                 raise Conflict("native_deal_binding_changed")
             self.proof(job)
+            # An older version may already have overwritten the deal. Reconcile
+            # the sent write without activating its still-reserved contact job.
+            self.check_picker_owner(job, job["previous_owner"])
             self.confirmed(job)
         elif job["acknowledged"]:
             raise Conflict("native_deal_owner_changed")
@@ -380,6 +400,7 @@ class NativeAcceptanceSync:
                     return True
                 deal = self.proof(job)
                 owner, modified, marker, contact = self.deal_identity(deal)
+                self.check_picker_owner(job, owner)
                 if timestamp(modified) > job["observed_at"] + 1:
                     raise Conflict("native_deal_changed_after_acceptance")
                 if job["previous_owner"] is not None and (owner, modified, marker, contact) != (
@@ -407,7 +428,8 @@ class NativeAcceptanceSync:
                 if self.deal_identity(final) != (owner, modified, marker, contact):
                     raise Conflict("native_deal_changed_before_dispatch")
                 # Persist before transport. A timeout/crash is read-only recovery.
-                self.save(job, "pending", dispatched=1)
+                if not self.mark_dispatched(job):
+                    return False
                 job["dispatched"] = 1
                 if owner != job["manager_id"]:
                     rejected = False
