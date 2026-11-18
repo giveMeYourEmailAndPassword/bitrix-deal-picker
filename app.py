@@ -166,7 +166,7 @@ ANALYSIS_INFLIGHT = SingleFlight()
 LOCAL_TZ = timezone(timedelta(hours=env_int("APP_TZ_OFFSET_HOURS", 6, -12, 14)))
 STATE_STORE = StateStore(APP_DIR, local_timezone=LOCAL_TZ, auto_initialize=False)
 APP_VERSION = (
-    "2026-11-18-automatic-contact-owner"
+    "2026-11-18-returning-client-routing"
 )
 # Bump whenever classifier, eligibility, source-completeness or oldest-first
 # routing semantics change. Pre-deploy tokens must not authorize post-deploy
@@ -297,6 +297,13 @@ CLAIM_RECONCILE_INTERVAL_SECONDS = env_float(
 CLAIM_RECONCILE_BATCH_SIZE = env_int("CLAIM_RECONCILE_BATCH_SIZE", 100, 1, 1000)
 NATIVE_ACCEPTANCE_SYNC_ENABLED = env_bool("NATIVE_ACCEPTANCE_SYNC_ENABLED", False)
 CRM_CONTACT_OWNER_SYNC_ENABLED = env_bool("CRM_CONTACT_OWNER_SYNC_ENABLED", False)
+OPENLINE_DEAL_ROUTING_ENABLED = env_bool("OPENLINE_DEAL_ROUTING_ENABLED", False)
+OPENLINE_LOST_RESTART_ENABLED = env_bool("OPENLINE_LOST_RESTART_ENABLED", False)
+OPENLINE_DEAL_ROUTING_BOT_ID = os.environ.get("OPENLINE_DEAL_ROUTING_BOT_ID", "").strip()
+OPENLINE_DEAL_ROUTING_CLIENT_ID = os.environ.get("OPENLINE_DEAL_ROUTING_CLIENT_ID", "").strip()
+# Explicit line/source pairs, e.g. {"103":["thoth_waba"]}. Never discover a
+# writable scope from all lines returned by the portal.
+OPENLINE_DEAL_ROUTING_LINES = os.environ.get("OPENLINE_DEAL_ROUTING_LINES", "{}")
 CLAIM_EVENT_EXPORT_ENABLED = env_bool("CLAIM_EVENT_EXPORT_ENABLED", False)
 EXTRA_CLAIM_REQUESTS_ENABLED = env_bool("EXTRA_CLAIM_REQUESTS_ENABLED", False)
 try:
@@ -5670,6 +5677,69 @@ def responsibility_sync_loop():
         time.sleep(30)
 
 
+def openline_deal_routing_loop():
+    router = None
+    while True:
+        try:
+            if OPENLINE_DEAL_ROUTING_ENABLED and not DRY_RUN and readiness_state().get("ok"):
+                if router is None:
+                    from openline_deal_router import OpenlineDealRouter
+                    router = OpenlineDealRouter(
+                        STATE_STORE, bitrix_call, CLAIM_LOCKS,
+                        allowed_lines=json.loads(OPENLINE_DEAL_ROUTING_LINES),
+                        bot_id=OPENLINE_DEAL_ROUTING_BOT_ID,
+                        bot_client_id=OPENLINE_DEAL_ROUTING_CLIENT_ID,
+                    )
+                    sys.stderr.write("OpenLine deal routing enabled; polling interval 15s\n")
+                summary = router.run()
+                if summary:
+                    # Only numeric counters, never provider payloads or secrets.
+                    counters = {key: value for key, value in summary.items()
+                                if type(value) is int and re.fullmatch(r"[a-z_]{1,32}", key)}
+                    if any(counters.values()):
+                        sys.stderr.write("OpenLine deal routing: " + " ".join(
+                            f"{key}={value}" for key, value in counters.items()) + "\n")
+        except Exception as exc:
+            sys.stderr.write(f"OpenLine deal routing failed: {type(exc).__name__}\n")
+        time.sleep(15)
+
+
+
+def lost_session_restart_loop():
+    lost = None
+    while True:
+        try:
+            if (OPENLINE_DEAL_ROUTING_ENABLED and OPENLINE_LOST_RESTART_ENABLED
+                    and not DRY_RUN and readiness_state().get("ok")):
+                if lost is None:
+                    from lost_session_restart import LostSessionRestart
+                    lost = LostSessionRestart(
+                        STATE_STORE, bitrix_call, CLAIM_LOCKS,
+                        allowed_lines=json.loads(OPENLINE_DEAL_ROUTING_LINES),
+                        prove_failed=prove_current_failed_deal,
+                        bot_id=OPENLINE_DEAL_ROUTING_BOT_ID,
+                        bot_client_id=OPENLINE_DEAL_ROUTING_CLIENT_ID,
+                    )
+                    sys.stderr.write("OpenLine lost-session restart enabled; polling interval 15s\n")
+                result = lost.tick()
+                if result:
+                    counters = {key: value for key, value in result.items()
+                                if type(value) is int and re.fullmatch(r"[a-z_]{1,32}", key)}
+                    if any(counters.values()):
+                        sys.stderr.write("OpenLine lost restart: " + " ".join(
+                            f"{key}={value}" for key, value in counters.items()) + "\n")
+        except Exception as exc:
+            sys.stderr.write(f"OpenLine lost restart failed: {type(exc).__name__}\n")
+        time.sleep(15)
+
+
+def prove_current_failed_deal(deal_id):
+    _, history = read_deal_stage_history(deal_id)
+    if not history:
+        raise LostDealCloseGuardError("stage_history_incomplete")
+    return exact_failed_transition(deal_id, history[0]["id"])
+
+
 def record_rejection(manager_id, payload):
     manager_id = normalize_entity_id(manager_id)
     deal_id = normalize_entity_id(payload.get("dealId"))
@@ -6081,6 +6151,24 @@ def _compute_readiness_state():
         errors.append("GREETING_AUTO_SEND=1 запрещён до безопасной привязки чата к сделке")
     if not DRY_RUN and not claim_marker_field_valid():
         errors.append("Для DRY_RUN=0 требуется корректный BITRIX_CLAIM_MARKER_FIELD")
+    if OPENLINE_LOST_RESTART_ENABLED and not OPENLINE_DEAL_ROUTING_ENABLED:
+        errors.append("Перезапуск проигранных диалогов требует включённой маршрутизации")
+    if OPENLINE_DEAL_ROUTING_ENABLED:
+        try:
+            lines = json.loads(OPENLINE_DEAL_ROUTING_LINES)
+            if (not isinstance(lines, dict) or not 1 <= len(lines) <= 30
+                    or any(not re.fullmatch(r"[1-9]\d{0,14}", str(line))
+                           or not isinstance(sources, list) or not 1 <= len(sources) <= 10
+                           or any(not isinstance(source, str)
+                                  or not re.fullmatch(r"[A-Za-z0-9_:-]{1,128}", source)
+                                  for source in sources)
+                           for line, sources in lines.items())):
+                raise ValueError()
+        except (ValueError, TypeError):
+            errors.append("OPENLINE_DEAL_ROUTING_LINES должен задавать точные линии и источники")
+        if (not re.fullmatch(r"[1-9]\d{0,14}", OPENLINE_DEAL_ROUTING_BOT_ID)
+                or not OPENLINE_DEAL_ROUTING_CLIENT_ID):
+            errors.append("Не настроен бот маршрутизации Открытых линий")
     if not ADMIN_USER_IDS:
         errors.append("Не задан ADMIN_USER_IDS")
     elif any(not item.isdigit() for item in ADMIN_USER_IDS):
@@ -7823,6 +7911,18 @@ def main():
         name="responsibility-sync",
         daemon=True,
     ).start()
+    if OPENLINE_DEAL_ROUTING_ENABLED:
+        threading.Thread(
+            target=openline_deal_routing_loop,
+            name="openline-deal-routing",
+            daemon=True,
+        ).start()
+    if OPENLINE_DEAL_ROUTING_ENABLED and OPENLINE_LOST_RESTART_ENABLED:
+        threading.Thread(
+            target=lost_session_restart_loop,
+            name="lost-session-restart",
+            daemon=True,
+        ).start()
     threading.Thread(
         target=integration_outbox_loop,
         name="baza-integration-outbox",
