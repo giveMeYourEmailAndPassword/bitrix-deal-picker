@@ -166,8 +166,7 @@ ANALYSIS_INFLIGHT = SingleFlight()
 LOCAL_TZ = timezone(timedelta(hours=env_int("APP_TZ_OFFSET_HOURS", 6, -12, 14)))
 STATE_STORE = StateStore(APP_DIR, local_timezone=LOCAL_TZ, auto_initialize=False)
 APP_VERSION = (
-    "2026-08-18-office-extra-claims-proven-greeting-"
-    "lost-deal-chat-autoclose-inbound-fix-active-dialog-guard"
+    "2026-11-18-automatic-contact-owner"
 )
 # Bump whenever classifier, eligibility, source-completeness or oldest-first
 # routing semantics change. Pre-deploy tokens must not authorize post-deploy
@@ -297,6 +296,7 @@ CLAIM_RECONCILE_INTERVAL_SECONDS = env_float(
 )
 CLAIM_RECONCILE_BATCH_SIZE = env_int("CLAIM_RECONCILE_BATCH_SIZE", 100, 1, 1000)
 NATIVE_ACCEPTANCE_SYNC_ENABLED = env_bool("NATIVE_ACCEPTANCE_SYNC_ENABLED", False)
+CRM_CONTACT_OWNER_SYNC_ENABLED = env_bool("CRM_CONTACT_OWNER_SYNC_ENABLED", False)
 CLAIM_EVENT_EXPORT_ENABLED = env_bool("CLAIM_EVENT_EXPORT_ENABLED", False)
 EXTRA_CLAIM_REQUESTS_ENABLED = env_bool("EXTRA_CLAIM_REQUESTS_ENABLED", False)
 try:
@@ -5436,7 +5436,8 @@ def preview_claim(deal_id, manager_id, auth=None, selection_token=None, *, send_
             success_result["claimedAt"] = previous_claim["timestamp"]
     if not DRY_RUN:
         try:
-            contact_sync = ContactOwnerSync(STATE_STORE, bitrix_call, BITRIX_CLAIM_MARKER_FIELD, locks=CLAIM_LOCKS)
+            contact_sync = ContactOwnerSync(STATE_STORE, bitrix_call, BITRIX_CLAIM_MARKER_FIELD,
+                                           locks=CLAIM_LOCKS, enforce_active_policy=CRM_CONTACT_OWNER_SYNC_ENABLED)
             contact_sync.process(operation_key)
             contact_status = contact_sync.status(operation_key)
             if contact_status:
@@ -5632,8 +5633,10 @@ def claim_reconciliation_loop():
 
 
 def responsibility_sync_loop():
-    contacts = ContactOwnerSync(STATE_STORE, bitrix_call, BITRIX_CLAIM_MARKER_FIELD, locks=CLAIM_LOCKS)
+    contacts = ContactOwnerSync(STATE_STORE, bitrix_call, BITRIX_CLAIM_MARKER_FIELD,
+                                locks=CLAIM_LOCKS, enforce_active_policy=CRM_CONTACT_OWNER_SYNC_ENABLED)
     native = None
+    crm = None
     while True:
         try:
             if not DRY_RUN and readiness_state().get("ok"):
@@ -5645,7 +5648,23 @@ def responsibility_sync_loop():
                             after_confirmed=invalidate_deal_caches,
                         )
                     native.run()
-                contacts.process()
+                if CRM_CONTACT_OWNER_SYNC_ENABLED:
+                    if crm is None:
+                        from crm_contact_owner_sync import CrmContactOwnerSync
+                        crm = CrmContactOwnerSync(STATE_STORE, bitrix_call, contacts, BITRIX_CLAIM_MARKER_FIELD)
+                        sys.stderr.write("CRM contact owner sync enabled; polling interval 30s\n")
+                    try:
+                        summary = crm.run()
+                        if summary and (summary.get("queued") or summary.get("errors")):
+                            sys.stderr.write("CRM contact sync: " + " ".join(
+                                f"{key}={summary[key]}" for key in ("observed", "processed", "queued", "errors")
+                            ) + "\n")
+                    except Exception as exc:
+                        # A scanner outage must not block the durable contact lane.
+                        sys.stderr.write(f"CRM contact scan failed: {type(exc).__name__}\n")
+                for _ in range(10):
+                    if not contacts.process():
+                        break
         except Exception as exc:
             sys.stderr.write(f"Responsibility sync failed: {type(exc).__name__}\n")
         time.sleep(30)
