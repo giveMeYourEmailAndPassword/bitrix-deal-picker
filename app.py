@@ -12,6 +12,7 @@ import re
 import secrets
 import sys
 import threading
+import queue
 import time
 import urllib.parse
 import urllib.error
@@ -22,6 +23,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import baza_bridge
+from claim_read_transport import claim_read_scope, open_bitrix_response
 from contact_owner_sync import ContactOwnerSync, entity_id as contact_entity_id
 from native_acceptance_sync import native_deal_unresolved
 from claim_chat_guard import (
@@ -156,6 +158,7 @@ MANAGERS_FILE = APP_DIR / "managers.json"
 CLAIM_LOCKS = ClaimLocks()
 GREETING_LOCK = threading.Lock()
 GREETING_WAKE_EVENT = threading.Event()
+BAZA_CONTACT_HINTS = queue.Queue(maxsize=32)
 LOST_DEAL_AUTOCLOSE_WAKE_EVENT = threading.Event()
 DEAL_ANALYSIS_CACHE_LOCK = threading.Lock()
 DEAL_HEADERS_CACHE_LOCK = threading.Lock()
@@ -1799,12 +1802,12 @@ def bitrix_call(method, params=None, timeout=None):
 
 def bitrix_call_full(method, params=None, timeout=None):
     base = load_env()
-    url = base + method + ".json"
     data = None
     if params:
         data = urllib.parse.urlencode(params, doseq=True).encode("utf-8")
     try:
-        with urllib.request.urlopen(url, data=data, timeout=timeout or BITRIX_TIMEOUT_SECONDS) as response:
+        with open_bitrix_response(base, method, data=data, timeout=timeout or BITRIX_TIMEOUT_SECONDS,
+                                  max_bytes=MAX_BITRIX_RESPONSE_BYTES) as response:
             payload = read_limited_bitrix_json(response)
             response_status = getattr(response, "status", None)
     except urllib.error.HTTPError as exc:
@@ -4699,7 +4702,7 @@ def already_claimed_response():
     }
 
 
-def preview_claim(deal_id, manager_id, auth=None, selection_token=None, *, send_greeting=True):
+def preview_claim(deal_id, manager_id, auth=None, selection_token=None, *, send_greeting=True, baza_claim=False):
     deal_id = normalize_entity_id(deal_id)
     manager_id = normalize_entity_id(manager_id)
     if not deal_id or not manager_id:
@@ -4735,6 +4738,7 @@ def preview_claim(deal_id, manager_id, auth=None, selection_token=None, *, send_
             "_httpStatus": 503,
         }
     success_result = None
+    confirmed_crm = ({}, "")
     suppress_replay_greeting = False
     claim_access = None
     with hold_claim_operation(
@@ -4803,6 +4807,7 @@ def preview_claim(deal_id, manager_id, auth=None, selection_token=None, *, send_
                         "message": "Сделка изменилась после прошлого взятия. Получите её заново.",
                         "_httpStatus": 409,
                     }
+                confirmed_crm = (replay_deal, expected_replay_marker)
                 success_result = dict(existing_operation.get("result") or {})
                 success_result.update({"ok": True, "idempotentReplay": True})
 
@@ -4910,6 +4915,7 @@ def preview_claim(deal_id, manager_id, auth=None, selection_token=None, *, send_
                     existing_attempt_timestamp
                     or claim_operation_attempt_timestamp(existing_operation)
                 )
+                confirmed_crm = (deal, expected_existing_marker)
                 recovery_request = dict(existing_operation.get("request") or {})
                 if not send_greeting:
                     recovery_request.pop("greetingRequested", None)
@@ -5261,6 +5267,7 @@ def preview_claim(deal_id, manager_id, auth=None, selection_token=None, *, send_
                             "message": "Сделка изменилась во время обработки. Получите её заново.",
                             "_httpStatus": 409,
                         }
+                    confirmed_crm = (replay_deal, expected_race_marker)
                     success_result = dict(operation.get("result") or {})
                     success_result.update({"ok": True, "idempotentReplay": True})
                 else:
@@ -5367,6 +5374,7 @@ def preview_claim(deal_id, manager_id, auth=None, selection_token=None, *, send_
                     "_httpStatus": 503,
                 }
 
+            confirmed_crm = (verified_deal, attempt_marker)
             claimed = (
                 str(verified_deal.get("STAGE_ID") or "") == TARGET_STAGE
                 and str(verified_deal.get("ASSIGNED_BY_ID") or "") == manager_id
@@ -5434,6 +5442,26 @@ def preview_claim(deal_id, manager_id, auth=None, selection_token=None, *, send_
                     "Сделка взята, но журнал временно не записался. Сообщите администратору."
                 )
 
+        if baza_claim and not DRY_RUN:
+            current, marker = confirmed_crm
+            if (not marker or str(current.get("ID") or "") != deal_id
+                    or str(current.get("ASSIGNED_BY_ID") or "") != manager_id
+                    or str(current.get("STAGE_ID") or "") != TARGET_STAGE
+                    or str(current.get(BITRIX_CLAIM_MARKER_FIELD) or "") != marker):
+                return {"ok": False, "selectionStale": True, "code": "claim_current_state_changed",
+                        "message": "Текущее назначение или стадия сделки изменились. Обновите список.",
+                        "_httpStatus": 409}
+            try:
+                event_time = STATE_STORE.confirmed_claim_time(operation_key, deal_id, manager_id)
+            except Exception:
+                event_time = None
+            if not event_time:
+                return {"ok": False, "recoveryPending": True, "code": "claim_audit_pending",
+                        "operationKey": operation_key, "claimedAt": success_result.get("claimedAt"),
+                        "auditRecorded": False, "message": "Битрикс подтвердил назначение. База сверяет журнал.",
+                        "_httpStatus": 503}
+            success_result.update(auditRecorded=True, claimedAt=event_time)
+
     # Old succeeded journal rows predate the additive response identity. Resolve
     # their original event time; reopening/replaying a claim must not repin a chat.
     success_result.setdefault("operationKey", operation_key)
@@ -5445,10 +5473,16 @@ def preview_claim(deal_id, manager_id, auth=None, selection_token=None, *, send_
         try:
             contact_sync = ContactOwnerSync(STATE_STORE, bitrix_call, BITRIX_CLAIM_MARKER_FIELD,
                                            locks=CLAIM_LOCKS, enforce_active_policy=CRM_CONTACT_OWNER_SYNC_ENABLED)
-            contact_sync.process(operation_key)
+            if not baza_claim:
+                contact_sync.process(operation_key)
             contact_status = contact_sync.status(operation_key)
             if contact_status:
                 success_result["contactAssignment"] = contact_status
+                if baza_claim and contact_status["status"] == "pending" and not success_result.get("idempotentReplay"):
+                    try:
+                        BAZA_CONTACT_HINTS.put_nowait(operation_key)
+                    except queue.Full:
+                        pass  # The committed job remains eligible for normal polling.
                 if contact_status["status"] != "ready":
                     success_result.setdefault("warnings", []).append(
                         "Сделка взята. Проверьте ответственного контакта: автоматическое назначение остановлено из-за изменения данных."
@@ -5639,6 +5673,28 @@ def claim_reconciliation_loop():
         time.sleep(CLAIM_RECONCILE_INTERVAL_SECONDS)
 
 
+def wait_for_baza_contacts(contacts, poll_seconds=30):
+    """Use the existing responsibility worker between its ordinary polling cycles."""
+    deadline = time.monotonic() + poll_seconds
+    for _ in range(10):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        try:
+            operation_key = BAZA_CONTACT_HINTS.get(timeout=remaining)
+        except queue.Empty:
+            return
+        try:
+            if not DRY_RUN and readiness_state().get("ok"):
+                contacts.process(operation_key)
+        except Exception as exc:
+            sys.stderr.write(f"Baza contact wake failed: {type(exc).__name__}\n")
+        finally:
+            BAZA_CONTACT_HINTS.task_done()
+    # Preserve normal scanner cadence even in a sustained burst of requests.
+    time.sleep(max(0, deadline - time.monotonic()))
+
+
 def responsibility_sync_loop():
     contacts = ContactOwnerSync(STATE_STORE, bitrix_call, BITRIX_CLAIM_MARKER_FIELD,
                                 locks=CLAIM_LOCKS, enforce_active_policy=CRM_CONTACT_OWNER_SYNC_ENABLED)
@@ -5674,7 +5730,7 @@ def responsibility_sync_loop():
                         break
         except Exception as exc:
             sys.stderr.write(f"Responsibility sync failed: {type(exc).__name__}\n")
-        time.sleep(30)
+        wait_for_baza_contacts(contacts)
 
 
 def openline_deal_routing_loop():
@@ -6400,7 +6456,8 @@ def baza_picker_action(action, payload):
         if action == "next":
             result = get_next_deal_for_manager(manager_id, command["continuationToken"])
         else:
-            result = preview_claim(command["dealId"], manager_id, selection_token=command["selectionToken"])
+            with claim_read_scope():
+                result = preview_claim(command["dealId"], manager_id, selection_token=command["selectionToken"], baza_claim=True)
     elif action == "reject":
         result = record_rejection(manager_id, {key: command[key] for key in ("dealId", "selectionToken", "reason")})
         return result, 200 if result.get("ok") else 400

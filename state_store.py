@@ -3732,6 +3732,17 @@ class StateStore:
         if self._filter_unresolved_claim_rows(rows, limit=1):
             raise IdempotencyConflictError("another deal lifecycle requires reconciliation")
 
+    def confirmed_claim_time(self, operation_key, deal_id, manager_id):
+        """Return the canonical audit time, including legacy events linked by id."""
+        self._ensure_ready()
+        with self._connect() as db:
+            row = db.execute("""SELECT e.timestamp FROM claim_operations o JOIN claim_events e
+                ON e.id=o.claim_event_id AND e.deal_id=o.deal_id AND e.manager_id=o.manager_id
+                AND (e.operation_key IS NULL OR e.operation_key=o.operation_key)
+                WHERE o.operation_key=? AND o.deal_id=? AND o.manager_id=? AND o.status='succeeded'""",
+                (operation_key, deal_id, manager_id)).fetchone()
+        return row["timestamp"] if row else None
+
     def get_claim_by_operation_key(self, operation_key: Any) -> Optional[Dict[str, Any]]:
         self._ensure_ready()
         with self._connect() as connection:
