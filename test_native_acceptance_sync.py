@@ -106,10 +106,21 @@ class NativeAcceptanceTest(unittest.TestCase):
         self.session.update(changes)
         self.service.observe(copy.deepcopy(self.session))
 
-    def canonical(self, *, pending=False):
+    def canonical(self, *, pending=False, at=None):
+        recorded = iso(self.now if at is None else at)
         with self.store._transaction(immediate=True) as db:
             db.execute("INSERT INTO claim_operations(operation_key,deal_id,manager_id,status,request_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
-                       ("canonical-1", "101", "44", "pending" if pending else "succeeded", '{}', iso(self.now), iso(self.now)))
+                       ("canonical-1", "101", "44", "pending" if pending else "succeeded", '{}', recorded, recorded))
+
+    def historical_legacy_claim(self):
+        self.store.append_claim({"timestamp": iso(self.origin - 3600), "dealId": "101", "managerId": "8"})
+
+    def assert_picker_owner_protected(self, *, dispatched):
+        job, = self.jobs()
+        self.assertEqual(job["status"], "conflict")
+        self.assertEqual(job["error_code"], "native_picker_owner_protected")
+        self.assertEqual(job["dispatched"], dispatched)
+        self.assertEqual(self.contacts.confirmations, [])
 
     def test_new_paused_acceptance_updates_only_owner_and_confirms_contact_once(self):
         self.observe()
@@ -194,6 +205,84 @@ class NativeAcceptanceTest(unittest.TestCase):
         self.service.process()
         self.assertEqual(self.jobs()[0]["error_code"], "native_acceptance_superseded")
         self.assertEqual(self.writes, [])
+
+    def test_old_successful_picker_claim_protects_a_third_live_owner(self):
+        # Picker originally assigned 44. The current CRM owner is 8; Open Lines reports 7.
+        self.canonical(at=self.origin - 3600)
+        self.observe()
+        self.service.process()
+        self.assert_picker_owner_protected(dispatched=0)
+        self.assertEqual(self.deal["ASSIGNED_BY_ID"], "8")
+        self.assertEqual(self.writes, [])
+        self.assertEqual(self.contacts.reservations, [])
+
+    def test_legacy_picker_event_without_operation_key_protects_current_owner(self):
+        self.historical_legacy_claim()
+        with self.store._connect() as db:
+            self.assertIsNone(db.execute("SELECT operation_key FROM claim_events").fetchone()[0])
+        self.observe()
+        self.service.process()
+        self.assert_picker_owner_protected(dispatched=0)
+        self.assertEqual(self.writes, [])
+        self.assertEqual(self.contacts.reservations, [])
+
+    def test_native_acceptance_confirms_an_already_matching_picker_deal_owner(self):
+        self.historical_legacy_claim()
+        self.deal["ASSIGNED_BY_ID"] = "7"
+        self.observe()
+        self.service.process()
+        self.assertEqual(self.jobs()[0]["status"], "ready")
+        self.assertEqual(self.writes, [])
+        self.assertEqual(self.contacts.confirmations, [1])
+
+    def test_picker_event_after_contact_reservation_releases_it_without_dispatch(self):
+        reserve = self.contacts.reserve_native
+
+        def reserve_then_record(*args, **kwargs):
+            generation = reserve(*args, **kwargs)
+            self.historical_legacy_claim()
+            return generation
+
+        self.contacts.reserve_native = reserve_then_record
+        self.observe()
+        self.service.process()
+        self.assert_picker_owner_protected(dispatched=0)
+        self.assertEqual(self.writes, [])
+        self.assertEqual(self.contacts.cancellations, [1])
+
+    def test_picker_event_at_dispatch_releases_reservation_and_sends_nothing(self):
+        mark_dispatched = self.service.mark_dispatched
+
+        def record_then_dispatch(job):
+            self.assertEqual(job["contact_generation"], 1)
+            self.historical_legacy_claim()
+            return mark_dispatched(job)
+
+        self.service.mark_dispatched = record_then_dispatch
+        self.observe()
+        self.service.process()
+        self.assert_picker_owner_protected(dispatched=0)
+        self.assertEqual(self.writes, [])
+        self.assertEqual(self.contacts.cancellations, [1])
+
+    def test_restart_reconciles_an_already_sent_native_write_without_confirming_contact(self):
+        def timeout():
+            raise TimeoutError("synthetic unknown outcome")
+
+        self.update = timeout
+        self.observe()
+        self.service.process()
+        self.assertEqual(len(self.writes), 1)
+        self.assertEqual(self.jobs()[0]["error_code"], "native_deal_update_uncertain")
+        self.historical_legacy_claim()
+        self.deal["ASSIGNED_BY_ID"] = "7"
+        self.now += 100
+        self.service = self.make_service()
+        self.service.process()
+        self.assert_picker_owner_protected(dispatched=1)
+        self.assertEqual(len(self.writes), 1)
+        self.assertEqual(self.contacts.conflicts, [1])
+        self.assertFalse(native_deal_unresolved(self.store, "101"))
 
     def test_unresolved_canonical_attempt_blocks_native_even_when_observed_first(self):
         self.canonical(pending=True)

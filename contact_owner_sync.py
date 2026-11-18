@@ -212,11 +212,25 @@ class ContactOwnerSync:
             if newer:
                 return "superseded" if newer["confirmed"] else "waiting"
             if dispatch:
+                if not self.native_contact_dispatch_allowed(db, job):
+                    return "native_picker_owner_protected"
                 if not entity_id(dispatch_owner, allow_zero=True):
                     raise ValueError("missing_dispatch_owner")
                 db.execute("UPDATE contact_owner_jobs SET dispatched=1,dispatch_owner=?,updated_at=? WHERE generation=?",
                            (dispatch_owner, now, job["generation"]))
             return "current"
+
+    def native_contact_dispatch_allowed(self, db, job):
+        # Older versions may have confirmed the contact after a native takeover.
+        # Only an acceptance by the existing deal owner can start this write.
+        if not job["operation_key"].startswith("native:") or not self.store._deal_was_claimed(db, job["deal_id"], ""):
+            return True
+        if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='native_acceptance_jobs'").fetchone():
+            return False
+        return bool(db.execute("""SELECT 1 FROM native_acceptance_jobs
+            WHERE operation_key=? AND deal_id=? AND contact_id=? AND contact_generation=?
+            AND manager_id=? AND previous_owner=manager_id""",
+            (job["operation_key"], job["deal_id"], job["contact_id"], job["generation"], job["manager_id"])).fetchone())
 
     def expected_owner(self, job, owner):
         if owner == job["previous_owner"]:
@@ -236,6 +250,8 @@ class ContactOwnerSync:
             return True
         if current == "waiting":
             self.finish(job, "pending", "newer_contact_claim_pending")
+        elif current == "native_picker_owner_protected":
+            self.finish(job, "conflict", current)
         elif current != "lost":
             self.finish(job, "conflict", "newer_contact_claim")
         return False
