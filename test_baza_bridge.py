@@ -194,7 +194,7 @@ class TestBazaBridgeAuthentication(TemporaryStateTestCase):
         with patch.object(app, "preview_claim", return_value={"ok": True}) as claim:
             handler.do_POST()
         self.assertEqual(HandlerHarness.status(handler), 200)
-        claim.assert_called_once_with("100", "42", selection_token="selection")
+        claim.assert_called_once_with("100", "42", selection_token="selection", baza_claim=True)
 
     def test_greeting_status_requires_same_manager_and_succeeded_operation(self):
         self.store.begin_claim_operation("100", "99", operation_key="foreign")
@@ -516,8 +516,10 @@ class TestBazaBridgeClaimSemantics(ClaimWorkflowTestCase):
             patch.object(app, "bitrix_call", side_effect=side_effect),
             patch.object(self.store, "finalize_claim_operation", side_effect=RuntimeError("disk failure")),
         ):
-            result, _ = app.baza_picker_action("claim", payload)
-        self.assertTrue(result["ok"])
+            result, status = app.baza_picker_action("claim", payload)
+        self.assertEqual(status, 503)
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["recoveryPending"])
         self.assertFalse(result["auditRecorded"])
         # Simulate older imported allocation evidence on a deal that had already
         # been reclaimed under the previous policy before this release.
