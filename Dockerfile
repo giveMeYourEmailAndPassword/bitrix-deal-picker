@@ -20,11 +20,11 @@ WORKDIR /app
 
 # Runtime code only. Tests, secrets and local state are excluded by
 # .dockerignore; state.sqlite3 and legacy JSON belong on the Volume.
-COPY --chown=root:root app.py state_store.py baza_bridge.py claim_chat_guard.py search_runtime.py claim_locks.py claim_read_transport.py contact_owner_sync.py native_acceptance_sync.py contact_owner_policy.py crm_contact_owner_sync.py openline_deal_router.py lost_session_restart.py returning_deal_policy.py ./
+COPY --chown=root:root app.py state_store.py baza_bridge.py claim_chat_guard.py greeting_dialog_guard.py greeting_actor_pin.py search_runtime.py claim_locks.py claim_read_transport.py contact_owner_sync.py native_acceptance_sync.py contact_owner_policy.py crm_contact_owner_sync.py openline_deal_router.py lost_session_restart.py returning_deal_policy.py ./
 COPY --chown=root:root managers.json ./seed-managers.json
 COPY --chown=root:root entrypoint.sh /usr/local/bin/bitrix-entrypoint
 
-RUN chmod 0444 /app/app.py /app/state_store.py /app/baza_bridge.py /app/claim_chat_guard.py /app/search_runtime.py /app/claim_locks.py /app/claim_read_transport.py /app/contact_owner_sync.py /app/native_acceptance_sync.py /app/contact_owner_policy.py /app/crm_contact_owner_sync.py /app/openline_deal_router.py /app/lost_session_restart.py /app/returning_deal_policy.py /app/seed-managers.json \
+RUN chmod 0444 /app/app.py /app/state_store.py /app/baza_bridge.py /app/claim_chat_guard.py /app/greeting_dialog_guard.py /app/greeting_actor_pin.py /app/search_runtime.py /app/claim_locks.py /app/claim_read_transport.py /app/contact_owner_sync.py /app/native_acceptance_sync.py /app/contact_owner_policy.py /app/crm_contact_owner_sync.py /app/openline_deal_router.py /app/lost_session_restart.py /app/returning_deal_policy.py /app/seed-managers.json \
     && chmod 0555 /usr/local/bin/bitrix-entrypoint \
     && install -d -o bitrix -g bitrix -m 0750 /data
 

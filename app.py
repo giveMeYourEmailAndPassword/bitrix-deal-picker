@@ -23,9 +23,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import baza_bridge
+from greeting_actor_pin import ensure_unmapped_actor_pin
+from greeting_dialog_guard import require_quiet_claim_dialog
 from claim_read_transport import claim_read_scope, open_bitrix_response
 from contact_owner_sync import ContactOwnerSync, entity_id as contact_entity_id
-from native_acceptance_sync import native_deal_unresolved
+from native_acceptance_sync import native_deal_unresolved, supported as supported_native_connector
 from claim_chat_guard import (
     ClaimChatGuardUnavailable, claim_chat_guard_diagnostic, read_claim_chat_ownership,
 )
@@ -225,6 +227,8 @@ GREETING_WORKER_POLL_SECONDS = env_float(
 # Baza accepts/pins the claimed dialog asynchronously after the picker replies.
 # Only pre-send readiness may wait; never turn this into an outbound retry.
 GREETING_ACTIVATION_MAX_ATTEMPTS = 12
+GREETING_PIN_WAIT_MAX_ATTEMPTS = 60
+GREETING_PIN_WAIT_SECONDS = 600
 GREETING_DELIVERY_WINDOW_SECONDS = 120
 GREETING_ACTOR_THREAD_LIMIT = env_int("GREETING_ACTOR_THREAD_LIMIT", 8, 1, 32)
 GREETING_ACTOR_THREAD_SLOTS = threading.BoundedSemaphore(
@@ -3032,7 +3036,13 @@ def get_openline_chat_context(session_id):
         "messageType": chat.get("messageType"),
         "entityType": chat.get("entityType"),
         "entityData2": chat.get("entityData2") or "",
+        **({"otherConnector": True} if unrelated_greeting_connector(str(chat.get("entityId") or "").split("|")[0]) else {}),
     }
+
+
+def unrelated_greeting_connector(source):
+    return (isinstance(source, str) and re.fullmatch(r"[a-z][a-z0-9_-]{1,199}", source) is not None
+            and source != "thoth_waba" and not supported_native_connector(source))
 
 
 def openline_chat_is_bound_to_deal(entity_data, deal_id):
@@ -3062,7 +3072,7 @@ def openline_chat_has_foreign_deal(entity_data, deal_id):
     return False
 
 
-def resolve_greeting_target(deal_id, manager_id, context):
+def resolve_greeting_target(deal_id, manager_id, context, *, add_participant=True):
     session_ids = list(
         dict.fromkeys(
             normalize_entity_id(item)
@@ -3109,6 +3119,19 @@ def resolve_greeting_target(deal_id, manager_id, context):
         raise RuntimeError("chat_not_latest_active_for_deal")
 
     require_available_greeting_chat(deal_id, manager_id)
+    if add_participant:
+        confirm_greeting_participant(deal_id, manager_id, chat_id)
+    target = {"chatId": chat_id, "sessionId": session_id}
+    if not add_participant:
+        sources = {row.get("CONNECTOR_ID") for row in active_chats if isinstance(row, dict)
+                   and normalize_entity_id(row.get("CHAT_ID")) == chat_id}
+        if len(sources) == 1 and unrelated_greeting_connector(next(iter(sources))):
+            target["otherConnector"] = True
+    return target
+
+
+def confirm_greeting_participant(deal_id, manager_id, chat_id):
+    crm_params = {"CRM_ENTITY_TYPE": "deal", "CRM_ENTITY": str(deal_id)}
     added_chat_id = normalize_entity_id(
         bitrix_call(
             "imopenlines.crm.chat.user.add",
@@ -3128,7 +3151,6 @@ def resolve_greeting_target(deal_id, manager_id, context):
         bitrix_call("imopenlines.crm.chat.getLastId", crm_params)
     ) != chat_id:
         raise RuntimeError("latest_chat_changed_before_send")
-    return {"chatId": chat_id, "sessionId": session_id}
 
 
 def get_deal_messages(deal_id):
@@ -4085,8 +4107,16 @@ GREETING_TERMINAL_PREFLIGHT_ERRORS = {
     "manager_not_active",
     "manager_access_revoked",
     "greeting_window_expired",
+    "greeting_staff_message_seen",
+    "greeting_session_already_contacted",
+    "greeting_activity_unclassified",
+    "greeting_dialog_changed",
+    "greeting_manager_unmapped",
+    "greeting_actor_pin_uncertain",
+    "greeting_actor_pin_unavailable",
+    "greeting_pin_receipt_changed",
 }
-GREETING_RETRYABLE_PREFLIGHT_ERRORS = {"chat_activation_pending", "chat_ownership_unavailable"}
+GREETING_RETRYABLE_PREFLIGHT_ERRORS = {"chat_activation_pending", "chat_ownership_unavailable", "greeting_guard_unavailable", "greeting_history_unverified"}
 
 
 def greeting_machine_error(exc, fallback="greeting_preflight_failed"):
@@ -4097,17 +4127,175 @@ def greeting_machine_error(exc, fallback="greeting_preflight_failed"):
     return fallback
 
 
-def require_recent_greeting(job):
-    """A delayed worker must not surprise a client with an old greeting."""
+def claimed_greeting_context(operation):
+    request = operation.get("request") or {}
+    context = request.get("greetingContext") or {}
+    if context.get("deliveryVersion") == 2:
+        return context
+    return {}
+
+
+def greeting_check_limit(code, operation):
+    if code != "chat_activation_pending":
+        return 3
+    if claimed_greeting_context(operation or {}):
+        return GREETING_PIN_WAIT_MAX_ATTEMPTS
+    return GREETING_ACTIVATION_MAX_ATTEMPTS
+
+
+def require_recent_greeting(job, operation=None):
+    context = claimed_greeting_context(operation or {})
+    times = [job.get("createdAt")]
+    if context:
+        times.append((operation.get("request") or {}).get("attemptStartedAt"))
+    extended = bool(context and job.get("errorCode") == "chat_activation_pending")
+    limit = GREETING_PIN_WAIT_SECONDS if extended else GREETING_DELIVERY_WINDOW_SECONDS
     try:
-        created = datetime.fromisoformat(str(job.get("createdAt") or "").replace("Z", "+00:00"))
-        if created.tzinfo is None:
-            raise ValueError("missing timezone")
-        age = (datetime.now(timezone.utc) - created.astimezone(timezone.utc)).total_seconds()
-        if age < 0 or age >= GREETING_DELIVERY_WINDOW_SECONDS:
-            raise ValueError("outside greeting window")
+        oldest = 0
+        now = datetime.now(timezone.utc)
+        for value in times:
+            created = datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
+            if created.tzinfo is None:
+                raise ValueError("missing timezone")
+            age = (now - created).total_seconds()
+            if age < 0 or age >= limit:
+                raise ValueError("outside greeting window")
+            oldest = max(oldest, age)
+        return oldest
     except (TypeError, ValueError, OverflowError) as exc:
         raise RuntimeError("greeting_window_expired") from exc
+
+
+def require_greeting_deal(job, operation, deal):
+    request = operation.get("request") or {}
+    marker = request.get("claimMarker")
+    if (not marker or str(deal.get("ASSIGNED_BY_ID") or "") != str(job["managerId"])
+            or str(deal.get(BITRIX_CLAIM_MARKER_FIELD) or "") != marker):
+        raise RuntimeError("claim_marker_mismatch")
+    context = claimed_greeting_context(operation)
+    stage = deal.get("STAGE_ID")
+    if context and (normalize_entity_id(deal.get("ID")) != str(job["dealId"])
+                    or deal.get("CLOSED") == "Y" or deal.get("STAGE_SEMANTIC_ID") in ("S", "F")):
+        raise RuntimeError("claim_marker_mismatch")
+    if stage == TARGET_STAGE:
+        return False
+    if (context.get("categoryId") == "0" and normalize_deal_category_id(deal.get("CATEGORY_ID")) == "0"
+            and stage == "EXECUTING" and deal.get("CLOSED") == "N" and deal.get("STAGE_SEMANTIC_ID") == "P"):
+        return True
+    raise RuntimeError("claim_marker_mismatch")
+
+
+def greeting_pin_receipt(job, chat_id):
+    response = baza_post("/integrations/deal-picker/v1/claim-dialog-readiness", {
+        "operationKey": job["operationKey"], "bitrixDealId": job["dealId"],
+        "bitrixUserId": job["managerId"], "chatId": chat_id, "sessionId": job["sessionId"],
+    }, timeout=5)
+    if type(response.get("schemaVersion")) is not int or response["schemaVersion"] != 1:
+        raise RuntimeError("greeting_guard_unavailable")
+    status = response.get("status")
+    if status not in ("ready", "pending", "unknown", "alreadyReplied", "unmapped"):
+        raise RuntimeError("greeting_guard_unavailable")
+    return status
+
+
+def check_claim_greeting_before_send(job, operation, target, *, actor_auth=None, worker_token=None, legacy_join=False):
+    context = claimed_greeting_context(operation)
+    if not context:
+        return
+    age = require_recent_greeting(job, operation)
+    deal = bitrix_call("crm.deal.get", {"id": job["dealId"]}) or {}
+    advanced = require_greeting_deal(job, operation, deal)
+    # Installations without Baza keep their original timely NEW-stage path.
+    # A rolling deployment may briefly have the previous API (HTTP 404).
+    if not claim_event_delivery_enabled() or not baza_integration_configured():
+        if advanced or age >= GREETING_DELIVERY_WINDOW_SECONDS:
+            raise RuntimeError("greeting_guard_unavailable")
+        return
+    chat_id = normalize_entity_id(target.get("chatId"))
+    if not chat_id or str(target.get("sessionId")) != str(job["sessionId"]):
+        raise RuntimeError("greeting_dialog_changed")
+    def verify_original_window():
+        current = bitrix_call("crm.deal.get", {"id": job["dealId"]}) or {}
+        if require_greeting_deal(job, operation, current) or require_recent_greeting(job, operation) >= GREETING_DELIVERY_WINDOW_SECONDS:
+            raise RuntimeError("greeting_guard_unavailable")
+
+    receipt = None
+    if target.get("otherConnector") is not True:
+        try:
+            receipt = greeting_pin_receipt(job, chat_id)
+            # The signed export can arrive just after a native click. Give its
+            # verified, in-memory personal sender a bounded chance to observe
+            # that event before handing the pending job to the service worker.
+            if (receipt == "unknown" and actor_auth and context.get("entrypoint") == "bitrix"
+                    and cached_verified_actor_auth(actor_auth, job["managerId"])):
+                deadline = time.monotonic() + 15
+                for delay in (2, 4, 6):
+                    if time.monotonic() + delay + 5 > deadline:
+                        break
+                    time.sleep(delay)
+                    require_recent_greeting(job, operation)
+                    receipt = greeting_pin_receipt(job, chat_id)
+                    if receipt != "unknown":
+                        break
+        except BazaIntegrationHttpError as exc:
+            if exc.status != 404:
+                raise RuntimeError("greeting_guard_unavailable") from exc
+    if receipt is None:
+        if advanced or age >= GREETING_DELIVERY_WINDOW_SECONDS:
+            raise RuntimeError("greeting_guard_unavailable")
+        verify_original_window()
+        if legacy_join:
+            confirm_greeting_participant(job["dealId"], job["managerId"], chat_id)
+            verify_original_window()
+        return
+    if receipt == "alreadyReplied":
+        raise RuntimeError("greeting_staff_message_seen")
+    if receipt == "pending":
+        raise RuntimeError("chat_activation_pending")
+    if receipt == "unknown":
+        raise RuntimeError("greeting_guard_unavailable")
+    if receipt == "unmapped" and (not actor_auth or context.get("entrypoint") != "bitrix"):
+        raise RuntimeError("greeting_manager_unmapped")
+    # Delayed and advanced-stage greetings previously stopped here. Check
+    # Bitrix's message interval as well as Baza's staff-reply record before
+    # allowing them, and require the same proof for a personal-token pin.
+    def verify_quiet_session():
+        require_quiet_claim_dialog(bitrix_call, deal_id=job["dealId"], manager_id=job["managerId"],
+                                  chat_id=chat_id, session_id=job["sessionId"],
+                                  claimed_at=operation["request"]["attemptStartedAt"])
+
+    def verify_delayed_destination():
+        verify_quiet_session()
+        # The provider and Baza receive outbound events independently. A
+        # human reply may have arrived in Baza during the live Bitrix reads.
+        latest = greeting_pin_receipt(job, chat_id)
+        if latest == "alreadyReplied":
+            raise RuntimeError("greeting_staff_message_seen")
+        if latest == "pending":
+            raise RuntimeError("chat_activation_pending")
+        if latest != "ready":
+            raise RuntimeError("greeting_guard_unavailable")
+
+    quiet_verified = advanced or age >= GREETING_DELIVERY_WINDOW_SECONDS or receipt == "unmapped"
+    if receipt == "unmapped":
+        def revalidate_native_actor():
+            require_recent_greeting(job, operation)
+            require_greeting_deal(job, operation, bitrix_call("crm.deal.get", {"id": job["dealId"]}) or {})
+            verify_quiet_session()
+            return greeting_pin_receipt(job, chat_id)
+        ensure_unmapped_actor_pin(STATE_STORE, job, worker_token, actor_auth, chat_id, receipt=receipt,
+                                  verify_actor=cached_verified_actor_auth, revalidate=revalidate_native_actor,
+                                  actor_call=bitrix_call_for_actor)
+    elif quiet_verified:
+        verify_delayed_destination()
+    # Pin and history proofs involve remote reads. Recheck the live CRM
+    # owner and the original marker just before acquiring the dispatch lease.
+    final_advanced = require_greeting_deal(job, operation, bitrix_call("crm.deal.get", {"id": job["dealId"]}) or {})
+    final_age = require_recent_greeting(job, operation)
+    if not quiet_verified and (final_advanced or final_age >= GREETING_DELIVERY_WINDOW_SECONDS):
+        verify_delayed_destination()
+        require_greeting_deal(job, operation, bitrix_call("crm.deal.get", {"id": job["dealId"]}) or {})
+        require_recent_greeting(job, operation)
 
 
 def append_greeting_delivery_audit(job, manager, *, status, auto_sent, message, error_code=""):
@@ -4157,7 +4345,7 @@ def process_actor_greeting_outbox_job(job, worker_token, auth, manager):
         token, domain = extract_auth_credentials(auth)
         if not token or not domain:
             raise RuntimeError("actor_auth_unavailable")
-        operation = STATE_STORE.get_claim_operation(operation_key)
+        operation = STATE_STORE.get_claim_operation(operation_key, for_greeting=True)
         if not operation or operation.get("status") != "succeeded":
             raise RuntimeError("claim_operation_not_succeeded")
         if (
@@ -4165,18 +4353,9 @@ def process_actor_greeting_outbox_job(job, worker_token, auth, manager):
             or str(operation.get("managerId") or "") != manager_id
         ):
             raise RuntimeError("claim_identity_mismatch")
-        expected_marker = str(
-            ((operation.get("request") or {}).get("claimMarker")) or ""
-        )
+        require_recent_greeting(job, operation)
         live_deal = bitrix_call("crm.deal.get", {"id": deal_id}) or {}
-        if (
-            str(live_deal.get("ASSIGNED_BY_ID") or "") != manager_id
-            or str(live_deal.get("STAGE_ID") or "") != TARGET_STAGE
-            or not expected_marker
-            or str(live_deal.get(BITRIX_CLAIM_MARKER_FIELD) or "")
-            != expected_marker
-        ):
-            raise RuntimeError("claim_marker_mismatch")
+        require_greeting_deal(job, operation, live_deal)
         if (
             not isinstance(manager, dict)
             or str(manager.get("id") or "") != manager_id
@@ -4217,8 +4396,25 @@ def process_actor_greeting_outbox_job(job, worker_token, auth, manager):
         # This is the exact sequence used by the previous working release.
         # Taking operator responsibility is pre-send and therefore retry-safe.
         require_available_greeting_chat(deal_id, manager_id)
-        answer_openline_for_actor(auth, chat_context["chatId"])
+        may_answer = True
+        if claimed_greeting_context(operation):
+            # A native click may accept its current dialog. A later-stage or
+            # delayed greeting can only observe a previously accepted session.
+            current = bitrix_call("crm.deal.get", {"id": deal_id}) or {}
+            advanced = require_greeting_deal(job, operation, current)
+            may_answer = not advanced and require_recent_greeting(job, operation) < GREETING_DELIVERY_WINDOW_SECONDS
+            if may_answer:
+                latest = bitrix_call("imopenlines.session.history.get", {"CHAT_ID": chat_context["chatId"]}) or {}
+                crm = {"CRM_ENTITY_TYPE": "deal", "CRM_ENTITY": deal_id}
+                if (normalize_entity_id(latest.get("sessionId")) != session_id
+                        or normalize_entity_id(latest.get("chatId")) != chat_context["chatId"]
+                        or not openline_chat_is_bound_to_deal(chat_context.get("entityData2"), deal_id)
+                        or normalize_entity_id(bitrix_call("imopenlines.crm.chat.getLastId", crm)) != chat_context["chatId"]):
+                    raise RuntimeError("greeting_dialog_changed")
+        if may_answer:
+            answer_openline_for_actor(auth, chat_context["chatId"])
         require_available_greeting_chat(deal_id, manager_id)
+        check_claim_greeting_before_send(job, operation, chat_context, actor_auth=auth, worker_token=worker_token)
         dispatching = STATE_STORE.mark_greeting_outbox_dispatching(
             operation_key,
             worker_token,
@@ -4368,9 +4564,9 @@ def process_greeting_outbox_job(job, worker_token):
     deal_id = normalize_entity_id(job.get("dealId"))
     manager_id = normalize_entity_id(job.get("managerId"))
     manager = None
+    operation = None
     try:
-        require_recent_greeting(job)
-        operation = STATE_STORE.get_claim_operation(operation_key)
+        operation = STATE_STORE.get_claim_operation(operation_key, for_greeting=True)
         if not operation or operation.get("status") != "succeeded":
             raise RuntimeError("claim_operation_not_succeeded")
         if (
@@ -4378,18 +4574,9 @@ def process_greeting_outbox_job(job, worker_token):
             or str(operation.get("managerId") or "") != manager_id
         ):
             raise RuntimeError("claim_identity_mismatch")
-        expected_marker = str(
-            ((operation.get("request") or {}).get("claimMarker")) or ""
-        )
+        require_recent_greeting(job, operation)
         live_deal = bitrix_call("crm.deal.get", {"id": deal_id}) or {}
-        if (
-            str(live_deal.get("ASSIGNED_BY_ID") or "") != manager_id
-            or str(live_deal.get("STAGE_ID") or "") != TARGET_STAGE
-            or not expected_marker
-            or str(live_deal.get(BITRIX_CLAIM_MARKER_FIELD) or "")
-            != expected_marker
-        ):
-            raise RuntimeError("claim_marker_mismatch")
+        require_greeting_deal(job, operation, live_deal)
         manager = get_greeting_manager_profile(manager_id)
         if (
             not manager
@@ -4427,18 +4614,19 @@ def process_greeting_outbox_job(job, worker_token):
         if not checked.get("transitioned"):
             return checked
         job = checked
-        target = resolve_greeting_target(deal_id, manager_id, context)
+        verify_pin = bool(claimed_greeting_context(operation) and claim_event_delivery_enabled() and baza_integration_configured())
+        if verify_pin:
+            target = resolve_greeting_target(deal_id, manager_id, context, add_participant=False)
+        else:
+            target = resolve_greeting_target(deal_id, manager_id, context)
         # Target discovery/join can take several REST round trips. A manual CRM
         # reassignment during that work must not dispatch as the old manager.
-        latest_deal = bitrix_call("crm.deal.get", {"id": deal_id}) or {}
-        if (
-            str(latest_deal.get("ASSIGNED_BY_ID") or "") != manager_id
-            or str(latest_deal.get("STAGE_ID") or "") != TARGET_STAGE
-            or str(latest_deal.get(BITRIX_CLAIM_MARKER_FIELD) or "") != expected_marker
-        ):
-            raise RuntimeError("claim_marker_mismatch")
-        require_recent_greeting(job)
         require_available_greeting_chat(deal_id, manager_id)
+        if claimed_greeting_context(operation):
+            check_claim_greeting_before_send(job, operation, target, legacy_join=verify_pin)
+        else:
+            require_greeting_deal(job, operation, bitrix_call("crm.deal.get", {"id": deal_id}) or {})
+            require_recent_greeting(job)
     except Exception as exc:
         code = greeting_machine_error(exc)
         try:
@@ -4454,7 +4642,7 @@ def process_greeting_outbox_job(job, worker_token):
                     worker_token,
                     error_code=code,
                     delay_seconds=10 if code == "chat_activation_pending" else 5,
-                    max_attempts=GREETING_ACTIVATION_MAX_ATTEMPTS if code == "chat_activation_pending" else 3,
+                    max_attempts=greeting_check_limit(code, operation),
                 )
         except Exception as state_exc:
             sys.stderr.write(
@@ -4539,7 +4727,7 @@ def process_greeting_outbox_once(worker_token=None, limit=1):
         limit=max(1, int(limit)),
         lease_seconds=max(30, int(BITRIX_TIMEOUT_SECONDS * 8)),
         max_attempts=3,
-        activation_max_attempts=GREETING_ACTIVATION_MAX_ATTEMPTS,
+        activation_max_attempts=GREETING_PIN_WAIT_MAX_ATTEMPTS,
     )
     processed = 0
     for job in jobs:
@@ -4623,6 +4811,15 @@ def public_claim_greeting(job):
             "text": job.get("text") or "",
             "message": "Приветствие автоматически отправлено клиенту.",
         }
+    explanations = {
+        "greeting_session_already_contacted": "По этому диалогу отправка приветствия уже выполнялась. Проверьте переписку.",
+        "greeting_staff_message_seen": "Сотрудник уже ответил туристу в этом диалоге.",
+        "greeting_manager_unmapped": "Назначение сделки сохранено. Для закрепления диалога свяжите профили менеджера в Базе и Битриксе.",
+        "greeting_actor_pin_uncertain": "Битрикс не подтвердил закрепление диалога. Проверьте его у назначенного менеджера.",
+    }
+    if status == "manual" and job.get("errorCode") in explanations:
+        return {"ok": True, "status": "manual", "autoSent": False, "text": "",
+                "message": explanations[job["errorCode"]]}
     if status == "manual" and job.get("errorCode") == "chat_owned_by_another_manager":
         return {
             "ok": True, "status": "manual", "autoSent": False, "text": "",
@@ -5174,6 +5371,9 @@ def preview_claim(deal_id, manager_id, auth=None, selection_token=None, *, send_
             if greeting_snapshot:
                 request_context["greetingRequested"] = True
                 request_context["greetingContext"] = {
+                    "deliveryVersion": 2,
+                    "entrypoint": "baza" if baza_claim else "bitrix",
+                    "categoryId": normalize_deal_category_id(deal.get("CATEGORY_ID")),
                     "sessionId": greeting_snapshot["openlineSessionIds"][0],
                     "direction": (
                         greeting_snapshot.get("classification") or {}
