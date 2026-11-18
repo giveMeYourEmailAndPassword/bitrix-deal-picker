@@ -4223,6 +4223,20 @@ def check_claim_greeting_before_send(job, operation, target, *, actor_auth=None,
     if target.get("otherConnector") is not True:
         try:
             receipt = greeting_pin_receipt(job, chat_id)
+            # The signed export can arrive just after a native click. Give its
+            # verified, in-memory personal sender a bounded chance to observe
+            # that event before handing the pending job to the service worker.
+            if (receipt == "unknown" and actor_auth and context.get("entrypoint") == "bitrix"
+                    and cached_verified_actor_auth(actor_auth, job["managerId"])):
+                deadline = time.monotonic() + 15
+                for delay in (2, 4, 6):
+                    if time.monotonic() + delay + 5 > deadline:
+                        break
+                    time.sleep(delay)
+                    require_recent_greeting(job, operation)
+                    receipt = greeting_pin_receipt(job, chat_id)
+                    if receipt != "unknown":
+                        break
         except BazaIntegrationHttpError as exc:
             if exc.status != 404:
                 raise RuntimeError("greeting_guard_unavailable") from exc

@@ -177,3 +177,32 @@ class TestClaimGreetingReadiness(ClaimWorkflowTestCase):
         internal = self.store.get_claim_operation(self.operation_key(), for_greeting=True)
         self.assertEqual(internal["request"]["greetingContext"]["categoryId"], "0")
         self.assertEqual(internal["request"]["greetingContext"]["deliveryVersion"], 2)
+
+    def test_personal_sender_does_not_accept_a_progressed_chat_to_send_a_late_greeting(self):
+        self.seed()
+        self.deal["STAGE_ID"] = "EXECUTING"
+        self.receipt = "alreadyReplied"
+        leased = self.store.lease_exact_greeting_outbox(self.operation_key(), "personal")
+        with (patch.object(app, "extract_auth_credentials", return_value=("ephemeral", "fake.example")),
+              patch.object(app, "actor_greeting_chat_context", return_value=self.target),
+              patch.object(app, "answer_openline_for_actor") as answer,
+              patch.object(app, "send_chat_message_for_actor") as send):
+            job = app.process_actor_greeting_outbox_job(leased, "personal", {"fake": True}, {
+                "id": self.manager_id, "active": True, "intranet": True,
+            })
+        self.assertEqual(job["errorCode"], "greeting_staff_message_seen")
+        answer.assert_not_called()
+        send.assert_not_called()
+
+    def test_native_sender_observes_a_late_export_before_handing_off_the_personal_token(self):
+        self.seed()
+        internal = self.store.get_claim_operation(self.operation_key(), for_greeting=True)
+        internal["request"]["greetingContext"]["entrypoint"] = "bitrix"
+        job = self.store.get_greeting_outbox(self.operation_key())
+        with (patch.object(app, "greeting_pin_receipt", side_effect=["unknown", "unmapped"]),
+              patch.object(app, "cached_verified_actor_auth", return_value={"access_token": "fake"}),
+              patch.object(app.time, "sleep") as wait,
+              patch.object(app, "ensure_unmapped_actor_pin") as pin):
+            app.check_claim_greeting_before_send(job, internal, self.target, actor_auth={"token": "fake"}, worker_token="personal")
+        wait.assert_called_once_with(2)
+        self.assertEqual(pin.call_args.kwargs["receipt"], "unmapped")
