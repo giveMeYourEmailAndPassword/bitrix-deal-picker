@@ -82,7 +82,7 @@ def _active_chat_ids(value):
     return chat_ids
 
 
-def _validate_deal_binding(value, deal_id):
+def _bound_deal_id(value):
     # ENTITY_DATA_2 consists of typed pairs, e.g. LEAD|0|DEAL|123|CONTACT|45.
     # A contact/lead ID or a substring matching the deal is not its binding.
     if not isinstance(value, str):
@@ -101,11 +101,15 @@ def _validate_deal_binding(value, deal_id):
         ):
             raise ClaimChatGuardUnavailable("invalid_dialog_deal_binding")
         bindings[kind] = str(int(identifier))
-    if bindings.get("DEAL") != deal_id:
+    return bindings.get("DEAL")
+
+
+def _validate_deal_binding(value, deal_id):
+    if _bound_deal_id(value) != deal_id:
         raise ClaimChatGuardUnavailable("dialog_deal_binding_mismatch")
 
 
-def _dialog_owner(dialog, chat_id, deal_id):
+def _require_openline_dialog(dialog, chat_id):
     if not isinstance(dialog, dict):
         raise ClaimChatGuardUnavailable("invalid_dialog")
     if _positive_id(dialog.get("id")) != chat_id:
@@ -115,11 +119,36 @@ def _dialog_owner(dialog, chat_id, deal_id):
         or str(dialog.get("entity_type") or "").strip().upper() != "LINES"
     ):
         raise ClaimChatGuardUnavailable("dialog_not_openline")
-    _validate_deal_binding(dialog.get("entity_data_2"), deal_id)
+
+
+def _current_owner(dialog):
     if _explicit_zero(dialog.get("owner")):
         # This is an incomplete identity, never proof that the chat is free.
         return "0"
     return _positive_id(dialog.get("owner"))
+
+
+def _dialog_owner(dialog, chat_id, deal_id):
+    _require_openline_dialog(dialog, chat_id)
+    _validate_deal_binding(dialog.get("entity_data_2"), deal_id)
+    return _current_owner(dialog)
+
+
+def _client_dialog_owner(dialog, chat_id, deal_id):
+    """Return ``(owner, bound deal)`` for an unfinished dialog of the deal's client.
+
+    Bitrix returns every unfinished dialog of the deal's contact. A duplicate
+    deal created through another line therefore also lists the dialog of its
+    sibling deal. That dialog is judged by its own exact binding and current
+    owner, like any other: it never frees the candidate, and its deterministic
+    foreign binding must not stop the whole queue the way an unreadable dialog
+    does. A dialog without a real deal still has no usable identity.
+    """
+    _require_openline_dialog(dialog, chat_id)
+    bound_deal_id = _bound_deal_id(dialog.get("entity_data_2"))
+    if bound_deal_id in (None, "0"):
+        raise ClaimChatGuardUnavailable("dialog_deal_binding_mismatch")
+    return _current_owner(dialog), bound_deal_id
 
 
 def _owner_is_staff(user, owner_id):
@@ -279,6 +308,11 @@ def read_claim_chat_ownership(deal_id, manager_id, call, timeout=8):
     one deadline; failures or incomplete evidence raise instead of freeing a
     deal. No results are cached, including user identity or an empty queue.
 
+    The listed chats belong to the deal's client and may be bound to another
+    deal of the same contact (a duplicate created through a different line).
+    Such a chat counts exactly like the deal's own: another employee's
+    accepted dialog occupies the candidate, the requesting manager's does not.
+
     Bitrix documents ACTIVE_ONLY=Y as accepted by an operator and unfinished:
     https://apidocs.bitrix24.com/api-reference/imopenlines/openlines/chats/index.html
     """
@@ -328,9 +362,11 @@ def read_claim_chat_ownership(deal_id, manager_id, call, timeout=8):
         )
         for chat_id in _active_chat_ids(chats):
             dialog = bounded_call("imopenlines.dialog.get", {"CHAT_ID": chat_id})
-            owner_id = _dialog_owner(dialog, chat_id, deal_id)
+            # chat_deal_id differs from deal_id only for a sibling deal of the
+            # same client; its session proof uses that dialog's own binding.
+            owner_id, chat_deal_id = _client_dialog_owner(dialog, chat_id, deal_id)
             if owner_id == "0":
-                if _zero_owner_occupied(dialog, chat_id, deal_id, manager_id, bounded_call):
+                if _zero_owner_occupied(dialog, chat_id, chat_deal_id, manager_id, bounded_call):
                     return True
                 continue
             if owner_id == manager_id:
