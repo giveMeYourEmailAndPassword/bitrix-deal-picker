@@ -31,7 +31,7 @@ class TestGuardDiagnosticMetadata(unittest.TestCase):
         call = Mock(side_effect=[
             [{"CHAT_ID": "300"}],
             {"id": 300, "type": "lines", "entity_type": "LINES",
-             "entity_data_2": "DEAL|999", "owner": 400},
+             "entity_data_2": "CONTACT|999", "owner": 400},
         ])
         output = StringIO()
         with patch("claim_chat_guard.time.monotonic", side_effect=[100, 100, 100.1, 100.1, 100.2]):

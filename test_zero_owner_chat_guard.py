@@ -113,7 +113,7 @@ class TestZeroOwnerChatGuard(unittest.TestCase):
                 self.unavailable(first_dialog={**dialog(), "owner": value})
                 self.assertEqual(len(self.calls), 2)
         for field, value in (("id", 0), ("type", "chat"), ("entity_type", "CRM"),
-                             ("entity_data_2", "DEAL|999"), ("entity_id", "malformed"),
+                             ("entity_data_2", "CONTACT|999"), ("entity_id", "malformed"),
                              ("entity_data_1", "Y|DEAL|100|N|N|0")):
             with self.subTest(field=field):
                 self.unavailable(first_dialog={**dialog(), field: value})

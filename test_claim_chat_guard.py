@@ -138,16 +138,20 @@ class TestClaimChatGuard(unittest.TestCase):
                 self.assert_unavailable([{"CHAT_ID": CHAT}], item)
 
     def test_binding_must_be_exact_typed_and_unambiguous(self):
+        # A well-formed binding to another real deal is a sibling deal of the
+        # same client; see test_duplicate_deal_chat_guard for that contract.
         for binding in (
-            None, {}, "", f"CONTACT|{DEAL}", f"DEAL|{DEAL}0",
-            f"DEAL|99|CONTACT|{DEAL}", f"DEAL|{DEAL}|DEAL|99",
+            None, {}, "", f"CONTACT|{DEAL}", "DEAL|0",
+            f"LEAD|0|DEAL|0|CONTACT|{DEAL}", f"DEAL|{DEAL}|DEAL|99",
             f"DEAL|{DEAL}|DEAL|{DEAL}", f"DEAL|{DEAL}|CONTACT",
             f"DEAL|{DEAL}|CONTACT|invalid", f"DEAL|{DEAL}|CONTACT|123|",
         ):
             with self.subTest(binding=binding):
-                self.assert_unavailable(
+                call = self.assert_unavailable(
                     [{"CHAT_ID": CHAT}], {**dialog(), "entity_data_2": binding},
                 )
+                # The dialog itself is rejected; no owner lookup is attempted.
+                self.assertEqual(call.call_count, 2)
 
     def test_missing_or_unknown_owner_identity_fails_closed(self):
         malformed = [None, [], {}, {**user(), "id": 99}]
