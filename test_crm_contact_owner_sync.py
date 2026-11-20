@@ -383,6 +383,33 @@ class CrmContactScannerTests(unittest.TestCase):
         self.scanner.run()
         self.assertEqual(len(self.contacts.jobs), 1)
 
+    def test_fresh_manager_change_is_processed_before_an_older_backlog(self):
+        # 20.11.2026: a manual manager change at 15:18 was still unprocessed
+        # minutes later behind the observations of a morning bulk edit.
+        for did in range(1, 31):
+            self.add(did, cid=1000 + did)
+            self.owners[str(1000 + did)] = "42"
+        self.advance()
+        self.assertEqual(self.scanner.poll()["queued"], 30)
+        self.add("200", modified=15)
+        self.advance()
+        result = self.scanner.run()
+        self.assertEqual(result["queued"], 1)
+        self.assertEqual(next(iter(self.contacts.jobs.values())), ("200", "42", "7", "9", "marker-200"))
+
+    def test_older_backlog_is_still_drained_after_the_fresh_change(self):
+        for did in range(1, 31):
+            self.add(did, cid=1000 + did)
+            self.owners[str(1000 + did)] = "42"
+        self.advance()
+        self.scanner.poll()
+        self.add("200", modified=15)
+        for _ in range(7):
+            self.advance()
+            self.scanner.run()
+        self.assertEqual(self.scanner.status()["pending"], 0)
+        self.assertEqual(len(self.contacts.jobs), 1)
+
     def test_scanner_rpc_refuses_any_crm_mutation(self):
         with self.assertRaisesRegex(ValueError, "write_forbidden"):
             self.scanner.rpc("crm.contact.update", {"id": "7"})
