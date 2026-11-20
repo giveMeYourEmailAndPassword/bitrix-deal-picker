@@ -13,7 +13,7 @@ import threading
 from datetime import datetime, timezone
 
 from contact_owner_sync import entity_id
-from contact_owner_policy import eligible_deal, contact_ids, latest_eligible_deal
+from contact_owner_policy import EXCLUDED_STAGES, eligible_deal, contact_ids, latest_eligible_deal
 
 LOG = logging.getLogger(__name__)
 PAGE_SIZE = 50
@@ -56,6 +56,21 @@ def iso(value):
 
 def digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def settled_by_row(row):
+    """True when the list row itself proves the deal cannot name a contact owner.
+
+    Only explicit, well-formed evidence counts: a closed deal, a finished stage
+    or one of the two intake stages. A missing or unexpected value proves
+    nothing, so that row keeps the full deal read. Skipping the queue here keeps
+    a bulk edit of old deals from delaying a manager change made minutes ago.
+    """
+    stage = row.get("STAGE_ID")
+    return (row.get("CLOSED") == "Y"
+            or row.get("STAGE_SEMANTIC_ID") in ("S", "F")
+            or (isinstance(stage, str) and bool(stage) and stage.strip() == stage
+                and stage.rsplit(":", 1)[-1] in EXCLUDED_STAGES))
 
 
 class CrmContactOwnerSync:
@@ -133,7 +148,7 @@ class CrmContactOwnerSync:
             modified = timestamp(row.get("DATE_MODIFY"))
             if int(did) <= previous or not cursor["from"] <= modified <= cursor["to"]:
                 raise ValueError("crm_modified_filter_unavailable")
-            validated.append((did, self.fingerprint(row), modified))
+            validated.append((did, self.fingerprint(row), modified, settled_by_row(row)))
             previous = int(did)
         queued = 0
         with self.store._transaction(immediate=True) as db:
@@ -141,7 +156,7 @@ class CrmContactOwnerSync:
             # to re-read later, but never replace its newer durable cursor.
             if db.execute("SELECT value FROM crm_contact_owner_meta WHERE key='cursor'").fetchone()[0] != raw:
                 return None
-            for did, fingerprint, modified in validated:
+            for did, fingerprint, modified, settled in validated:
                 old = db.execute("SELECT fingerprint,source_modified FROM crm_contact_owner_observations WHERE deal_id=?", (did,)).fetchone()
                 if old and (old["fingerprint"] == fingerprint or old["source_modified"] > modified):
                     continue
@@ -150,6 +165,12 @@ class CrmContactOwnerSync:
                     fingerprint=excluded.fingerprint,source_modified=excluded.source_modified,
                     revision=revision+1,received_at=excluded.received_at,attempts=0,next_at=0,error_code=''""",
                            (did, fingerprint, modified, self.time()))
+                if settled:
+                    # The newest snapshot supersedes any earlier pending one:
+                    # the full read would reach the same "ineligible" outcome.
+                    db.execute("""UPDATE crm_contact_owner_observations
+                        SET done_revision=revision,error_code='ineligible' WHERE deal_id=?""", (did,))
+                    continue
                 queued += 1
             updated = {**cursor, "after": previous, "complete": len(page) < PAGE_SIZE}
             db.execute("UPDATE crm_contact_owner_meta SET value=? WHERE key='cursor'", (json.dumps(updated),))
