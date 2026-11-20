@@ -218,10 +218,13 @@ class CrmContactOwnerSync:
         return "queued" if queued else "unchanged", queued
 
     def process(self):
+        # Newest observation first: a manager change made a minute ago must not
+        # wait behind hours of older ones. Every observation is derived from
+        # the current CRM state, so the order cannot change any outcome.
         with self.store._connect() as db:
             row = db.execute("""SELECT * FROM crm_contact_owner_observations
                 WHERE revision>done_revision AND next_at<=?
-                ORDER BY next_at,received_at,CAST(deal_id AS INTEGER) LIMIT 1""", (self.time(),)).fetchone()
+                ORDER BY received_at DESC,CAST(deal_id AS INTEGER) DESC LIMIT 1""", (self.time(),)).fetchone()
         if row is None:
             return None
         job = dict(row)
