@@ -11,6 +11,7 @@ import re
 import threading
 from datetime import datetime, timezone
 
+from contact_owner_policy import EXCLUDED_STAGES as INTAKE_STAGES
 from contact_owner_sync import entity_id
 
 SCHEMA = """
@@ -26,6 +27,8 @@ CREATE TABLE IF NOT EXISTS native_acceptance_jobs(
  deal_id TEXT NOT NULL,manager_id TEXT NOT NULL,observed_at REAL NOT NULL,
  claim_fence TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'pending',
  previous_owner TEXT,expected_modified TEXT,expected_marker TEXT,contact_id TEXT,
+ promote_stage INTEGER NOT NULL DEFAULT 0,
+ promotion_from_stage TEXT,promotion_moved_time TEXT,
  contact_generation INTEGER,dispatched INTEGER NOT NULL DEFAULT 0,acknowledged INTEGER NOT NULL DEFAULT 0,
  next_at REAL NOT NULL DEFAULT 0,error_code TEXT NOT NULL DEFAULT '',
  UNIQUE(session_id,revision));
@@ -33,6 +36,7 @@ CREATE INDEX IF NOT EXISTS native_acceptance_due ON native_acceptance_jobs(statu
 """
 ACTIVE = {"new", "answered", "paused"}
 ACCEPTED = {"answered", "paused"}
+WORK_STAGE = "NEW"
 LOG = logging.getLogger(__name__)
 
 
@@ -59,7 +63,7 @@ def iso(value):
 
 
 def supported(value):
-    return isinstance(value, str) and (value == "fbinstagramdirect" or
+    return isinstance(value, str) and (value in {"fbinstagramdirect", "thoth_waba"} or
         re.fullmatch(r"wz_whatsapp_[a-f0-9]{16,64}", value) is not None)
 
 
@@ -82,9 +86,16 @@ class NativeAcceptanceSync:
             for statement in SCHEMA.split(";"):
                 if statement.strip():
                     db.execute(statement)
-            if "acknowledged" not in {row[1] for row in db.execute("PRAGMA table_info(native_acceptance_jobs)")}:
-                db.execute("ALTER TABLE native_acceptance_jobs ADD COLUMN acknowledged INTEGER NOT NULL DEFAULT 0")
+            columns = {row[1] for row in db.execute("PRAGMA table_info(native_acceptance_jobs)")}
+            for column in ("acknowledged", "promote_stage"):
+                if column not in columns:
+                    db.execute(f"ALTER TABLE native_acceptance_jobs ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0")
+            for column in ("promotion_from_stage", "promotion_moved_time"):
+                if column not in columns:
+                    db.execute(f"ALTER TABLE native_acceptance_jobs ADD COLUMN {column} TEXT")
             db.execute("INSERT OR IGNORE INTO native_acceptance_meta VALUES('activated_at',?)",
+                       (str(self.time()),))
+            db.execute("INSERT OR IGNORE INTO native_acceptance_meta VALUES('stage_activated_at',?)",
                        (str(self.time()),))
             db.execute("INSERT OR IGNORE INTO native_acceptance_meta VALUES('cursor',?)",
                        (json.dumps({"lane": 0, "offset": 0, "to": self.time()}),))
@@ -113,6 +124,8 @@ class NativeAcceptanceSync:
     def candidate(self, value):
         if not isinstance(value, dict) or not supported(value.get("source")):
             return None
+        if value["source"] == "thoth_waba" and entity_id(value.get("configId")) != "103":
+            return None
         created = timestamp(value.get("dateCreate"))
         fields = {name: entity_id(value.get(key)) for name, key in (
             ("session_id", "id"), ("chat_id", "chatId"), ("line_id", "configId"))}
@@ -139,17 +152,25 @@ class NativeAcceptanceSync:
             if old and any(old[key] != item[key] for key in ("chat_id", "line_id", "source", "date_create")):
                 raise ValueError("native_session_identity_changed")
             activated = float(db.execute("SELECT value FROM native_acceptance_meta WHERE key='activated_at'").fetchone()[0])
-            eligible = bool(old and old["armed"]) or (not old and timestamp(item["date_create"]) >= activated)
+            stage_activated = float(db.execute("SELECT value FROM native_acceptance_meta WHERE key='stage_activated_at'").fetchone()[0])
+            if item["source"] == "thoth_waba":
+                activated = stage_activated
             accepted = item["status"] in ACCEPTED
             created = timestamp(item["date_create"])
             answered = timestamp(value.get("dateOperatorAnswer"))
+            if answered is not None and not created <= answered <= now:
+                answered = None
+            fresh_answer = accepted and answered is not None and answered >= stage_activated
+            eligible = bool(old and old["armed"]) or (not old and (created >= activated or fresh_answer))
             if old and old["armed"]:
                 event_bound = old["last_seen"]
+                if old["status"] == "new" and fresh_answer and answered >= event_bound:
+                    event_bound = answered
             else:
                 # The first observation can arrive after a newer picker claim.
                 # Use a provider acceptance time (or conservative creation
                 # lower bound), never first-poll time as the event's authority.
-                event_bound = answered if answered is not None and created <= answered <= now else created
+                event_bound = answered if answered is not None else created
             revision = (old["revision"] if old else 0) + (1 if eligible and accepted and item["deal_id"] else 0)
             # A first historical accepted snapshot is a baseline, never a job.
             # Preserve an observed queue transition when CRM binding appears late.
@@ -164,11 +185,15 @@ class NativeAcceptanceSync:
                  event_bound if armed and accepted else now))
             if eligible and accepted and item["deal_id"]:
                 key = f'native:{item["session_id"]}:{revision}'
+                promote = event_bound >= stage_activated or fresh_answer
+                if item["source"] == "fbinstagramdirect" and item["line_id"] in {"7", "11", "13"}:
+                    # Disconnected lines can still contain historical duplicate deals.
+                    promote = False
                 db.execute("""INSERT OR IGNORE INTO native_acceptance_jobs(
                     operation_key,session_id,revision,chat_id,line_id,source,date_create,
-                    deal_id,manager_id,observed_at,claim_fence) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                    deal_id,manager_id,observed_at,claim_fence,promote_stage) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (key, item["session_id"], revision, item["chat_id"], item["line_id"], item["source"],
-                     item["date_create"], item["deal_id"], item["manager_id"], event_bound, fence))
+                     item["date_create"], item["deal_id"], item["manager_id"], event_bound, fence, int(promote)))
 
     @staticmethod
     def page(result):
@@ -312,6 +337,9 @@ class NativeAcceptanceSync:
         if user.get("ACTIVE") not in (True, "Y", "1", 1) or not any(entity_id(v) for v in departments):
             raise Conflict("native_employee_inactive")
         deal = self.rpc("crm.deal.get", {"id": job["deal_id"]}) or {}
+        if (job["promote_stage"] and str(deal.get("CATEGORY_ID")) == "0"
+                and deal.get("STAGE_ID") in INTAKE_STAGES and user.get("USER_TYPE") != "employee"):
+            raise Conflict("native_employee_unconfirmed")
         if (entity_id(deal.get("ID")) != job["deal_id"] or deal.get("CLOSED") != "N"
                 or deal.get("STAGE_SEMANTIC_ID") != "P" or deal.get("IS_ARCHIVED") in (True, "Y", "1", 1)
                 or not entity_id(deal.get("ASSIGNED_BY_ID"), allow_zero=True)
@@ -354,22 +382,31 @@ class NativeAcceptanceSync:
             except Exception:
                 LOG.warning("native acceptance cache refresh unavailable")
 
-    def readback(self, job):
-        # This path deliberately never sends another deal update.
-        deal = self.rpc("crm.deal.get", {"id": job["deal_id"]}) or {}
+    def matches_dispatch(self, job, deal):
         if entity_id(deal.get("ID")) != job["deal_id"]:
             raise ValueError("native_deal_identity_unavailable")
         owner, _modified, marker, contact = self.deal_identity(deal)
         if owner == job["manager_id"]:
             if marker != job["expected_marker"] or contact != job["contact_id"]:
                 raise Conflict("native_deal_binding_changed")
-            self.proof(job)
+            if not job["promotion_from_stage"] or (
+                    str(deal.get("CATEGORY_ID")) == "0" and deal.get("STAGE_ID") == WORK_STAGE):
+                return True
+            if job["acknowledged"]:
+                raise Conflict("native_deal_stage_changed")
+        elif job["acknowledged"]:
+            raise Conflict("native_deal_owner_changed")
+        return False
+
+    def readback(self, job):
+        # Verify the dispatched fields again after the live dialog/binding proof.
+        # This path deliberately never sends another deal update.
+        deal = self.rpc("crm.deal.get", {"id": job["deal_id"]}) or {}
+        if self.matches_dispatch(job, deal) and self.matches_dispatch(job, self.proof(job)):
             # An older version may already have overwritten the deal. Reconcile
             # the sent write without activating its still-reserved contact job.
             self.check_picker_owner(job, job["previous_owner"])
             self.confirmed(job)
-        elif job["acknowledged"]:
-            raise Conflict("native_deal_owner_changed")
         else:
             # A timed-out request may still arrive even if another external
             # owner is now visible. Keep the per-deal fence until reconciled.
@@ -401,10 +438,22 @@ class NativeAcceptanceSync:
                 deal = self.proof(job)
                 owner, modified, marker, contact = self.deal_identity(deal)
                 self.check_picker_owner(job, owner)
-                if timestamp(modified) > job["observed_at"] + 1:
+                stage = deal.get("STAGE_ID")
+                promote = job["promote_stage"] and str(deal.get("CATEGORY_ID")) == "0" and stage in INTAKE_STAGES
+                source_stage = stage if promote else None
+                moved = deal.get("MOVED_TIME") if promote else None
+                moved_at = timestamp(moved)
+                # Bitrix can set the accepting employee as owner itself. A newer
+                # modification then permits a stage-only write if this stage was
+                # already current at acceptance and stays stable until dispatch.
+                changed_at = timestamp(modified)
+                if moved_at is not None:
+                    changed_at = moved_at if owner == job["manager_id"] else max(changed_at, moved_at)
+                if changed_at > job["observed_at"] + 1:
                     raise Conflict("native_deal_changed_after_acceptance")
-                if job["previous_owner"] is not None and (owner, modified, marker, contact) != (
-                        job["previous_owner"], job["expected_modified"], job["expected_marker"], job["contact_id"]):
+                if job["previous_owner"] is not None and (owner, modified, marker, contact, source_stage, moved) != (
+                        job["previous_owner"], job["expected_modified"], job["expected_marker"], job["contact_id"],
+                        job["promotion_from_stage"], job["promotion_moved_time"]):
                     raise Conflict("native_deal_changed_before_dispatch")
                 if job["previous_owner"] is None:
                     generation = None
@@ -421,20 +470,27 @@ class NativeAcceptanceSync:
                                 raise Conflict(str(exc)) from None
                             raise
                     fields = {"previous_owner": owner, "expected_modified": modified, "expected_marker": marker,
-                              "contact_id": contact, "contact_generation": generation}
+                              "contact_id": contact, "contact_generation": generation,
+                              "promotion_from_stage": source_stage, "promotion_moved_time": moved}
                     self.save(job, "pending", **fields)
                     job.update(fields)
                 final = self.proof(job)
-                if self.deal_identity(final) != (owner, modified, marker, contact):
+                if self.deal_identity(final) != (owner, modified, marker, contact) or any(
+                        final.get(field) != deal.get(field) for field in ("CATEGORY_ID", "STAGE_ID", "MOVED_TIME")):
                     raise Conflict("native_deal_changed_before_dispatch")
                 # Persist before transport. A timeout/crash is read-only recovery.
                 if not self.mark_dispatched(job):
                     return False
                 job["dispatched"] = 1
+                changes = {}
                 if owner != job["manager_id"]:
+                    changes["fields[ASSIGNED_BY_ID]"] = job["manager_id"]
+                if promote:
+                    changes["fields[STAGE_ID]"] = WORK_STAGE
+                if changes:
                     rejected = False
                     try:
-                        result = self.rpc("crm.deal.update", {"id": job["deal_id"], "fields[ASSIGNED_BY_ID]": job["manager_id"]})
+                        result = self.rpc("crm.deal.update", {"id": job["deal_id"], **changes})
                         rejected = result is False
                         if result is True:
                             self.save(job, "pending", acknowledged=1)

@@ -48,7 +48,7 @@ class NativeAcceptanceTest(unittest.TestCase):
                      "DATE_MODIFY": iso(self.now - 86400), "STAGE_SEMANTIC_ID": "P", "CLOSED": "N",
                      "STAGE_ID": "NEW", "UF_CRM_CLAIM": ""}
         self.contact = {"ID": "10", "ASSIGNED_BY_ID": "9"}
-        self.user = {"ID": "7", "ACTIVE": True, "UF_DEPARTMENT": [1]}
+        self.user = {"ID": "7", "ACTIVE": True, "UF_DEPARTMENT": [1], "USER_TYPE": "employee"}
         self.calls, self.writes = [], []
         self.before_call = None
         self.update = None
@@ -75,7 +75,7 @@ class NativeAcceptanceTest(unittest.TestCase):
             return {"sessions": rows, "hasNextPage": False}
         if method == "imopenlines.dialog.get":
             return {"id": self.session["chatId"], "owner": self.session["operatorId"],
-                    "entity_type": "LINES", "entity_id": f'{self.source}|33|external',
+                    "entity_type": "LINES", "entity_id": f'{self.source}|{self.session["configId"]}|external',
                     "entity_data_1": f'Y|DEAL|101|N|N|{self.session["id"]}',
                     "entity_data_2": "CONTACT|10|DEAL|101" + self.binding_extra}
         if method == "imopenlines.crm.chat.get":
@@ -93,7 +93,9 @@ class NativeAcceptanceTest(unittest.TestCase):
                 self.assertEqual(db.execute("SELECT dispatched FROM native_acceptance_jobs").fetchone()[0], 1)
             if self.update:
                 return self.update()
-            self.deal["ASSIGNED_BY_ID"] = params["fields[ASSIGNED_BY_ID]"]
+            for field in ("ASSIGNED_BY_ID", "STAGE_ID"):
+                if f"fields[{field}]" in params:
+                    self.deal[field] = params[f"fields[{field}]"]
             self.deal["DATE_MODIFY"] = iso(self.now)
             return True
         self.fail("unexpected endpoint: " + method)
@@ -147,12 +149,211 @@ class NativeAcceptanceTest(unittest.TestCase):
         self.assertEqual(self.jobs(), [])
         self.assertEqual(float(self.service.meta("activated_at")), self.origin)
 
+    def test_accepting_an_unprocessed_deal_assigns_employee_and_sets_work_stage_in_one_update(self):
+        self.deal.update(CATEGORY_ID="0", STAGE_ID="UC_ZJ55BR")
+        self.observe(status="answered", dateOperatorAnswer=iso(self.now))
+        self.service.process()
+        self.assertEqual(self.writes, [
+            {"id": "101", "fields[ASSIGNED_BY_ID]": "7", "fields[STAGE_ID]": "NEW"},
+        ])
+        self.assertEqual(self.jobs()[0]["status"], "ready")
+        self.assertEqual(self.contacts.confirmations, [1])
+
+    def test_accepting_a_waiting_deal_already_assigned_to_employee_sets_work_stage(self):
+        self.deal.update(CATEGORY_ID=0, STAGE_ID="UC_PUCAAQ", ASSIGNED_BY_ID="7")
+        self.observe(status="answered", dateOperatorAnswer=iso(self.now))
+        self.service.process()
+        self.assertEqual(len(self.writes), 1)
+        self.assertEqual(self.writes[0]["fields[STAGE_ID]"], "NEW")
+        self.assertEqual(self.deal["ASSIGNED_BY_ID"], "7")
+        self.assertEqual(self.jobs()[0]["status"], "ready")
+        self.assertEqual(self.contacts.confirmations, [1])
+
+    def test_acceptance_preserves_later_stage_and_foreign_pipeline(self):
+        for category, stage in (("0", "PREPARATION"), ("8", "C8:UC_PUCAAQ"), ("8", "UC_PUCAAQ")):
+            with self.subTest(category=category, stage=stage):
+                self.setUp_case_for_loop()
+                self.deal.update(CATEGORY_ID=category, STAGE_ID=stage, ASSIGNED_BY_ID="8",
+                                 DATE_MODIFY=iso(self.origin))
+                self.writes.clear()
+                self.observe(status="answered", dateOperatorAnswer=iso(self.now))
+                self.service.process()
+                self.assertEqual(self.writes, [{"id": "101", "fields[ASSIGNED_BY_ID]": "7"}])
+                self.assertEqual(self.deal["STAGE_ID"], stage)
+                self.assertEqual(self.jobs()[0]["status"], "ready")
+
+    def test_stage_advance_during_contact_reservation_is_preserved_even_in_same_second(self):
+        self.deal.update(CATEGORY_ID="0", STAGE_ID="UC_PUCAAQ")
+
+        def manual_advance(method, _params):
+            if method == "crm.contact.get":
+                self.deal["STAGE_ID"] = "PREPARATION"
+
+        self.before_call = manual_advance
+        self.observe(status="answered", dateOperatorAnswer=iso(self.now))
+        self.service.process()
+        self.assertEqual(self.writes, [])
+        self.assertEqual(self.deal["STAGE_ID"], "PREPARATION")
+        self.assertEqual(self.jobs()[0]["status"], "conflict")
+        self.assertEqual(self.contacts.confirmations, [])
+
+    def test_stage_update_timeout_with_matching_owner_needs_stage_confirmation_after_restart(self):
+        self.deal.update(CATEGORY_ID="0", STAGE_ID="UC_PUCAAQ", ASSIGNED_BY_ID="7")
+
+        def timeout():
+            raise TimeoutError("synthetic timeout while setting stage")
+
+        self.update = timeout
+        self.observe(status="answered", dateOperatorAnswer=iso(self.now))
+        self.service.process()
+        self.assertEqual(len(self.writes), 1)
+        self.assertEqual(self.writes[0]["fields[STAGE_ID]"], "NEW")
+        self.assertEqual(self.jobs()[0]["status"], "pending")
+        self.assertEqual(self.contacts.confirmations, [])
+
+        self.now += 100
+        self.service = self.make_service()
+        self.service.process()
+        self.assertEqual(len(self.writes), 1)
+        self.assertEqual(self.jobs()[0]["status"], "pending")
+        self.assertEqual(self.contacts.confirmations, [])
+
+        self.deal["STAGE_ID"] = "NEW"
+        self.now += 100
+        self.service.process()
+        self.assertEqual(len(self.writes), 1)
+        self.assertEqual(self.jobs()[0]["status"], "ready")
+        self.assertEqual(self.contacts.confirmations, [1])
+
+    def test_native_owner_already_updated_after_answer_but_intake_stage_predates_answer(self):
+        answered_at = self.origin + 3
+        self.deal.update(CATEGORY_ID="0", STAGE_ID="UC_PUCAAQ", ASSIGNED_BY_ID="7",
+                         DATE_MODIFY=iso(answered_at + 4), MOVED_TIME=iso(answered_at - 10))
+        self.observe(status="answered", dateOperatorAnswer=iso(answered_at))
+        self.service.process()
+        self.assertEqual(len(self.writes), 1)
+        self.assertEqual(self.writes[0]["fields[STAGE_ID]"], "NEW")
+        self.assertEqual(self.jobs()[0]["status"], "ready")
+
+    def test_stage_moved_back_to_queue_after_answer_is_preserved(self):
+        answered_at = self.origin + 3
+        self.deal.update(CATEGORY_ID="0", STAGE_ID="UC_PUCAAQ", ASSIGNED_BY_ID="7",
+                         DATE_MODIFY=iso(answered_at + 4), MOVED_TIME=iso(answered_at + 4))
+        self.observe(status="answered", dateOperatorAnswer=iso(answered_at))
+        self.service.process()
+        self.assertEqual(self.writes, [])
+        self.assertEqual(self.jobs()[0]["status"], "conflict")
+        self.assertEqual(self.contacts.confirmations, [])
+
+    def test_stage_change_before_final_confirmation_never_confirms_or_replays_assignment(self):
+        self.deal.update(CATEGORY_ID="0", STAGE_ID="UC_PUCAAQ")
+        reads_after_write = 0
+
+        def advance_after_initial_readback(method, _params):
+            nonlocal reads_after_write
+            if method == "crm.deal.get" and self.writes:
+                reads_after_write += 1
+                if reads_after_write == 2:
+                    self.deal["STAGE_ID"] = "PREPARATION"
+
+        self.before_call = advance_after_initial_readback
+        self.observe(status="answered", dateOperatorAnswer=iso(self.now))
+        self.service.process()
+        self.assertEqual(len(self.writes), 1)
+        self.assertEqual(self.deal["STAGE_ID"], "PREPARATION")
+        self.assertEqual(self.jobs()[0]["status"], "conflict")
+        self.assertEqual(self.contacts.confirmations, [])
+        self.now += 100
+        self.service.process()
+        self.assertEqual(len(self.writes), 1)
+
     def test_existing_queued_session_can_be_accepted_after_baseline(self):
         self.observe(dateCreate=iso(self.origin - 86400), status="new", operatorId=7)
         self.assertEqual(self.jobs(), [])
         self.observe(status="answered")
         self.service.process()
         self.assertEqual(len(self.writes), 1)
+
+    def test_cloud_whatsapp_and_instagram_promote_once_on_acceptance(self):
+        for line, source in ((103, "thoth_waba"), (45, "fbinstagramdirect")):
+            with self.subTest(line=line):
+                self.source = source
+                self.setUp_case_for_loop()
+                self.writes.clear()
+                self.deal.update(CATEGORY_ID="0", STAGE_ID="UC_PUCAAQ", ASSIGNED_BY_ID="7",
+                                 DATE_MODIFY=iso(self.now), MOVED_TIME=iso(self.origin - 60))
+                self.observe(source=self.source, configId=line, status="new", operatorId=7)
+                self.assertFalse(self.service.process())
+                self.observe(status="answered", dateOperatorAnswer=iso(self.now))
+                self.assertTrue(self.service.process())
+                self.assertEqual(self.jobs()[0]["status"], "ready")
+                self.assertEqual(self.writes, [{"id": "101", "fields[STAGE_ID]": "NEW"}])
+                self.observe(status="paused")
+                self.assertFalse(self.service.process())
+
+    def test_cloud_whatsapp_skips_other_lines_and_preexisting_acceptances(self):
+        self.source = "thoth_waba"
+        with self.store._transaction(immediate=True) as db:
+            db.execute("UPDATE native_acceptance_meta SET value=? WHERE key='activated_at'",
+                       (str(self.origin - 86400),))
+        self.observe(source=self.source, configId=7, status="answered")
+        self.observe(source=self.source, configId=103, status="answered",
+                     dateCreate=iso(self.origin - 60), dateOperatorAnswer=iso(self.origin - 30))
+        self.service = self.make_service()
+        self.observe()
+        self.assertEqual(self.jobs(), [])
+        self.assertFalse(self.service.process())
+
+    def test_cloud_whatsapp_acceptance_after_rollout_of_older_queued_deal(self):
+        self.source = "thoth_waba"
+        self.deal.update(CATEGORY_ID="0", STAGE_ID="UC_PUCAAQ")
+        self.observe(source=self.source, configId=103, status="answered",
+                     dateCreate=iso(self.origin - 60), dateOperatorAnswer=iso(self.now - 1))
+        self.assertTrue(self.service.process())
+        self.assertEqual(self.deal["STAGE_ID"], "NEW")
+
+    def test_intake_stage_can_change_between_queue_observation_and_acceptance(self):
+        self.observe(status="new")
+        self.now += 20
+        self.deal.update(CATEGORY_ID="0", STAGE_ID="UC_PUCAAQ",
+                         MOVED_TIME=iso(self.now), DATE_MODIFY=iso(self.now))
+        self.now += 20
+        self.observe(status="answered", dateOperatorAnswer=iso(self.now))
+        self.assertTrue(self.service.process())
+        self.assertEqual(self.deal["STAGE_ID"], "NEW")
+        self.assertEqual(self.deal["ASSIGNED_BY_ID"], "7")
+
+    def test_intake_promotion_requires_employee_profile(self):
+        self.user["USER_TYPE"] = "bot"
+        self.deal.update(CATEGORY_ID="0", STAGE_ID="UC_PUCAAQ")
+        self.observe(status="answered")
+        self.service.process()
+        self.assertEqual(self.writes, [])
+        self.assertEqual(self.jobs()[0]["error_code"], "native_employee_unconfirmed")
+
+    def test_upgrade_keeps_pending_owner_update_from_the_previous_version(self):
+        self.observe(status="answered")
+        with self.store._transaction(immediate=True) as db:
+            db.execute("DELETE FROM native_acceptance_meta WHERE key='stage_activated_at'")
+            for column in ("promote_stage", "promotion_from_stage", "promotion_moved_time"):
+                db.execute(f"ALTER TABLE native_acceptance_jobs DROP COLUMN {column}")
+        self.deal.update(CATEGORY_ID="0", STAGE_ID="UC_PUCAAQ")
+        self.service = self.make_service()
+        self.assertTrue(self.service.process())
+        self.assertEqual(self.jobs()[0]["status"], "ready")
+        self.assertEqual(self.writes, [{"id": "101", "fields[ASSIGNED_BY_ID]": "7"}])
+
+    def test_stage_activation_keeps_earlier_instagram_acceptance_owner_only(self):
+        self.source = "fbinstagramdirect"
+        with self.store._transaction(immediate=True) as db:
+            db.execute("UPDATE native_acceptance_meta SET value=? WHERE key='activated_at'",
+                       (str(self.origin - 86400),))
+        self.deal.update(CATEGORY_ID="0", STAGE_ID="UC_PUCAAQ")
+        self.observe(source=self.source, configId=45, status="answered",
+                     dateCreate=iso(self.origin - 60), dateOperatorAnswer=iso(self.origin - 30))
+        self.assertTrue(self.service.process())
+        self.assertEqual(self.jobs()[0]["status"], "ready")
+        self.assertEqual(self.writes, [{"id": "101", "fields[ASSIGNED_BY_ID]": "7"}])
 
     def test_offered_operator_is_not_acceptance(self):
         self.observe(status="new", operatorId=7)
