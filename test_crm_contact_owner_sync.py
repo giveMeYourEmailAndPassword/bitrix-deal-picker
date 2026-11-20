@@ -327,6 +327,62 @@ class CrmContactScannerTests(unittest.TestCase):
         self.assertEqual(self.contacts.jobs, {})
         self.assertEqual(self.scanner.status()["pending"], 0)
 
+    def test_bulk_edit_of_closed_deals_does_not_delay_a_fresh_manager_change(self):
+        # 20.11.2026: about 1700 old deals were closed in bulk and a manager
+        # change made minutes later waited for hours behind them.
+        for did in range(1, 61):
+            self.add(did, cid=1000 + did, closed="Y", semantic="F", stage="LOSE")
+        self.add("100")
+        self.advance()
+        result = self.scanner.run()
+        self.assertEqual(result["queued"], 1)
+        self.assertEqual(next(iter(self.contacts.jobs.values())), ("100", "42", "7", "9", "marker-100"))
+        self.assertEqual(self.scanner.status()["pending"], 0)
+
+    def test_closed_and_intake_rows_are_settled_without_reading_each_deal(self):
+        self.add("100", stage="UC_ZJ55BR")
+        self.add("101", stage="C15:UC_PUCAAQ", cid="8")
+        self.add("102", closed="Y", semantic="F", cid="9")
+        self.add("103", semantic="S", cid="10")
+        self.advance()
+        self.assertEqual(self.scanner.poll(), {"read": 4, "queued": 0})
+        self.assertEqual(self.scanner.status()["pending"], 0)
+        self.assertIsNone(self.scanner.process())
+        self.assertNotIn("crm.deal.get", [method for method, _ in self.calls])
+        self.assertEqual({row["error_code"] for row in self.observations()}, {"ineligible"})
+
+    def test_row_without_explicit_proof_still_gets_the_full_deal_read(self):
+        self.add("100", closed="", semantic="")
+        self.advance()
+        self.assertEqual(self.scanner.poll()["queued"], 1)
+        self.scanner.process()
+        self.assertIn(("crm.deal.get", {"id": "100"}), self.calls)
+        self.assertEqual(self.contacts.jobs, {})
+        self.assertEqual(self.scanner.status()["pending"], 0)
+
+    def test_pending_change_is_dropped_when_the_deal_closes_before_processing(self):
+        deal = self.add()
+        self.advance()
+        self.assertEqual(self.scanner.poll()["queued"], 1)
+        deal.update(CLOSED="Y", STAGE_SEMANTIC_ID="F",
+                    DATE_MODIFY=(self.start + timedelta(seconds=11)).isoformat())
+        self.advance()
+        self.assertEqual(self.scanner.poll()["queued"], 0)
+        self.assertEqual(self.scanner.status()["pending"], 0)
+        self.assertIsNone(self.scanner.process())
+        self.assertEqual(self.contacts.jobs, {})
+
+    def test_deal_settled_as_closed_is_picked_up_again_when_it_returns_to_work(self):
+        deal = self.add(closed="Y", semantic="F")
+        self.advance()
+        self.scanner.run()
+        self.assertEqual(self.contacts.jobs, {})
+        deal.update(CLOSED="N", STAGE_SEMANTIC_ID="P",
+                    DATE_MODIFY=(self.start + timedelta(seconds=11)).isoformat())
+        self.advance()
+        self.scanner.run()
+        self.assertEqual(len(self.contacts.jobs), 1)
+
     def test_scanner_rpc_refuses_any_crm_mutation(self):
         with self.assertRaisesRegex(ValueError, "write_forbidden"):
             self.scanner.rpc("crm.contact.update", {"id": "7"})
