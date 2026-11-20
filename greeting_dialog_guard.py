@@ -18,7 +18,7 @@ class GreetingDialogGuardError(RuntimeError):
 def _dialog_snapshot(dialog, chat, deal, session, manager):
     owner = _dialog_owner(dialog, chat, deal)
     address = _zero_owner_address(dialog)
-    if address[2] != session or not (known_native_source(address[0]) or address[0] == "thoth_waba"):
+    if address[2] != session or not known_native_source(address[0]):
         raise GreetingDialogGuardError("greeting_dialog_changed")
     # Some dialogs have a second current CRM binding in entity_data_1.
     fields = dialog["entity_data_1"].split("|")

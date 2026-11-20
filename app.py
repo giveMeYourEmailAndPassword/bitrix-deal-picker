@@ -27,7 +27,7 @@ from greeting_actor_pin import ensure_unmapped_actor_pin
 from greeting_dialog_guard import require_quiet_claim_dialog
 from claim_read_transport import claim_read_scope, open_bitrix_response
 from contact_owner_sync import ContactOwnerSync, entity_id as contact_entity_id
-from native_acceptance_sync import native_deal_unresolved, supported as supported_native_connector
+from native_acceptance_sync import WORK_STAGE, native_deal_unresolved, supported as supported_native_connector
 from claim_chat_guard import (
     ClaimChatGuardUnavailable, claim_chat_guard_diagnostic, read_claim_chat_ownership,
 )
@@ -182,7 +182,7 @@ SOURCE_STAGES = {
     "UC_ZJ55BR": "Необработанные ЛИДЫ",
     "UC_PUCAAQ": "ОЖИДАЮТ СПЕЦИАЛИСТА",
 }
-TARGET_STAGE = "NEW"
+TARGET_STAGE = WORK_STAGE
 TARGET_STAGE_NAME = "В РАБОТЕ"
 DEAL_ANALYSIS_CACHE = {}
 DEAL_HEADERS_CACHE = {}
@@ -3042,7 +3042,7 @@ def get_openline_chat_context(session_id):
 
 def unrelated_greeting_connector(source):
     return (isinstance(source, str) and re.fullmatch(r"[a-z][a-z0-9_-]{1,199}", source) is not None
-            and source != "thoth_waba" and not supported_native_connector(source))
+            and not supported_native_connector(source))
 
 
 def openline_chat_is_bound_to_deal(entity_data, deal_id):
