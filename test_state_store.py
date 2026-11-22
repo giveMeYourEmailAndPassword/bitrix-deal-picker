@@ -17,6 +17,7 @@ from state_store import (
     IdempotencyConflictError,
     MIGRATION_MARKER,
     StateStore,
+    StateStoreError,
     StateStoreNotReadyError,
     _claim_export_app_version,
 )
@@ -2229,6 +2230,151 @@ class TestLostDealAutocloseState(StateStoreTestCase):
         migrated = restarted.get_lost_deal_close_operation("9001")
         self.assertEqual(migrated["chatLookupMode"], "")
         self.assertEqual(migrated["activityUpdatedAt"], "")
+
+    def _dispatched_store(self):
+        store = self.make_store()
+        claim = store.claim_lost_deal_close_transition(self.transition())
+        store.mark_lost_deal_close_dispatching(
+            "9001",
+            claim["leaseToken"],
+            "8101",
+            "8201",
+            "8301",
+            12,
+            "a" * 64,
+            "8401",
+            "active_registry",
+            "",
+        )
+        return store
+
+    def _extra_chat(self, store, chat_id="8102"):
+        return store.mark_lost_deal_close_extra_chat_dispatching(
+            "9001", chat_id, "8202", "8302", 7, "b" * 64, "8402"
+        )
+
+    def test_extra_chat_boundary_persists_identity_of_another_chat(self):
+        store = self._dispatched_store()
+
+        chat = self._extra_chat(store)
+
+        self.assertEqual(chat["status"], "dispatching")
+        self.assertEqual(chat["outcomeCode"], "finish_started")
+        self.assertEqual(chat["dealId"], "7001")
+        self.assertEqual(chat["chatId"], "8102")
+        self.assertEqual(chat["sessionId"], "8202")
+        self.assertEqual(chat["lastMessageId"], "8302")
+        self.assertEqual(chat["historyMessageCount"], 7)
+        self.assertEqual(chat["historySignature"], "b" * 64)
+        self.assertEqual(chat["activityId"], "8402")
+        self.assertEqual(chat["chatLookupMode"], "active_registry")
+        self.assertEqual(store.list_lost_deal_close_extra_chats("9001"), [chat])
+        # The primary chat of the transition is untouched.
+        primary = store.get_lost_deal_close_operation("9001")
+        self.assertEqual(primary["chatId"], "8101")
+        self.assertEqual(primary["status"], "dispatching")
+
+    def test_extra_chat_is_never_dispatched_twice(self):
+        store = self._dispatched_store()
+        self._extra_chat(store)
+
+        with self.assertRaises(StateStoreError):
+            self._extra_chat(store)
+        store.mark_lost_deal_close_extra_chat_uncertain("9001", "8102")
+        with self.assertRaises(StateStoreError):
+            self._extra_chat(store)
+        self.assertEqual(len(store.list_lost_deal_close_extra_chats("9001")), 1)
+
+    def test_extra_chat_requires_transition_past_its_dispatch_boundary(self):
+        store = self.make_store()
+        with self.assertRaises(StateStoreError):
+            self._extra_chat(store)
+        claim = store.claim_lost_deal_close_transition(self.transition())
+        with self.assertRaises(StateStoreError):
+            self._extra_chat(store)
+        store.finalize_lost_deal_close_check(
+            "9001", claim["leaseToken"], status="skipped", outcome_code="no_active_chat"
+        )
+        with self.assertRaises(StateStoreError):
+            self._extra_chat(store)
+        self.assertEqual(store.list_lost_deal_close_extra_chats("9001"), [])
+
+    def test_extra_chat_cannot_repeat_the_primary_chat(self):
+        store = self._dispatched_store()
+        with self.assertRaises(StateStoreError):
+            self._extra_chat(store, chat_id="8101")
+        self.assertEqual(store.list_lost_deal_close_extra_chats("9001"), [])
+
+    def test_extra_chat_rejects_invalid_identity(self):
+        store = self._dispatched_store()
+        invalid = [
+            ("9001", "0", "8202", "8302", 7, "b" * 64, "8402"),
+            ("9001", "8102", "", "8302", 7, "b" * 64, "8402"),
+            ("9001", "8102", "8202", "x", 7, "b" * 64, "8402"),
+            ("9001", "8102", "8202", "8302", -1, "b" * 64, "8402"),
+            ("9001", "8102", "8202", "8302", 7, "not-a-digest", "8402"),
+            ("9001", "8102", "8202", "8302", 7, "b" * 64, ""),
+            ("", "8102", "8202", "8302", 7, "b" * 64, "8402"),
+        ]
+        for arguments in invalid:
+            with self.subTest(arguments=arguments):
+                with self.assertRaises(ValueError):
+                    store.mark_lost_deal_close_extra_chat_dispatching(*arguments)
+        self.assertEqual(store.list_lost_deal_close_extra_chats("9001"), [])
+
+    def test_extra_chat_final_states_and_reconciliation_queue(self):
+        store = self._dispatched_store()
+        self._extra_chat(store, "8102")
+        self._extra_chat(store, "8103")
+        self.assertEqual(
+            [
+                row["chatId"]
+                for row in store.list_lost_deal_close_extra_chat_reconciliation()
+            ],
+            ["8102", "8103"],
+        )
+
+        closed = store.mark_lost_deal_close_extra_chat_closed("9001", "8102")
+        self.assertEqual(closed["status"], "closed")
+        self.assertEqual(closed["outcomeCode"], "finished")
+        self.assertIsNotNone(closed["finalizedAt"])
+        with self.assertRaises(StateStoreError):
+            store.mark_lost_deal_close_extra_chat_uncertain("9001", "8102")
+        with self.assertRaises(StateStoreError):
+            store.mark_lost_deal_close_extra_chat_reconciled("9001", "8102")
+
+        uncertain = store.mark_lost_deal_close_extra_chat_uncertain(
+            "9001", "8103", "finish_not_acknowledged"
+        )
+        self.assertEqual(uncertain["status"], "uncertain")
+        self.assertEqual(uncertain["outcomeCode"], "finish_not_acknowledged")
+        self.assertEqual(
+            [
+                row["chatId"]
+                for row in store.list_lost_deal_close_extra_chat_reconciliation()
+            ],
+            ["8103"],
+        )
+        reconciled = store.mark_lost_deal_close_extra_chat_reconciled("9001", "8103")
+        self.assertEqual(reconciled["status"], "closed")
+        self.assertEqual(reconciled["outcomeCode"], "finished_reconciled")
+        self.assertEqual(store.list_lost_deal_close_extra_chat_reconciliation(), [])
+
+    def test_existing_database_gains_extra_chat_table_without_version_bump(self):
+        store = self._dispatched_store()
+        with sqlite3.connect(store.db_path) as connection:
+            connection.execute("DROP INDEX idx_lost_deal_close_extra_status")
+            connection.execute("DROP TABLE lost_deal_close_extra_chats")
+
+        restarted = self.make_store()
+
+        self.assertTrue(restarted.readiness_check()["ok"])
+        self.assertEqual(restarted.readiness_check()["schemaVersion"], 2)
+        chat = self._extra_chat(restarted)
+        self.assertEqual(chat["status"], "dispatching")
+        self.assertEqual(
+            restarted.get_lost_deal_close_operation("9001")["status"], "dispatching"
+        )
 
 
 if __name__ == "__main__":

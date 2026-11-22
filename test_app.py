@@ -6078,6 +6078,1063 @@ class TestLostDealAutoclose(TemporaryStateTestCase):
         self.assertEqual(result, "message_after_failed_transition")
         finish.assert_not_called()
 
+    def test_system_notice_after_failed_transition_does_not_keep_dialog_open(self):
+        redirected = self.snapshot(
+            latestMessageAt="2099-01-01T10:00:20+00:00",
+            latestAuthoredMessageAt="2099-01-01T09:59:50+00:00",
+            latestAuthoredMessagesAreTrigger=False,
+        )
+        finish = MagicMock(return_value=True)
+        with (
+            patch.object(app, "DRY_RUN", False),
+            patch.object(app, "exact_failed_transition", return_value=self.transition()),
+            patch.object(
+                app, "read_single_active_deal_chat_snapshot", return_value=redirected
+            ),
+            patch.object(app, "selected_chat_is_confirmed_inactive", return_value=True),
+            patch.object(app, "bitrix_call", finish),
+        ):
+            result = app.process_lost_deal_transition(
+                "7001", "9001", datetime.fromisoformat(self.REMOTE_TIME)
+            )
+        self.assertEqual(result, "closed")
+        finish.assert_called_once_with(
+            "imopenlines.operator.another.finish", {"CHAT_ID": "8101"}
+        )
+
+    def test_dialog_with_only_system_notices_is_closed(self):
+        only_system = self.snapshot(
+            latestMessageAt="2099-01-01T10:00:20+00:00",
+            latestAuthoredMessageAt="",
+            latestAuthoredMessagesAreTrigger=False,
+        )
+        finish = MagicMock(return_value=True)
+        with (
+            patch.object(app, "DRY_RUN", False),
+            patch.object(app, "exact_failed_transition", return_value=self.transition()),
+            patch.object(
+                app, "read_single_active_deal_chat_snapshot", return_value=only_system
+            ),
+            patch.object(app, "selected_chat_is_confirmed_inactive", return_value=True),
+            patch.object(app, "bitrix_call", finish),
+        ):
+            result = app.process_lost_deal_transition(
+                "7001", "9001", datetime.fromisoformat(self.REMOTE_TIME)
+            )
+        self.assertEqual(result, "closed")
+        finish.assert_called_once()
+
+    def test_trigger_phrase_in_transition_second_closes_the_dialog(self):
+        unsubscribed = self.snapshot(
+            latestMessageAt=self.transition()["transitionTime"],
+            latestAuthoredMessageAt=self.transition()["transitionTime"],
+            latestAuthoredMessagesAreTrigger=True,
+        )
+        finish = MagicMock(return_value=True)
+        with (
+            patch.object(app, "DRY_RUN", False),
+            patch.object(app, "exact_failed_transition", return_value=self.transition()),
+            patch.object(
+                app, "read_single_active_deal_chat_snapshot", return_value=unsubscribed
+            ),
+            patch.object(app, "selected_chat_is_confirmed_inactive", return_value=True),
+            patch.object(app, "bitrix_call", finish),
+        ):
+            result = app.process_lost_deal_transition(
+                "7001", "9001", datetime.fromisoformat(self.REMOTE_TIME)
+            )
+        self.assertEqual(result, "closed")
+        finish.assert_called_once()
+
+    def test_ordinary_authored_message_in_transition_second_still_skips(self):
+        same_second = self.snapshot(
+            latestMessageAt=self.transition()["transitionTime"],
+            latestAuthoredMessageAt=self.transition()["transitionTime"],
+            latestAuthoredMessagesAreTrigger=False,
+        )
+        with (
+            patch.object(app, "DRY_RUN", False),
+            patch.object(app, "exact_failed_transition", return_value=self.transition()),
+            patch.object(
+                app, "read_single_active_deal_chat_snapshot", return_value=same_second
+            ),
+            patch.object(app, "bitrix_call") as finish,
+        ):
+            result = app.process_lost_deal_transition(
+                "7001", "9001", datetime.fromisoformat(self.REMOTE_TIME)
+            )
+        self.assertEqual(result, "message_after_failed_transition")
+        finish.assert_not_called()
+
+    def test_authored_message_after_transition_skips_even_with_trigger_phrase(self):
+        late = self.snapshot(
+            latestMessageAt="2099-01-01T10:00:02+00:00",
+            latestAuthoredMessageAt="2099-01-01T10:00:02+00:00",
+            latestAuthoredMessagesAreTrigger=True,
+        )
+        with (
+            patch.object(app, "DRY_RUN", False),
+            patch.object(app, "exact_failed_transition", return_value=self.transition()),
+            patch.object(app, "read_single_active_deal_chat_snapshot", return_value=late),
+            patch.object(app, "bitrix_call") as finish,
+        ):
+            result = app.process_lost_deal_transition(
+                "7001", "9001", datetime.fromisoformat(self.REMOTE_TIME)
+            )
+        self.assertEqual(result, "message_after_failed_transition")
+        finish.assert_not_called()
+
+    def _history(self, messages, users=None):
+        return {
+            "chatId": "8101",
+            "sessionId": "8201",
+            "users": users
+            if users is not None
+            else {
+                "501": {
+                    "id": "501",
+                    "connector": True,
+                    "extranet": True,
+                    "bot": False,
+                    "departments": [],
+                },
+                "77": {
+                    "id": "77",
+                    "connector": False,
+                    "extranet": False,
+                    "bot": False,
+                    "departments": [1],
+                },
+                "88": {
+                    "id": "88",
+                    "connector": False,
+                    "extranet": False,
+                    "bot": True,
+                    "departments": [],
+                },
+            },
+            "message": {
+                str(index + 1): {"id": str(index + 1), **message}
+                for index, message in enumerate(messages)
+            },
+        }
+
+    def test_history_identity_separates_system_notices_from_authored_messages(self):
+        history = self._history(
+            [
+                {"senderid": "501", "date": "2099-01-01T09:59:50+00:00", "text": "Здравствуйте"},
+                {"senderid": "0", "date": "2099-01-01T10:00:30+00:00", "text": "Обращение перенаправлено"},
+            ]
+        )
+        with patch.object(app, "bitrix_call", return_value=history):
+            identity = app._history_identity("CHAT_ID", "8101")
+        self.assertEqual(
+            identity["latestMessageAt"],
+            datetime.fromisoformat("2099-01-01T10:00:30+00:00"),
+        )
+        self.assertEqual(
+            identity["latestAuthoredMessageAt"],
+            datetime.fromisoformat("2099-01-01T09:59:50+00:00"),
+        )
+        self.assertFalse(identity["latestAuthoredMessagesAreTrigger"])
+
+    def test_history_identity_without_authored_messages(self):
+        history = self._history(
+            [{"senderid": 0, "date": "2099-01-01T10:00:30+00:00", "text": "Начат диалог"}]
+        )
+        with patch.object(app, "bitrix_call", return_value=history):
+            identity = app._history_identity("CHAT_ID", "8101")
+        self.assertIsNone(identity["latestAuthoredMessageAt"])
+        self.assertFalse(identity["latestAuthoredMessagesAreTrigger"])
+
+    def test_history_identity_treats_unknown_sender_as_authored(self):
+        history = self._history(
+            [
+                {"senderid": "0", "date": "2099-01-01T09:59:50+00:00", "text": "Начат диалог"},
+                {"date": "2099-01-01T10:00:05+00:00", "text": "Отписаться"},
+            ]
+        )
+        with patch.object(app, "bitrix_call", return_value=history):
+            identity = app._history_identity("CHAT_ID", "8101")
+        self.assertEqual(
+            identity["latestAuthoredMessageAt"],
+            datetime.fromisoformat("2099-01-01T10:00:05+00:00"),
+        )
+        self.assertFalse(identity["latestAuthoredMessagesAreTrigger"])
+
+    def test_history_identity_recognizes_only_the_client_trigger_phrase(self):
+        moment = "2099-01-01T10:00:01+00:00"
+        cases = [
+            ("client phrase", [{"senderid": "501", "text": "Отписаться"}], True),
+            ("case and context", [{"senderid": "501", "text": "прошу ОТПИСАТЬСЯ от рассылки"}], True),
+            ("legacy text field", [{"senderid": "501", "textlegacy": "Отписаться"}], True),
+            ("other client text", [{"senderid": "501", "text": "Сколько стоит тур?"}], False),
+            ("employee phrase", [{"senderid": "77", "text": "Отписаться"}], False),
+            ("bot phrase", [{"senderid": "88", "text": "Отписаться"}], False),
+            ("unknown user", [{"senderid": "999", "text": "Отписаться"}], False),
+            (
+                "second ordinary message in the same second",
+                [
+                    {"senderid": "501", "text": "Отписаться"},
+                    {"senderid": "501", "text": "хотя подождите"},
+                ],
+                False,
+            ),
+        ]
+        for name, messages, expected in cases:
+            with self.subTest(name=name):
+                history = self._history(
+                    [{"date": moment, **message} for message in messages]
+                )
+                with patch.object(app, "bitrix_call", return_value=history):
+                    identity = app._history_identity("SESSION_ID", "8201")
+                self.assertEqual(
+                    identity["latestAuthoredMessageAt"],
+                    datetime.fromisoformat(moment),
+                )
+                self.assertEqual(identity["latestAuthoredMessagesAreTrigger"], expected)
+
+    def test_history_identity_trigger_needs_proven_connector_user(self):
+        message = {
+            "senderid": "501",
+            "date": "2099-01-01T10:00:01+00:00",
+            "text": "Отписаться",
+        }
+        for users in (None, [], {"501": {"id": "501"}}, {"501": {"id": "502", "connector": True}}):
+            with self.subTest(users=users):
+                history = self._history([message], users={} if users is None else users)
+                with patch.object(app, "bitrix_call", return_value=history):
+                    identity = app._history_identity("SESSION_ID", "8201")
+                self.assertFalse(identity["latestAuthoredMessagesAreTrigger"])
+
+    def test_history_identity_trigger_phrases_can_be_disabled(self):
+        history = self._history(
+            [{"senderid": "501", "date": "2099-01-01T10:00:01+00:00", "text": "Отписаться"}]
+        )
+        with (
+            patch.object(app, "LOST_DEAL_AUTOCLOSE_TRIGGER_TEXTS", ()),
+            patch.object(app, "bitrix_call", return_value=history),
+        ):
+            identity = app._history_identity("SESSION_ID", "8201")
+        self.assertFalse(identity["latestAuthoredMessagesAreTrigger"])
+
+    def second_snapshot(self, **changes):
+        value = self.snapshot(
+            chatId="8102",
+            sessionId="8202",
+            lastMessageId="8302",
+            activityId="8402",
+            historySignature="b" * 64,
+            entityData1="Y|DEAL|7001|N|N|8202|0|0|0|0",
+        )
+        value.update(changes)
+        return value
+
+    def _several_chats(self, first, second, **overrides):
+        """Patch the readers for a deal that owns two active chats."""
+
+        stack = ExitStack()
+        mocks = {
+            "exact": stack.enter_context(
+                patch.object(
+                    app,
+                    "exact_failed_transition",
+                    **overrides.get("exact", {"return_value": self.transition()}),
+                )
+            ),
+            "single": stack.enter_context(
+                patch.object(
+                    app,
+                    "read_single_active_deal_chat_snapshot",
+                    side_effect=app.LostDealCloseGuardError("multiple_active_chats"),
+                )
+            ),
+            "several": stack.enter_context(
+                patch.object(
+                    app,
+                    "read_multiple_active_deal_chat_snapshots",
+                    **overrides.get(
+                        "several",
+                        {
+                            "side_effect": [
+                                ([first, second], {}, ["8101", "8102"]),
+                                ([first], {}, ["8101", "8102"]),
+                            ]
+                        },
+                    ),
+                )
+            ),
+            "remaining": stack.enter_context(
+                patch.object(
+                    app,
+                    "read_remaining_active_deal_chat_snapshot",
+                    **overrides.get("remaining", {"return_value": second}),
+                )
+            ),
+        }
+        stack.enter_context(patch.object(app, "DRY_RUN", overrides.get("dry_run", False)))
+        return stack, mocks
+
+    def test_every_active_chat_of_failed_deal_is_verified_and_closed_once(self):
+        first, second = self.snapshot(), self.second_snapshot()
+        events = []
+
+        def finish_side_effect(method, params):
+            events.append(params["CHAT_ID"])
+            if params["CHAT_ID"] == "8102":
+                extra = self.store.list_lost_deal_close_extra_chats("9001")
+                self.assertEqual([row["status"] for row in extra], ["dispatching"])
+                self.assertEqual(extra[0]["sessionId"], "8202")
+                self.assertEqual(extra[0]["activityId"], "8402")
+                self.assertEqual(
+                    self.store.get_lost_deal_close_operation("9001")["status"],
+                    "closed",
+                )
+            return True
+
+        finish = MagicMock(side_effect=finish_side_effect)
+        stack, mocks = self._several_chats(first, second)
+        with stack:
+            with (
+                patch.object(app, "selected_chat_is_confirmed_inactive", return_value=True),
+                patch.object(app, "bitrix_call", finish),
+            ):
+                result = app.process_lost_deal_transition(
+                    "7001", "9001", datetime.fromisoformat(self.REMOTE_TIME)
+                )
+                replay = app.process_lost_deal_transition(
+                    "7001", "9001", datetime.fromisoformat(self.REMOTE_TIME)
+                )
+        self.assertEqual(result, "closed")
+        self.assertEqual(replay, "closed")
+        self.assertEqual(events, ["8101", "8102"])
+        self.assertEqual(
+            finish.call_args_list,
+            [
+                call("imopenlines.operator.another.finish", {"CHAT_ID": "8101"}),
+                call("imopenlines.operator.another.finish", {"CHAT_ID": "8102"}),
+            ],
+        )
+        # The first chat is re-verified against the unchanged registry and the
+        # second one once more right before its own finish call.
+        self.assertEqual(
+            mocks["several"].call_args_list,
+            [
+                call("7001"),
+                call(
+                    "7001",
+                    only_chat_ids=["8101"],
+                    expected_chat_ids=["8101", "8102"],
+                ),
+            ],
+        )
+        mocks["remaining"].assert_called_once_with("7001", "8102")
+        self.assertEqual(mocks["exact"].call_count, 3)
+        operation = self.store.get_lost_deal_close_operation("9001")
+        self.assertEqual(operation["status"], "closed")
+        self.assertEqual(operation["chatId"], "8101")
+        extra = self.store.list_lost_deal_close_extra_chats("9001")
+        self.assertEqual(len(extra), 1)
+        self.assertEqual(extra[0]["chatId"], "8102")
+        self.assertEqual(extra[0]["status"], "closed")
+        self.assertEqual(extra[0]["outcomeCode"], "finished")
+
+    def test_chat_with_later_client_message_stays_open_while_other_is_closed(self):
+        first = self.snapshot()
+        second = self.second_snapshot(
+            latestMessageAt="2099-01-01T10:00:05+00:00",
+            latestAuthoredMessageAt="2099-01-01T10:00:05+00:00",
+            latestAuthoredMessagesAreTrigger=False,
+        )
+        finish = MagicMock(return_value=True)
+        stack, mocks = self._several_chats(first, second)
+        with stack:
+            with (
+                patch.object(app, "selected_chat_is_confirmed_inactive", return_value=True),
+                patch.object(app, "bitrix_call", finish),
+            ):
+                result = app.process_lost_deal_transition(
+                    "7001", "9001", datetime.fromisoformat(self.REMOTE_TIME)
+                )
+        self.assertEqual(result, "partial")
+        finish.assert_called_once_with(
+            "imopenlines.operator.another.finish", {"CHAT_ID": "8101"}
+        )
+        mocks["remaining"].assert_not_called()
+        self.assertEqual(
+            self.store.get_lost_deal_close_operation("9001")["status"], "closed"
+        )
+        self.assertEqual(self.store.list_lost_deal_close_extra_chats("9001"), [])
+
+    def test_first_eligible_chat_is_closed_when_an_earlier_one_fails_its_checks(self):
+        second = self.second_snapshot()
+        finish = MagicMock(return_value=True)
+        stack, mocks = self._several_chats(
+            self.snapshot(),
+            second,
+            several={
+                "side_effect": [
+                    ([second], {"8101": "dialog_deal_binding_mismatch"}, ["8101", "8102"]),
+                    ([second], {}, ["8101", "8102"]),
+                ]
+            },
+        )
+        with stack:
+            with (
+                patch.object(app, "selected_chat_is_confirmed_inactive", return_value=True),
+                patch.object(app, "bitrix_call", finish),
+            ):
+                result = app.process_lost_deal_transition(
+                    "7001", "9001", datetime.fromisoformat(self.REMOTE_TIME)
+                )
+        self.assertEqual(result, "partial")
+        finish.assert_called_once_with(
+            "imopenlines.operator.another.finish", {"CHAT_ID": "8102"}
+        )
+        self.assertEqual(
+            mocks["several"].call_args_list[1],
+            call("7001", only_chat_ids=["8102"], expected_chat_ids=["8101", "8102"]),
+        )
+        operation = self.store.get_lost_deal_close_operation("9001")
+        self.assertEqual(operation["status"], "closed")
+        self.assertEqual(operation["chatId"], "8102")
+        self.assertEqual(self.store.list_lost_deal_close_extra_chats("9001"), [])
+
+    def test_no_eligible_chat_among_several_is_terminal_skip(self):
+        cases = [
+            (
+                {"8101": "dialog_deal_binding_mismatch", "8102": "dialog_deal_binding_mismatch"},
+                "dialog_deal_binding_mismatch",
+            ),
+            (
+                {"8101": "dialog_deal_binding_mismatch", "8102": "dialog_session_mismatch"},
+                "no_eligible_active_chat",
+            ),
+        ]
+        for index, (skipped, expected) in enumerate(cases):
+            with self.subTest(expected=expected):
+                transition = {**self.transition(), "transitionId": str(9001 + index)}
+                finish = MagicMock()
+                stack, _ = self._several_chats(
+                    self.snapshot(),
+                    self.second_snapshot(),
+                    exact={"return_value": transition},
+                    several={"return_value": ([], dict(skipped), ["8101", "8102"])},
+                )
+                with stack:
+                    with patch.object(app, "bitrix_call", finish):
+                        result = app.process_lost_deal_transition(
+                            "7001",
+                            transition["transitionId"],
+                            datetime.fromisoformat(self.REMOTE_TIME),
+                        )
+                self.assertEqual(result, expected)
+                finish.assert_not_called()
+                operation = self.store.get_lost_deal_close_operation(
+                    transition["transitionId"]
+                )
+                self.assertEqual(operation["status"], "skipped")
+                self.assertEqual(operation["outcomeCode"], expected)
+
+    def test_registry_change_before_first_finish_aborts_every_chat(self):
+        finish = MagicMock()
+        stack, _ = self._several_chats(
+            self.snapshot(),
+            self.second_snapshot(),
+            several={
+                "side_effect": [
+                    ([self.snapshot(), self.second_snapshot()], {}, ["8101", "8102"]),
+                    app.LostDealCloseGuardError("active_chat_changed_during_check"),
+                ]
+            },
+        )
+        with stack:
+            with patch.object(app, "bitrix_call", finish):
+                result = app.process_lost_deal_transition(
+                    "7001", "9001", datetime.fromisoformat(self.REMOTE_TIME)
+                )
+        self.assertEqual(result, "active_chat_changed_during_check")
+        finish.assert_not_called()
+        self.assertEqual(
+            self.store.get_lost_deal_close_operation("9001")["status"], "skipped"
+        )
+
+    def test_remaining_chat_that_changed_is_left_open(self):
+        first, second = self.snapshot(), self.second_snapshot()
+        finish = MagicMock(return_value=True)
+        stack, _ = self._several_chats(
+            first,
+            second,
+            remaining={"return_value": self.second_snapshot(lastMessageId="8399")},
+        )
+        with stack:
+            with (
+                patch.object(app, "selected_chat_is_confirmed_inactive", return_value=True),
+                patch.object(app, "bitrix_call", finish),
+            ):
+                result = app.process_lost_deal_transition(
+                    "7001", "9001", datetime.fromisoformat(self.REMOTE_TIME)
+                )
+        self.assertEqual(result, "partial")
+        finish.assert_called_once_with(
+            "imopenlines.operator.another.finish", {"CHAT_ID": "8101"}
+        )
+        self.assertEqual(self.store.list_lost_deal_close_extra_chats("9001"), [])
+
+    def test_remaining_chat_is_left_open_when_the_deal_was_reopened(self):
+        first, second = self.snapshot(), self.second_snapshot()
+        reopened = {**self.transition(), "transitionTime": "2099-01-01T10:00:40+00:00"}
+        finish = MagicMock(return_value=True)
+        stack, mocks = self._several_chats(
+            first,
+            second,
+            exact={"side_effect": [self.transition(), self.transition(), reopened]},
+        )
+        with stack:
+            with (
+                patch.object(app, "selected_chat_is_confirmed_inactive", return_value=True),
+                patch.object(app, "bitrix_call", finish),
+            ):
+                result = app.process_lost_deal_transition(
+                    "7001", "9001", datetime.fromisoformat(self.REMOTE_TIME)
+                )
+        self.assertEqual(result, "partial")
+        finish.assert_called_once_with(
+            "imopenlines.operator.another.finish", {"CHAT_ID": "8101"}
+        )
+        mocks["remaining"].assert_not_called()
+        self.assertEqual(self.store.list_lost_deal_close_extra_chats("9001"), [])
+
+    def test_unreadable_remaining_chat_is_left_open_without_failing_the_poll(self):
+        first, second = self.snapshot(), self.second_snapshot()
+        finish = MagicMock(return_value=True)
+        stack, _ = self._several_chats(
+            first, second, remaining={"side_effect": TimeoutError("read")}
+        )
+        with stack:
+            with (
+                patch.object(app, "selected_chat_is_confirmed_inactive", return_value=True),
+                patch.object(app, "bitrix_call", finish),
+            ):
+                result = app.process_lost_deal_transition(
+                    "7001", "9001", datetime.fromisoformat(self.REMOTE_TIME)
+                )
+        self.assertEqual(result, "partial")
+        finish.assert_called_once()
+        self.assertEqual(
+            self.store.get_lost_deal_close_operation("9001")["status"], "closed"
+        )
+        self.assertEqual(self.store.list_lost_deal_close_extra_chats("9001"), [])
+
+    def test_remaining_chat_timeout_is_uncertain_never_resent_and_reconciled_later(self):
+        first, second = self.snapshot(), self.second_snapshot()
+
+        def finish_side_effect(method, params):
+            if params["CHAT_ID"] == "8102":
+                raise TimeoutError("ambiguous")
+            return True
+
+        def confirmed(operation):
+            return operation["chatId"] == "8101"
+
+        finish = MagicMock(side_effect=finish_side_effect)
+        stack, _ = self._several_chats(first, second)
+        with stack:
+            with (
+                patch.object(app, "selected_chat_is_confirmed_inactive", side_effect=confirmed),
+                patch.object(app, "bitrix_call", finish),
+            ):
+                result = app.process_lost_deal_transition(
+                    "7001", "9001", datetime.fromisoformat(self.REMOTE_TIME)
+                )
+                replay = app.process_lost_deal_transition(
+                    "7001", "9001", datetime.fromisoformat(self.REMOTE_TIME)
+                )
+        self.assertEqual(result, "partial")
+        self.assertEqual(replay, "closed")
+        self.assertEqual(finish.call_count, 2)
+        extra = self.store.list_lost_deal_close_extra_chats("9001")
+        self.assertEqual(extra[0]["status"], "uncertain")
+        self.assertEqual(extra[0]["outcomeCode"], "finish_result_uncertain")
+
+        with (
+            patch.object(
+                app, "selected_chat_is_confirmed_inactive", return_value=True
+            ) as confirm,
+            patch.object(app, "bitrix_call") as later_call,
+        ):
+            reconciled = app.reconcile_lost_deal_close_operations()
+        self.assertEqual(reconciled, 1)
+        later_call.assert_not_called()
+        self.assertEqual(confirm.call_args.args[0]["chatId"], "8102")
+        self.assertEqual(confirm.call_args.args[0]["dealId"], "7001")
+        extra = self.store.list_lost_deal_close_extra_chats("9001")
+        self.assertEqual(extra[0]["status"], "closed")
+        self.assertEqual(extra[0]["outcomeCode"], "finished_reconciled")
+
+    def test_remaining_chat_without_acknowledgement_or_confirmation_is_uncertain(self):
+        cases = [
+            ("not acknowledged", False, True, "finish_not_acknowledged"),
+            ("not confirmed", True, False, "finish_ack_unconfirmed"),
+        ]
+        for index, (name, acknowledged, second_confirmed, expected) in enumerate(cases):
+            with self.subTest(name=name):
+                transition = {**self.transition(), "transitionId": str(9001 + index)}
+                first, second = self.snapshot(), self.second_snapshot()
+
+                def finish_side_effect(method, params, acknowledged=acknowledged):
+                    return True if params["CHAT_ID"] == "8101" else acknowledged
+
+                def confirmed(operation, second_confirmed=second_confirmed):
+                    return True if operation["chatId"] == "8101" else second_confirmed
+
+                stack, _ = self._several_chats(
+                    first, second, exact={"return_value": transition}
+                )
+                with stack:
+                    with (
+                        patch.object(
+                            app,
+                            "selected_chat_is_confirmed_inactive",
+                            side_effect=confirmed,
+                        ),
+                        patch.object(
+                            app, "bitrix_call", MagicMock(side_effect=finish_side_effect)
+                        ),
+                    ):
+                        result = app.process_lost_deal_transition(
+                            "7001",
+                            transition["transitionId"],
+                            datetime.fromisoformat(self.REMOTE_TIME),
+                        )
+                self.assertEqual(result, "partial")
+                extra = self.store.list_lost_deal_close_extra_chats(
+                    transition["transitionId"]
+                )
+                self.assertEqual(extra[0]["status"], "uncertain")
+                self.assertEqual(extra[0]["outcomeCode"], expected)
+
+    def test_dry_run_with_several_chats_never_calls_finish(self):
+        finish = MagicMock()
+        stack, mocks = self._several_chats(
+            self.snapshot(), self.second_snapshot(), dry_run=True
+        )
+        with stack:
+            with patch.object(app, "bitrix_call", finish):
+                result = app.process_lost_deal_transition(
+                    "7001", "9001", datetime.fromisoformat(self.REMOTE_TIME)
+                )
+        self.assertEqual(result, "dry_run")
+        finish.assert_not_called()
+        mocks["remaining"].assert_not_called()
+        self.assertEqual(
+            self.store.get_lost_deal_close_operation("9001")["status"], "dry_run"
+        )
+        self.assertEqual(self.store.list_lost_deal_close_extra_chats("9001"), [])
+
+    def test_several_chat_reader_verifies_each_registry_chat_independently(self):
+        rows = [{"chatId": "8102"}, {"chatId": "8101"}]
+
+        def read(deal_id, transition, chat_id, fallback, expected_registry):
+            self.assertEqual((deal_id, transition, fallback), ("7001", None, None))
+            self.assertEqual(expected_registry, rows)
+            if chat_id == "8101":
+                raise app.LostDealCloseGuardError("dialog_deal_binding_mismatch")
+            return self.second_snapshot()
+
+        with (
+            patch.object(app, "active_chat_rows_for_deal", return_value=rows),
+            patch.object(app, "_read_deal_chat_snapshot", side_effect=read) as reader,
+        ):
+            snapshots, skipped, chat_ids = app.read_multiple_active_deal_chat_snapshots(
+                "7001"
+            )
+        self.assertEqual([item["chatId"] for item in snapshots], ["8102"])
+        self.assertEqual(skipped, {"8101": "dialog_deal_binding_mismatch"})
+        self.assertEqual(chat_ids, ["8101", "8102"])
+        self.assertEqual(
+            [item.args[2] for item in reader.call_args_list], ["8101", "8102"]
+        )
+
+    def test_several_chat_reader_fails_closed_on_registry_surprises(self):
+        cases = [
+            ("changed set", [{"chatId": "8101"}, {"chatId": "8103"}], ["8101", "8102"], app.LostDealCloseGuardError),
+            ("shrunk", [{"chatId": "8101"}], None, app.LostDealCloseGuardError),
+            ("empty", [], None, app.LostDealCloseGuardError),
+            ("duplicate", [{"chatId": "8101"}, {"chatId": "8101"}], None, RuntimeError),
+            (
+                "too many",
+                [{"chatId": str(8101 + index)} for index in range(app.MAX_LOST_DEAL_CHATS_PER_TRANSITION + 1)],
+                None,
+                app.LostDealCloseGuardError,
+            ),
+        ]
+        for name, rows, expected_ids, error in cases:
+            with self.subTest(name=name):
+                with (
+                    patch.object(app, "active_chat_rows_for_deal", return_value=rows),
+                    patch.object(app, "_read_deal_chat_snapshot") as reader,
+                ):
+                    with self.assertRaises(error):
+                        app.read_multiple_active_deal_chat_snapshots(
+                            "7001", expected_chat_ids=expected_ids
+                        )
+                reader.assert_not_called()
+
+    def test_several_chat_reader_skips_requested_chat_that_left_the_registry(self):
+        rows = [{"chatId": "8101"}, {"chatId": "8102"}]
+        with (
+            patch.object(app, "active_chat_rows_for_deal", return_value=rows),
+            patch.object(app, "_read_deal_chat_snapshot") as reader,
+        ):
+            snapshots, skipped, _ = app.read_multiple_active_deal_chat_snapshots(
+                "7001", only_chat_ids=["8109"]
+            )
+        self.assertEqual(snapshots, [])
+        self.assertEqual(skipped, {"8109": "active_chat_changed_during_check"})
+        reader.assert_not_called()
+
+    def test_remaining_chat_reader_requires_chat_still_in_active_registry(self):
+        with (
+            patch.object(
+                app, "active_chat_rows_for_deal", return_value=[{"chatId": "8103"}]
+            ),
+            patch.object(app, "_read_deal_chat_snapshot") as reader,
+        ):
+            with self.assertRaisesRegex(
+                app.LostDealCloseGuardError, "active_chat_changed_during_check"
+            ):
+                app.read_remaining_active_deal_chat_snapshot("7001", "8102")
+        reader.assert_not_called()
+
+        rows = [{"chatId": "8102"}]
+        with (
+            patch.object(app, "active_chat_rows_for_deal", return_value=rows),
+            patch.object(
+                app, "_read_deal_chat_snapshot", return_value=self.second_snapshot()
+            ) as reader,
+        ):
+            snapshot = app.read_remaining_active_deal_chat_snapshot("7001", "8102")
+        self.assertEqual(snapshot["chatId"], "8102")
+        reader.assert_called_once_with("7001", None, "8102", None, rows)
+
+    def test_snapshot_of_one_of_several_chats_passes_the_exact_single_chat_checks(self):
+        identity = {
+            "chatId": "8102",
+            "sessionId": "8202",
+            "messageCount": 3,
+            "lastMessageId": "8302",
+            "latestMessageAt": datetime.fromisoformat("2099-01-01T10:00:20+00:00"),
+            "historySignature": "b" * 64,
+            "latestAuthoredMessageAt": datetime.fromisoformat("2099-01-01T09:59:50+00:00"),
+            "latestAuthoredMessagesAreTrigger": False,
+        }
+        dialog = {
+            "id": "8102",
+            "type": "lines",
+            "entity_data_1": "Y|DEAL|7001|N|N|8202|0|0|0|0",
+            "entity_data_2": "LEAD|0|COMPANY|0|CONTACT|0|DEAL|7001",
+            "last_message_id": "8302",
+            "unread_id": "0",
+            "counter": 0,
+            "user_counter": 2,
+            "is_new": False,
+        }
+        registry = [{"chatId": "8102"}, {"chatId": "8101"}]
+        reordered = [{"chatId": "8101"}, {"chatId": "8102"}]
+        with (
+            patch.object(app, "active_chat_rows_for_deal", return_value=reordered),
+            patch.object(app, "bitrix_call", return_value=dialog),
+            patch.object(app, "_history_identity", return_value=identity),
+            patch.object(app, "exact_openline_activity", return_value="8402"),
+        ):
+            snapshot = app._read_deal_chat_snapshot("7001", None, "8102", None, registry)
+        self.assertEqual(snapshot["chatId"], "8102")
+        self.assertEqual(snapshot["sessionId"], "8202")
+        self.assertEqual(snapshot["activityId"], "8402")
+        self.assertEqual(snapshot["chatLookupMode"], "active_registry")
+        self.assertEqual(snapshot["latestAuthoredMessageAt"], "2099-01-01T09:59:50+00:00")
+        self.assertFalse(snapshot["latestAuthoredMessagesAreTrigger"])
+        self.assertFalse(
+            app.lost_deal_chat_continued_after_transition(
+                snapshot, datetime.fromisoformat(self.transition()["transitionTime"])
+            )
+        )
+
+        foreign = {**dialog, "entity_data_2": "LEAD|0|COMPANY|0|CONTACT|0|DEAL|7002"}
+        with (
+            patch.object(app, "active_chat_rows_for_deal", return_value=reordered),
+            patch.object(app, "bitrix_call", return_value=foreign),
+            patch.object(app, "_history_identity", return_value=identity),
+            patch.object(app, "exact_openline_activity", return_value="8402"),
+        ):
+            with self.assertRaisesRegex(
+                app.LostDealCloseGuardError, "dialog_deal_binding_mismatch"
+            ):
+                app._read_deal_chat_snapshot("7001", None, "8102", None, registry)
+
+        with (
+            patch.object(
+                app, "active_chat_rows_for_deal", return_value=[{"chatId": "8102"}]
+            ),
+            patch.object(app, "bitrix_call", return_value=dialog),
+            patch.object(app, "_history_identity", return_value=identity),
+            patch.object(app, "exact_openline_activity", return_value="8402"),
+        ):
+            with self.assertRaisesRegex(
+                app.LostDealCloseGuardError, "active_chat_changed_during_check"
+            ):
+                app._read_deal_chat_snapshot("7001", None, "8102", None, registry)
+
+    class _FakePortal:
+        """A small stateful Bitrix stand-in driven only through REST calls."""
+
+        TRANSITION = "2099-01-01T10:00:01+00:00"
+
+        def __init__(self, test, born_lost=False):
+            self.test = test
+            self.born_lost = born_lost
+            self.chats = {}
+            self.finished = []
+            self.users = {
+                "501": {"id": "501", "connector": True, "extranet": True, "bot": False, "departments": []},
+                "77": {"id": "77", "connector": False, "extranet": False, "bot": False, "departments": [1]},
+            }
+
+        def add_chat(
+            self,
+            chat_id,
+            session_id,
+            activity_id,
+            messages,
+            accepted=True,
+            activity_created="2099-01-01T09:00:00+00:00",
+        ):
+            self.chats[chat_id] = {
+                "sessionId": session_id,
+                "activityId": activity_id,
+                "activityCreated": activity_created,
+                "accepted": accepted,
+                "open": True,
+                "messages": [
+                    {"id": str(int(chat_id) * 100 + index), **message}
+                    for index, message in enumerate(messages, start=1)
+                ],
+            }
+
+        def _chat_by_session(self, session_id):
+            for chat_id, chat in self.chats.items():
+                if chat["sessionId"] == str(session_id):
+                    return chat_id, chat
+            raise AssertionError(session_id)
+
+        def _activity(self, chat):
+            return {
+                "ID": chat["activityId"],
+                "OWNER_TYPE_ID": "2",
+                "OWNER_ID": "7001",
+                "PROVIDER_ID": "IMOPENLINES_SESSION",
+                "ASSOCIATED_ENTITY_ID": chat["sessionId"],
+                "COMPLETED": "Y",
+                # Bitrix completes the activity itself when the deal is closed.
+                "STATUS": "3" if chat["open"] else "2",
+                "CREATED": chat["activityCreated"],
+                "LAST_UPDATED": self.TRANSITION,
+            }
+
+        def call(self, method, params=None, timeout=None):
+            params = params or {}
+            if method == "crm.deal.get":
+                return {
+                    "ID": "7001",
+                    "CATEGORY_ID": "0",
+                    "STAGE_ID": "LOSE",
+                    "STAGE_SEMANTIC_ID": "F",
+                    "CLOSED": "Y",
+                    "MOVED_TIME": self.TRANSITION,
+                }
+            if method == "crm.status.list":
+                return [
+                    {"ENTITY_ID": "DEAL_STAGE", "STATUS_ID": "NEW", "SEMANTICS": ""},
+                    {"ENTITY_ID": "DEAL_STAGE", "STATUS_ID": "LOSE", "SEMANTICS": "F"},
+                ]
+            if method == "imopenlines.crm.chat.get":
+                self.test.assertEqual(params["ACTIVE_ONLY"], "Y")
+                return [
+                    {"CHAT_ID": chat_id}
+                    for chat_id, chat in self.chats.items()
+                    if chat["open"] and chat["accepted"]
+                ]
+            if method == "imopenlines.dialog.get":
+                chat = self.chats[str(params["CHAT_ID"])]
+                session = chat["sessionId"] if chat["open"] else "0"
+                return {
+                    "id": str(params["CHAT_ID"]),
+                    "type": "lines",
+                    "entity_data_1": f"Y|DEAL|7001|N|N|{session}|0|0|0|0",
+                    "entity_data_2": "LEAD|0|COMPANY|0|CONTACT|0|DEAL|7001",
+                    "last_message_id": chat["messages"][-1]["id"],
+                    "unread_id": "0",
+                    "counter": 0,
+                    "user_counter": 2,
+                    "is_new": False,
+                }
+            if method == "imopenlines.session.history.get":
+                if "CHAT_ID" in params:
+                    chat_id, chat = str(params["CHAT_ID"]), self.chats[str(params["CHAT_ID"])]
+                else:
+                    chat_id, chat = self._chat_by_session(params["SESSION_ID"])
+                return {
+                    "chatId": chat_id,
+                    "sessionId": chat["sessionId"],
+                    "users": self.users,
+                    "message": {item["id"]: item for item in chat["messages"]},
+                }
+            if method == "crm.activity.get":
+                for chat in self.chats.values():
+                    if chat["activityId"] == str(params["id"]):
+                        return self._activity(chat)
+                raise AssertionError(params)
+            if method == "imopenlines.operator.another.finish":
+                chat = self.chats[str(params["CHAT_ID"])]
+                self.test.assertTrue(chat["open"], "a closed chat was finished again")
+                chat["open"] = False
+                self.finished.append(str(params["CHAT_ID"]))
+                return True
+            raise AssertionError(method)
+
+        def call_full(self, method, params=None, timeout=None):
+            params = params or {}
+            if method == "crm.stagehistory.list":
+                previous = "2099-01-01T10:00:01+00:00" if self.born_lost else "2099-01-01T09:00:00+00:00"
+                return {
+                    "result": {
+                        "items": [
+                            {"ID": "9001", "OWNER_ID": "7001", "CATEGORY_ID": "0", "STAGE_ID": "LOSE", "CREATED_TIME": self.TRANSITION},
+                            {"ID": "9000", "OWNER_ID": "7001", "CATEGORY_ID": "0", "STAGE_ID": "NEW", "CREATED_TIME": previous},
+                        ]
+                    },
+                    "time": {"date_finish": "2099-01-01T10:01:00+00:00"},
+                }
+            if method == "crm.activity.list":
+                if "filter[ASSOCIATED_ENTITY_ID]" in params:
+                    _, chat = self._chat_by_session(params["filter[ASSOCIATED_ENTITY_ID]"])
+                    rows = [self._activity(chat)]
+                else:
+                    rows = [self._activity(chat) for chat in self.chats.values()]
+                return {"result": rows, "total": len(rows)}
+            raise AssertionError(method)
+
+    def _run_against(self, portal):
+        with (
+            patch.object(app, "DRY_RUN", False),
+            patch.object(app, "bitrix_call", side_effect=portal.call),
+            patch.object(app, "bitrix_call_full", side_effect=portal.call_full),
+        ):
+            return app.process_lost_deal_transition(
+                "7001", "9001", datetime.fromisoformat(self.REMOTE_TIME)
+            )
+
+    def test_end_to_end_two_accepted_chats_of_one_failed_deal_are_both_closed(self):
+        portal = self._FakePortal(self)
+        portal.add_chat("8102", "8202", "8402", [
+            {"senderid": "0", "date": "2099-01-01T09:55:49+00:00", "text": "Начат новый диалог"},
+            {"senderid": "0", "date": "2099-01-01T09:58:17+00:00", "text": "template+1+Тест"},
+        ])
+        portal.add_chat("8101", "8201", "8401", [
+            {"senderid": "501", "date": "2099-01-01T09:28:00+00:00", "text": "Здравствуйте"},
+            {"senderid": "0", "date": "2099-01-01T09:48:05+00:00", "text": "Диалог откреплен"},
+        ])
+
+        result = self._run_against(portal)
+
+        self.assertEqual(result, "closed")
+        self.assertEqual(portal.finished, ["8101", "8102"])
+        operation = self.store.get_lost_deal_close_operation("9001")
+        self.assertEqual(operation["status"], "closed")
+        self.assertEqual(operation["chatId"], "8101")
+        self.assertEqual(operation["sessionId"], "8201")
+        extra = self.store.list_lost_deal_close_extra_chats("9001")
+        self.assertEqual(
+            [(row["chatId"], row["sessionId"], row["activityId"], row["status"]) for row in extra],
+            [("8102", "8202", "8402", "closed")],
+        )
+        # A second poll of the same transition never finishes anything again.
+        self.assertEqual(self._run_against(portal), "closed")
+        self.assertEqual(portal.finished, ["8101", "8102"])
+
+    def test_end_to_end_chat_where_client_wrote_after_loss_stays_open(self):
+        portal = self._FakePortal(self)
+        portal.add_chat("8101", "8201", "8401", [
+            {"senderid": "501", "date": "2099-01-01T09:28:00+00:00", "text": "Здравствуйте"},
+        ])
+        portal.add_chat("8102", "8202", "8402", [
+            {"senderid": "0", "date": "2099-01-01T09:55:49+00:00", "text": "Начат новый диалог"},
+            {"senderid": "501", "date": "2099-01-01T10:00:09+00:00", "text": "А на июль есть?"},
+        ])
+
+        result = self._run_against(portal)
+
+        self.assertEqual(result, "partial")
+        self.assertEqual(portal.finished, ["8101"])
+        self.assertTrue(portal.chats["8102"]["open"])
+        self.assertEqual(self.store.list_lost_deal_close_extra_chats("9001"), [])
+
+    def test_end_to_end_unsubscribe_message_in_transition_second_is_closed(self):
+        portal = self._FakePortal(self, born_lost=True)
+        portal.add_chat("8101", "8201", "8401", [
+            {"senderid": "0", "date": "2099-01-01T10:00:00+00:00", "text": "Начат новый диалог"},
+            {"senderid": "0", "date": "2099-01-01T10:00:01+00:00", "text": "Создана новая сделка"},
+            {"senderid": "501", "date": "2099-01-01T10:00:01+00:00", "text": "Отписаться"},
+            {"senderid": "0", "date": "2099-01-01T10:00:01+00:00", "text": "Автоответ линии"},
+        ], accepted=False, activity_created="2099-01-01T10:00:00+00:00")
+
+        result = self._run_against(portal)
+
+        self.assertEqual(result, "closed")
+        self.assertEqual(portal.finished, ["8101"])
+        operation = self.store.get_lost_deal_close_operation("9001")
+        self.assertEqual(operation["status"], "closed")
+        self.assertEqual(operation["chatLookupMode"], "activity_fallback")
+
+    def test_end_to_end_queue_redirect_after_loss_does_not_keep_dialog_open(self):
+        portal = self._FakePortal(self)
+        portal.add_chat("8101", "8201", "8401", [
+            {"senderid": "501", "date": "2099-01-01T09:30:51+00:00", "text": "Спасибо, не надо"},
+            {"senderid": "0", "date": "2099-01-01T10:00:16+00:00", "text": "Обращение перенаправлено по правилам очереди"},
+        ], accepted=False)
+
+        result = self._run_against(portal)
+
+        self.assertEqual(result, "closed")
+        self.assertEqual(portal.finished, ["8101"])
+
+    def test_end_to_end_ordinary_client_message_in_transition_second_stays_open(self):
+        portal = self._FakePortal(self)
+        portal.add_chat("8101", "8201", "8401", [
+            {"senderid": "501", "date": "2099-01-01T10:00:01+00:00", "text": "Подождите, я передумал"},
+        ])
+
+        result = self._run_against(portal)
+
+        self.assertEqual(result, "message_after_failed_transition")
+        self.assertEqual(portal.finished, [])
+        self.assertEqual(
+            self.store.get_lost_deal_close_operation("9001")["status"], "skipped"
+        )
+
+    def test_end_to_end_employee_reply_after_loss_stays_open(self):
+        portal = self._FakePortal(self)
+        portal.add_chat("8101", "8201", "8401", [
+            {"senderid": "501", "date": "2099-01-01T09:30:51+00:00", "text": "Дорого"},
+            {"senderid": "77", "date": "2099-01-01T10:00:20+00:00", "text": "Можем предложить скидку"},
+        ])
+
+        result = self._run_against(portal)
+
+        self.assertEqual(result, "message_after_failed_transition")
+        self.assertEqual(portal.finished, [])
+
     def test_grace_period_keeps_transition_undiscovered_for_next_poll(self):
         with (
             patch.object(app, "exact_failed_transition", return_value=self.transition()),
