@@ -503,6 +503,27 @@ class StateStore:
                     finalized_at TEXT
                 );
 
+                CREATE TABLE IF NOT EXISTS lost_deal_close_extra_chats (
+                    transition_id TEXT NOT NULL,
+                    chat_id TEXT NOT NULL,
+                    deal_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    last_message_id TEXT NOT NULL DEFAULT '',
+                    history_message_count INTEGER NOT NULL DEFAULT 0
+                        CHECK (history_message_count >= 0),
+                    history_signature TEXT NOT NULL DEFAULT '',
+                    activity_id TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL CHECK (status IN (
+                        'dispatching', 'closed', 'uncertain'
+                    )),
+                    outcome_code TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    dispatching_at TEXT NOT NULL,
+                    finalized_at TEXT,
+                    PRIMARY KEY (transition_id, chat_id)
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_claim_events_manager_date
                     ON claim_events(manager_id, event_date);
                 CREATE INDEX IF NOT EXISTS idx_claim_events_deal
@@ -538,6 +559,8 @@ class StateStore:
                     ON lost_deal_close_operations(deal_id, transition_time DESC);
                 CREATE INDEX IF NOT EXISTS idx_lost_deal_close_status
                     ON lost_deal_close_operations(status, updated_at);
+                CREATE INDEX IF NOT EXISTS idx_lost_deal_close_extra_status
+                    ON lost_deal_close_extra_chats(status, updated_at);
                 """
             )
             for statement in (schema_sql + contact_owner_sync.SCHEMA).split(";"):
@@ -5102,6 +5125,230 @@ class StateStore:
                 (transition_id,),
             ).fetchone()
         return self._lost_deal_close_row(row)
+
+    @staticmethod
+    def _lost_deal_close_extra_chat_row(row: sqlite3.Row) -> Dict[str, Any]:
+        return {
+            "transitionId": str(row["transition_id"]),
+            "dealId": str(row["deal_id"]),
+            "chatId": str(row["chat_id"]),
+            "sessionId": str(row["session_id"]),
+            "lastMessageId": str(row["last_message_id"] or ""),
+            "historyMessageCount": int(row["history_message_count"] or 0),
+            "historySignature": str(row["history_signature"] or ""),
+            "activityId": str(row["activity_id"] or ""),
+            # Additional chats are only ever taken from the active CRM registry.
+            "chatLookupMode": "active_registry",
+            "status": str(row["status"]),
+            "outcomeCode": str(row["outcome_code"] or ""),
+            "createdAt": str(row["created_at"]),
+            "updatedAt": str(row["updated_at"]),
+            "dispatchingAt": str(row["dispatching_at"]),
+            "finalizedAt": row["finalized_at"],
+        }
+
+    def mark_lost_deal_close_extra_chat_dispatching(
+        self,
+        transition_id: Any,
+        chat_id: Any,
+        session_id: Any,
+        last_message_id: Any,
+        history_message_count: int,
+        history_signature: Any,
+        activity_id: Any,
+    ) -> Dict[str, Any]:
+        """Commit the no-retry boundary for one more chat of the same deal.
+
+        The transition itself must already be past its own dispatch boundary,
+        so it can never be claimed again.  The primary key then guarantees that
+        a given chat is dispatched at most once for this transition, even
+        after a crash between this commit and the remote finish call.
+        """
+
+        self._ensure_ready()
+        transition_id = str(transition_id or "").strip()
+        chat_id = str(chat_id or "").strip()
+        session_id = str(session_id or "").strip()
+        last_message_id = str(last_message_id or "").strip()
+        activity_id = str(activity_id or "").strip()
+        history_signature = str(history_signature or "").strip().lower()
+        if not re.fullmatch(r"[1-9]\d{0,19}", transition_id):
+            raise ValueError("transition_id must be a positive integer")
+        if not re.fullmatch(r"[1-9]\d{0,19}", chat_id):
+            raise ValueError("chat_id must be a positive integer")
+        if not re.fullmatch(r"[1-9]\d{0,19}", session_id):
+            raise ValueError("session_id must be a positive integer")
+        if last_message_id and not re.fullmatch(r"[1-9]\d{0,19}", last_message_id):
+            raise ValueError("last_message_id must be a positive integer or empty")
+        history_message_count = int(history_message_count)
+        if history_message_count < 0 or history_message_count > 1_000_000:
+            raise ValueError("history_message_count is invalid")
+        if not re.fullmatch(r"[1-9]\d{0,19}", activity_id):
+            raise ValueError("activity_id must be a positive integer")
+        if not re.fullmatch(r"[0-9a-f]{64}", history_signature):
+            raise ValueError("history_signature must be a SHA-256 digest")
+        now = self._now_iso()
+        with self._transaction(immediate=True) as connection:
+            parent = connection.execute(
+                "SELECT * FROM lost_deal_close_operations WHERE transition_id = ?",
+                (transition_id,),
+            ).fetchone()
+            if parent is None or str(parent["status"]) not in {
+                "dispatching", "closed", "uncertain"
+            }:
+                raise StateStoreError(
+                    "lost-deal close transition is not past its dispatch boundary"
+                )
+            if str(parent["chat_id"] or "") == chat_id:
+                raise StateStoreError(
+                    "lost-deal close chat is already the transition's primary chat"
+                )
+            existing = connection.execute(
+                """
+                SELECT 1 FROM lost_deal_close_extra_chats
+                WHERE transition_id = ? AND chat_id = ?
+                """,
+                (transition_id, chat_id),
+            ).fetchone()
+            if existing is not None:
+                raise StateStoreError(
+                    "lost-deal close extra chat was already dispatched"
+                )
+            connection.execute(
+                """
+                INSERT INTO lost_deal_close_extra_chats(
+                    transition_id, chat_id, deal_id, session_id,
+                    last_message_id, history_message_count, history_signature,
+                    activity_id, status, outcome_code,
+                    created_at, updated_at, dispatching_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, 'dispatching', 'finish_started', ?, ?, ?)
+                """,
+                (
+                    transition_id,
+                    chat_id,
+                    str(parent["deal_id"]),
+                    session_id,
+                    last_message_id,
+                    history_message_count,
+                    history_signature,
+                    activity_id,
+                    now,
+                    now,
+                    now,
+                ),
+            )
+            row = connection.execute(
+                """
+                SELECT * FROM lost_deal_close_extra_chats
+                WHERE transition_id = ? AND chat_id = ?
+                """,
+                (transition_id, chat_id),
+            ).fetchone()
+        return self._lost_deal_close_extra_chat_row(row)
+
+    def _finalize_lost_deal_extra_chat(
+        self,
+        transition_id: Any,
+        chat_id: Any,
+        *,
+        from_statuses: tuple,
+        status: str,
+        outcome_code: Any,
+    ) -> Dict[str, Any]:
+        self._ensure_ready()
+        transition_id = str(transition_id or "").strip()
+        chat_id = str(chat_id or "").strip()
+        outcome_code = self._normalize_lost_deal_outcome_code(outcome_code)
+        if status not in {"closed", "uncertain"}:
+            raise ValueError("dispatch final status must be closed or uncertain")
+        now = self._now_iso()
+        placeholders = ", ".join("?" for _ in from_statuses)
+        with self._transaction(immediate=True) as connection:
+            cursor = connection.execute(
+                f"""
+                UPDATE lost_deal_close_extra_chats
+                SET status=?, outcome_code=?, updated_at=?, finalized_at=?
+                WHERE transition_id=? AND chat_id=? AND status IN ({placeholders})
+                """,
+                (status, outcome_code, now, now, transition_id, chat_id, *from_statuses),
+            )
+            if cursor.rowcount != 1:
+                raise StateStoreError("lost-deal close extra chat is not pending")
+            row = connection.execute(
+                """
+                SELECT * FROM lost_deal_close_extra_chats
+                WHERE transition_id = ? AND chat_id = ?
+                """,
+                (transition_id, chat_id),
+            ).fetchone()
+        return self._lost_deal_close_extra_chat_row(row)
+
+    def mark_lost_deal_close_extra_chat_closed(
+        self, transition_id: Any, chat_id: Any
+    ) -> Dict[str, Any]:
+        return self._finalize_lost_deal_extra_chat(
+            transition_id,
+            chat_id,
+            from_statuses=("dispatching",),
+            status="closed",
+            outcome_code="finished",
+        )
+
+    def mark_lost_deal_close_extra_chat_uncertain(
+        self,
+        transition_id: Any,
+        chat_id: Any,
+        outcome_code: Any = "finish_result_uncertain",
+    ) -> Dict[str, Any]:
+        return self._finalize_lost_deal_extra_chat(
+            transition_id,
+            chat_id,
+            from_statuses=("dispatching",),
+            status="uncertain",
+            outcome_code=outcome_code,
+        )
+
+    def mark_lost_deal_close_extra_chat_reconciled(
+        self, transition_id: Any, chat_id: Any
+    ) -> Dict[str, Any]:
+        return self._finalize_lost_deal_extra_chat(
+            transition_id,
+            chat_id,
+            from_statuses=("dispatching", "uncertain"),
+            status="closed",
+            outcome_code="finished_reconciled",
+        )
+
+    def list_lost_deal_close_extra_chats(self, transition_id: Any) -> list[Dict[str, Any]]:
+        self._ensure_ready()
+        transition_id = str(transition_id or "").strip()
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM lost_deal_close_extra_chats
+                WHERE transition_id = ?
+                ORDER BY CAST(chat_id AS INTEGER)
+                """,
+                (transition_id,),
+            ).fetchall()
+        return [self._lost_deal_close_extra_chat_row(row) for row in rows]
+
+    def list_lost_deal_close_extra_chat_reconciliation(
+        self, limit: int = 100
+    ) -> list[Dict[str, Any]]:
+        self._ensure_ready()
+        limit = max(1, min(1000, int(limit)))
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM lost_deal_close_extra_chats
+                WHERE status IN ('dispatching', 'uncertain')
+                ORDER BY updated_at, transition_id, chat_id
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [self._lost_deal_close_extra_chat_row(row) for row in rows]
 
 
 def create_state_store() -> StateStore:

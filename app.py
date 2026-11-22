@@ -209,6 +209,21 @@ LOST_DEAL_AUTOCLOSE_GRACE_SECONDS = env_int(
 LOST_DEAL_MAX_PREFLIGHT_ATTEMPTS = env_int(
     "LOST_DEAL_MAX_PREFLIGHT_ATTEMPTS", 5, 1, 20
 )
+MAX_LOST_DEAL_CHATS_PER_TRANSITION = env_int(
+    "MAX_LOST_DEAL_CHATS_PER_TRANSITION", 5, 2, 10
+)
+# Client phrases that the portal's own CRM trigger converts into a failed
+# stage ("Отписаться").  Such a message is the cause of the transition, so
+# sharing its second with the transition does not make it a later reply.
+LOST_DEAL_AUTOCLOSE_TRIGGER_TEXTS = tuple(
+    dict.fromkeys(
+        item.strip().casefold()
+        for item in os.environ.get(
+            "LOST_DEAL_AUTOCLOSE_TRIGGER_TEXTS", "Отписаться"
+        ).split("|")
+        if item.strip()
+    )
+)
 PUBLIC_APP_URL = os.environ.get("PUBLIC_APP_URL", "").strip().rstrip("/")
 ADMIN_USER_IDS = {
     item.strip()
@@ -2041,6 +2056,49 @@ def active_chat_rows_for_deal(deal_id):
     return rows
 
 
+def _history_message_is_system(message):
+    """Only an explicit zero sender is a Bitrix system notice."""
+
+    for key in ("senderid", "senderId", "SENDER_ID"):
+        if message.get(key) is not None:
+            return str(message.get(key)).strip() == "0"
+    return False
+
+
+def _history_message_is_failed_stage_trigger(users, message):
+    """A client phrase that the portal's CRM trigger turns into a lost deal."""
+
+    if not LOST_DEAL_AUTOCLOSE_TRIGGER_TEXTS:
+        return False
+    sender_id = next(
+        (
+            message.get(key)
+            for key in ("senderid", "senderId", "SENDER_ID")
+            if message.get(key) is not None
+        ),
+        None,
+    )
+    identity = source_numeric_id(sender_id)
+    if identity is None or identity <= 0 or not isinstance(users, dict):
+        return False
+    # The CRM trigger reacts only to an incoming client message, so the
+    # sender must be the proven external connector user of this dialog.
+    user = users.get(str(identity), users.get(identity))
+    if (
+        not isinstance(user, dict)
+        or source_numeric_id(user.get("id")) != identity
+        or user.get("connector") is not True
+    ):
+        return False
+    raw_text = message.get("text")
+    if not isinstance(raw_text, str):
+        raw_text = message.get("textlegacy")
+    if not isinstance(raw_text, str):
+        return False
+    text = raw_text.casefold()
+    return any(phrase in text for phrase in LOST_DEAL_AUTOCLOSE_TRIGGER_TEXTS)
+
+
 def _history_identity(parameter, identifier):
     history = bitrix_call(
         "imopenlines.session.history.get",
@@ -2057,6 +2115,7 @@ def _history_identity(parameter, identifier):
         raise RuntimeError("История открытой линии превышает безопасный лимит")
     entries = list(messages.items()) if isinstance(messages, dict) else list(enumerate(messages))
     identity_rows = []
+    authored_rows = []
     for fallback_id, message in entries:
         if not isinstance(message, dict):
             raise RuntimeError("Bitrix вернул повреждённое сообщение сессии")
@@ -2072,7 +2131,20 @@ def _history_identity(parameter, identifier):
             message.get("senderid") or message.get("senderId") or message.get("SENDER_ID") or ""
         ).strip()
         identity_rows.append((int(message_id), sender_id, message_time.isoformat()))
+        # Queue redirects, pin notices and automatic replies are written by
+        # Bitrix itself.  Only a message somebody actually authored can mean
+        # that the conversation continued after the deal was lost.
+        if not _history_message_is_system(message):
+            authored_rows.append(
+                (
+                    message_time,
+                    _history_message_is_failed_stage_trigger(
+                        history.get("users"), message
+                    ),
+                )
+            )
     identity_rows.sort()
+    latest_authored_at = max((item[0] for item in authored_rows), default=None)
     identity_material = json.dumps(identity_rows, separators=(",", ":"))
     return {
         "chatId": chat_id,
@@ -2085,6 +2157,12 @@ def _history_identity(parameter, identifier):
             else None
         ),
         "historySignature": hashlib.sha256(identity_material.encode("utf-8")).hexdigest(),
+        "latestAuthoredMessageAt": latest_authored_at,
+        "latestAuthoredMessagesAreTrigger": bool(authored_rows) and all(
+            is_trigger
+            for message_time, is_trigger in authored_rows
+            if message_time == latest_authored_at
+        ),
     }
 
 
@@ -2285,6 +2363,66 @@ def read_single_active_deal_chat_snapshot(deal_id, transition=None):
         fallback = None
         chat_id = rows[0]["chatId"]
         expected_registry = [{"chatId": chat_id}]
+    return _read_deal_chat_snapshot(
+        deal_id, transition, chat_id, fallback, expected_registry
+    )
+
+
+def _active_chat_ids(rows):
+    return sorted(row["chatId"] for row in rows)
+
+
+def read_multiple_active_deal_chat_snapshots(
+    deal_id, only_chat_ids=None, expected_chat_ids=None
+):
+    """Verify every active chat of a failed deal that owns more than one.
+
+    Each chat passes exactly the same checks as a single chat.  A chat that
+    fails its own checks is reported in ``skipped`` and left untouched; it
+    never prevents the other, independently proven chats from being closed.
+    """
+
+    rows = active_chat_rows_for_deal(deal_id)
+    chat_ids = _active_chat_ids(rows)
+    if len(set(chat_ids)) != len(chat_ids):
+        raise RuntimeError("Bitrix вернул повторяющийся активный чат сделки")
+    if expected_chat_ids is not None and chat_ids != sorted(expected_chat_ids):
+        raise LostDealCloseGuardError("active_chat_changed_during_check")
+    if len(chat_ids) < 2:
+        raise LostDealCloseGuardError("active_chat_changed_during_check")
+    if len(chat_ids) > MAX_LOST_DEAL_CHATS_PER_TRANSITION:
+        raise LostDealCloseGuardError("too_many_active_chats")
+    wanted = chat_ids if only_chat_ids is None else [
+        str(chat_id) for chat_id in only_chat_ids
+    ]
+    snapshots = []
+    skipped = {}
+    for chat_id in sorted(wanted, key=int):
+        if chat_id not in chat_ids:
+            skipped[chat_id] = "active_chat_changed_during_check"
+            continue
+        try:
+            snapshots.append(
+                _read_deal_chat_snapshot(deal_id, None, chat_id, None, rows)
+            )
+        except LostDealCloseGuardError as exc:
+            skipped[chat_id] = exc.code
+    return snapshots, skipped, chat_ids
+
+
+def read_remaining_active_deal_chat_snapshot(deal_id, chat_id):
+    """Re-verify one more chat immediately before its own finish call."""
+
+    rows = active_chat_rows_for_deal(deal_id)
+    chat_ids = _active_chat_ids(rows)
+    if len(set(chat_ids)) != len(chat_ids):
+        raise RuntimeError("Bitrix вернул повторяющийся активный чат сделки")
+    if str(chat_id) not in chat_ids:
+        raise LostDealCloseGuardError("active_chat_changed_during_check")
+    return _read_deal_chat_snapshot(deal_id, None, str(chat_id), None, rows)
+
+
+def _read_deal_chat_snapshot(deal_id, transition, chat_id, fallback, expected_registry):
     dialog = bitrix_call("imopenlines.dialog.get", {"CHAT_ID": chat_id}) or {}
     if not isinstance(dialog, dict):
         raise RuntimeError("Bitrix вернул неожиданный формат диалога")
@@ -2325,7 +2463,9 @@ def read_single_active_deal_chat_snapshot(deal_id, transition=None):
         or fallback["activityId"] != activity_id
     ):
         raise LostDealCloseGuardError("fallback_activity_binding_mismatch")
-    if active_chat_rows_for_deal(deal_id) != expected_registry:
+    if _active_chat_ids(active_chat_rows_for_deal(deal_id)) != _active_chat_ids(
+        expected_registry
+    ):
         raise LostDealCloseGuardError("active_chat_changed_during_check")
     if fallback and auto_completed_chat_candidate(deal_id, transition) != fallback:
         raise LostDealCloseGuardError("fallback_activity_changed_during_check")
@@ -2342,7 +2482,7 @@ def read_single_active_deal_chat_snapshot(deal_id, transition=None):
     )
     if any(late_dialog.get(key) != dialog.get(key) for key in guarded_dialog_fields):
         raise LostDealCloseGuardError("dialog_changed_during_check")
-    return {
+    snapshot = {
         "chatId": chat_id,
         "sessionId": session_id,
         "lastMessageId": last_message_id,
@@ -2369,6 +2509,39 @@ def read_single_active_deal_chat_snapshot(deal_id, transition=None):
         "entityData1": str(dialog.get("entity_data_1") or ""),
         "entityData2": entity_data_2,
     }
+    if "latestAuthoredMessageAt" in by_chat:
+        authored_at = by_chat["latestAuthoredMessageAt"]
+        snapshot["latestAuthoredMessageAt"] = (
+            authored_at.isoformat() if authored_at else ""
+        )
+        snapshot["latestAuthoredMessagesAreTrigger"] = bool(
+            by_chat.get("latestAuthoredMessagesAreTrigger")
+        )
+    return snapshot
+
+
+def lost_deal_chat_continued_after_transition(snapshot, transition_time):
+    """True when somebody may have written after the deal was lost.
+
+    Bitrix timestamps have only second precision, so a message in the very
+    second of the transition is ambiguous and keeps the dialog open.  The one
+    exception is the client phrase that the portal's CRM trigger itself turns
+    into the failed stage: it caused the transition and cannot follow it.
+    System notices (queue redirects, pin notices, automatic replies) are not
+    part of the conversation and never keep a lost deal's dialog open.
+    """
+
+    if "latestAuthoredMessageAt" not in snapshot:
+        latest = parse_source_message_time(snapshot.get("latestMessageAt"))
+        return latest is not None and latest >= transition_time
+    latest = parse_source_message_time(snapshot["latestAuthoredMessageAt"])
+    if latest is None:
+        return False
+    if latest > transition_time:
+        return True
+    return latest == transition_time and not snapshot.get(
+        "latestAuthoredMessagesAreTrigger"
+    )
 
 
 def _same_transition(left, right):
@@ -2447,6 +2620,15 @@ def reconcile_lost_deal_close_operations():
                 reconciled += 1
         except Exception:
             continue
+    for chat in STATE_STORE.list_lost_deal_close_extra_chat_reconciliation(limit=100):
+        try:
+            if selected_chat_is_confirmed_inactive(chat):
+                STATE_STORE.mark_lost_deal_close_extra_chat_reconciled(
+                    chat["transitionId"], chat["chatId"]
+                )
+                reconciled += 1
+        except Exception:
+            continue
     return reconciled
 
 
@@ -2470,20 +2652,54 @@ def process_lost_deal_transition(deal_id, transition_id, observed_at=None):
             raise LostDealTransitionNotMature("transition_check_in_progress")
         return claim.get("status") or "already_processed"
     lease_token = claim["leaseToken"]
+    # Further chats of the same deal, each re-verified right before its own
+    # finish call after the first chat has been dispatched.
+    remaining_snapshots = []
+    left_open = {}
     try:
-        first_snapshot = read_single_active_deal_chat_snapshot(deal_id, transition)
-        latest_message_at = parse_source_message_time(first_snapshot["latestMessageAt"])
+        try:
+            first_snapshot = read_single_active_deal_chat_snapshot(deal_id, transition)
+            registry_chat_ids = None
+        except LostDealCloseGuardError as exc:
+            if exc.code != "multiple_active_chats":
+                raise
+            candidates, left_open, registry_chat_ids = (
+                read_multiple_active_deal_chat_snapshots(deal_id)
+            )
+            eligible = []
+            for candidate in candidates:
+                if lost_deal_chat_continued_after_transition(
+                    candidate, transition_time
+                ):
+                    left_open[candidate["chatId"]] = "message_after_failed_transition"
+                else:
+                    eligible.append(candidate)
+            if not eligible:
+                codes = set(left_open.values())
+                raise LostDealCloseGuardError(
+                    codes.pop() if len(codes) == 1 else "no_eligible_active_chat"
+                )
+            first_snapshot = eligible[0]
+            remaining_snapshots = eligible[1:]
         # Bitrix message timestamps can have only second precision.  Equality
         # is therefore ambiguous: the message may have arrived just after the
         # stage change but been rounded to the same second.  Fail closed.
-        if latest_message_at is not None and latest_message_at >= transition_time:
+        if lost_deal_chat_continued_after_transition(first_snapshot, transition_time):
             raise LostDealCloseGuardError("message_after_failed_transition")
         final_transition = exact_failed_transition(deal_id, transition_id)
         if not _same_transition(transition, final_transition):
             raise LostDealCloseGuardError("transition_changed_before_finish")
-        final_snapshot = read_single_active_deal_chat_snapshot(
-            deal_id, final_transition
-        )
+        if registry_chat_ids is None:
+            final_snapshot = read_single_active_deal_chat_snapshot(
+                deal_id, final_transition
+            )
+        else:
+            rechecked, _, _ = read_multiple_active_deal_chat_snapshots(
+                deal_id,
+                only_chat_ids=[first_snapshot["chatId"]],
+                expected_chat_ids=registry_chat_ids,
+            )
+            final_snapshot = rechecked[0] if rechecked else None
         if final_snapshot != first_snapshot:
             raise LostDealCloseGuardError("chat_changed_before_finish")
         if DRY_RUN:
@@ -2529,6 +2745,31 @@ def process_lost_deal_transition(deal_id, transition_id, observed_at=None):
         )
         raise
 
+    status = _finish_dispatched_lost_deal_chat(transition_id, dispatch)
+    if registry_chat_ids is None:
+        return status
+    statuses = [status]
+    for snapshot in remaining_snapshots:
+        try:
+            statuses.append(
+                _close_remaining_lost_deal_chat(
+                    deal_id, transition_id, transition, snapshot
+                )
+            )
+        except LostDealCloseGuardError as exc:
+            left_open[snapshot["chatId"]] = exc.code
+        except Exception:
+            # The transition is already terminal and is never claimed again,
+            # so an unreadable chat simply stays open.
+            left_open[snapshot["chatId"]] = "remaining_chat_check_failed"
+    if left_open or any(
+        value not in {"closed", "closed_reconciled"} for value in statuses
+    ):
+        return "partial"
+    return "closed"
+
+
+def _finish_dispatched_lost_deal_chat(transition_id, dispatch):
     try:
         acknowledged = bitrix_call(
             "imopenlines.operator.another.finish",
@@ -2562,6 +2803,67 @@ def process_lost_deal_transition(deal_id, transition_id, observed_at=None):
         return "closed"
     STATE_STORE.mark_lost_deal_close_uncertain(
         transition_id, "finish_ack_unconfirmed"
+    )
+    return "uncertain"
+
+
+def _close_remaining_lost_deal_chat(deal_id, transition_id, transition, verified):
+    """Close one more chat of a deal whose first chat is already dispatched.
+
+    The chat gets the same protection as the first one: the exact transition
+    and the unchanged chat are re-read immediately before the call, the
+    no-retry boundary is committed first, and the result is confirmed by a
+    read-only check.  Any doubt leaves this chat open.
+    """
+
+    chat_id = verified["chatId"]
+    if not _same_transition(
+        transition, exact_failed_transition(deal_id, transition_id)
+    ):
+        raise LostDealCloseGuardError("transition_changed_before_finish")
+    if read_remaining_active_deal_chat_snapshot(deal_id, chat_id) != verified:
+        raise LostDealCloseGuardError("chat_changed_before_finish")
+    chat = STATE_STORE.mark_lost_deal_close_extra_chat_dispatching(
+        transition_id,
+        chat_id,
+        verified["sessionId"],
+        verified["lastMessageId"],
+        verified["historyMessageCount"],
+        verified["historySignature"],
+        verified["activityId"],
+    )
+    try:
+        acknowledged = bitrix_call(
+            "imopenlines.operator.another.finish",
+            {"CHAT_ID": chat["chatId"]},
+        ) is True
+    except Exception:
+        STATE_STORE.mark_lost_deal_close_extra_chat_uncertain(
+            transition_id, chat_id, "finish_result_uncertain"
+        )
+        try:
+            if selected_chat_is_confirmed_inactive(chat):
+                STATE_STORE.mark_lost_deal_close_extra_chat_reconciled(
+                    transition_id, chat_id
+                )
+                return "closed_reconciled"
+        except Exception:
+            pass
+        return "uncertain"
+    if not acknowledged:
+        STATE_STORE.mark_lost_deal_close_extra_chat_uncertain(
+            transition_id, chat_id, "finish_not_acknowledged"
+        )
+        return "uncertain"
+    try:
+        confirmed = selected_chat_is_confirmed_inactive(chat)
+    except Exception:
+        confirmed = False
+    if confirmed:
+        STATE_STORE.mark_lost_deal_close_extra_chat_closed(transition_id, chat_id)
+        return "closed"
+    STATE_STORE.mark_lost_deal_close_extra_chat_uncertain(
+        transition_id, chat_id, "finish_ack_unconfirmed"
     )
     return "uncertain"
 
